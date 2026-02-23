@@ -33,6 +33,11 @@ This builds the kernel module (`wireview_hwmon.ko`), the daemon (`wireviewd`), a
 ## Quick start
 
 ```bash
+# Install udev rules (serial port access + hwmon device permissions)
+sudo cp 99-wireview-hwmon.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
 # Load the kernel module
 sudo insmod wireview_hwmon.ko
 
@@ -46,7 +51,7 @@ sensors wireview-*
 ## Install (persistent)
 
 ```bash
-sudo make install
+sudo make install  # installs module, daemon, udev rules, and systemd service
 
 # Load module and start daemon
 sudo modprobe wireview_hwmon
