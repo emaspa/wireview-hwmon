@@ -2,8 +2,8 @@
 /*
  * wireview_hwmon - Virtual hwmon driver for WireView Pro II
  *
- * Exposes GPU power monitoring data (voltage, current, power, temperature)
- * from the WireView Pro II USB device through the Linux hwmon subsystem.
+ * Exposes GPU power monitoring data from the WireView Pro II USB device
+ * through the Linux hwmon subsystem.
  *
  * A userspace daemon (wireviewd) reads sensor data from the device over
  * serial and writes it to /dev/wireview-hwmon as a packed binary struct.
@@ -20,20 +20,28 @@
 #include <linux/ktime.h>
 
 #define WIREVIEW_MAGIC   0x57565032  /* "WVP2" */
-#define WIREVIEW_VERSION 1
+#define WIREVIEW_VERSION 2
 #define WIREVIEW_STALE_MS 5000
 
 struct wireview_hwmon_data {
 	__u32 magic;
 	__u32 version;
-	__s32 voltage_mv[6];
-	__s32 current_ma[6];
-	__s64 power_uw;
-	__s32 temp_mc[4];
-	__u64 _reserved;
+	__s32 voltage_mv[6];       /* per-pin voltages (mV) */
+	__s32 current_ma[6];       /* per-pin currents (mA) */
+	__s64 total_power_uw;      /* total power (uW) */
+	__s32 temp_mc[4];          /* temperatures (millidegrees C) */
+	__s64 pin_power_uw[6];     /* per-pin power (uW) */
+	__s32 total_current_ma;    /* total current (mA) */
+	__s32 avg_voltage_mv;      /* average voltage (mV) */
+	__s32 vdd_mv;              /* supply voltage (mV) */
+	__u8  fan_duty;            /* fan duty 0-100% */
+	__u8  psu_cap;             /* PSU capability enum */
+	__u16 fault_status;        /* active fault bitmask */
+	__u16 fault_log;           /* historical fault bitmask */
+	__u16 _pad;
 } __packed;
 
-static_assert(sizeof(struct wireview_hwmon_data) == 88, "struct size mismatch");
+static_assert(sizeof(struct wireview_hwmon_data) == 148, "struct size mismatch");
 
 struct wireview_priv {
 	struct mutex lock;
@@ -82,19 +90,35 @@ static const struct file_operations wireview_misc_fops = {
 	.write = wireview_misc_write,
 };
 
-/* ---- hwmon callbacks ---- */
+/* ---- hwmon labels ---- */
+
+/*
+ * Voltages: in0-in5 = Pin 1-6, in6 = Average, in7 = Vdd
+ * Currents: curr1-curr6 = Pin 1-6, curr7 = Total
+ * Power:    power1 = Total, power2-power7 = Pin 1-6
+ * Temps:    temp1-temp4 = Onboard In, Onboard Out, External 1, External 2
+ */
 
 static const char * const voltage_labels[] = {
-	"Pin 1", "Pin 2", "Pin 3", "Pin 4", "Pin 5", "Pin 6"
+	"Pin 1", "Pin 2", "Pin 3", "Pin 4", "Pin 5", "Pin 6",
+	"Average", "Vdd"
 };
 
 static const char * const current_labels[] = {
+	"Pin 1", "Pin 2", "Pin 3", "Pin 4", "Pin 5", "Pin 6",
+	"Total"
+};
+
+static const char * const power_labels[] = {
+	"Total",
 	"Pin 1", "Pin 2", "Pin 3", "Pin 4", "Pin 5", "Pin 6"
 };
 
 static const char * const temp_labels[] = {
 	"Onboard In", "Onboard Out", "External 1", "External 2"
 };
+
+/* ---- hwmon callbacks ---- */
 
 static umode_t wireview_is_visible(const void *drvdata,
 				   enum hwmon_sensor_types type,
@@ -115,6 +139,14 @@ static umode_t wireview_is_visible(const void *drvdata,
 		break;
 	case hwmon_temp:
 		if (attr == hwmon_temp_input || attr == hwmon_temp_label)
+			return 0444;
+		break;
+	case hwmon_fan:
+		if (attr == hwmon_fan_input)
+			return 0444;
+		break;
+	case hwmon_intrusion:
+		if (attr == hwmon_intrusion_alarm)
 			return 0444;
 		break;
 	default:
@@ -144,16 +176,37 @@ static int wireview_read(struct device *dev, enum hwmon_sensor_types type,
 
 	switch (type) {
 	case hwmon_in:
-		*val = priv->data.voltage_mv[channel];
+		if (channel < 6)
+			*val = priv->data.voltage_mv[channel];
+		else if (channel == 6)
+			*val = priv->data.avg_voltage_mv;
+		else /* channel 7 */
+			*val = priv->data.vdd_mv;
 		break;
 	case hwmon_curr:
-		*val = priv->data.current_ma[channel];
+		if (channel < 6)
+			*val = priv->data.current_ma[channel];
+		else /* channel 6 = curr7 */
+			*val = priv->data.total_current_ma;
 		break;
 	case hwmon_power:
-		*val = priv->data.power_uw;
+		if (channel == 0)
+			*val = priv->data.total_power_uw;
+		else /* channels 1-6 = power2-power7 */
+			*val = priv->data.pin_power_uw[channel - 1];
 		break;
 	case hwmon_temp:
 		*val = priv->data.temp_mc[channel];
+		break;
+	case hwmon_fan:
+		/* Report fan duty as "RPM" scaled 0-100 for visibility */
+		*val = priv->data.fan_duty;
+		break;
+	case hwmon_intrusion:
+		if (channel == 0)
+			*val = priv->data.fault_status != 0 ? 1 : 0;
+		else
+			*val = priv->data.fault_log != 0 ? 1 : 0;
 		break;
 	default:
 		mutex_unlock(&priv->lock);
@@ -176,7 +229,7 @@ static int wireview_read_string(struct device *dev,
 		*str = current_labels[channel];
 		break;
 	case hwmon_power:
-		*str = "Total";
+		*str = power_labels[channel];
 		break;
 	case hwmon_temp:
 		*str = temp_labels[channel];
@@ -195,26 +248,40 @@ static const struct hwmon_ops wireview_ops = {
 
 static const struct hwmon_channel_info * const wireview_info[] = {
 	HWMON_CHANNEL_INFO(in,
-		HWMON_I_INPUT | HWMON_I_LABEL,
-		HWMON_I_INPUT | HWMON_I_LABEL,
-		HWMON_I_INPUT | HWMON_I_LABEL,
-		HWMON_I_INPUT | HWMON_I_LABEL,
-		HWMON_I_INPUT | HWMON_I_LABEL,
-		HWMON_I_INPUT | HWMON_I_LABEL),
+		HWMON_I_INPUT | HWMON_I_LABEL,   /* in0: Pin 1 */
+		HWMON_I_INPUT | HWMON_I_LABEL,   /* in1: Pin 2 */
+		HWMON_I_INPUT | HWMON_I_LABEL,   /* in2: Pin 3 */
+		HWMON_I_INPUT | HWMON_I_LABEL,   /* in3: Pin 4 */
+		HWMON_I_INPUT | HWMON_I_LABEL,   /* in4: Pin 5 */
+		HWMON_I_INPUT | HWMON_I_LABEL,   /* in5: Pin 6 */
+		HWMON_I_INPUT | HWMON_I_LABEL,   /* in6: Average */
+		HWMON_I_INPUT | HWMON_I_LABEL),  /* in7: Vdd */
 	HWMON_CHANNEL_INFO(curr,
-		HWMON_C_INPUT | HWMON_C_LABEL,
-		HWMON_C_INPUT | HWMON_C_LABEL,
-		HWMON_C_INPUT | HWMON_C_LABEL,
-		HWMON_C_INPUT | HWMON_C_LABEL,
-		HWMON_C_INPUT | HWMON_C_LABEL,
-		HWMON_C_INPUT | HWMON_C_LABEL),
+		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr1: Pin 1 */
+		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr2: Pin 2 */
+		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr3: Pin 3 */
+		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr4: Pin 4 */
+		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr5: Pin 5 */
+		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr6: Pin 6 */
+		HWMON_C_INPUT | HWMON_C_LABEL),  /* curr7: Total */
 	HWMON_CHANNEL_INFO(power,
-		HWMON_P_INPUT | HWMON_P_LABEL),
+		HWMON_P_INPUT | HWMON_P_LABEL,   /* power1: Total */
+		HWMON_P_INPUT | HWMON_P_LABEL,   /* power2: Pin 1 */
+		HWMON_P_INPUT | HWMON_P_LABEL,   /* power3: Pin 2 */
+		HWMON_P_INPUT | HWMON_P_LABEL,   /* power4: Pin 3 */
+		HWMON_P_INPUT | HWMON_P_LABEL,   /* power5: Pin 4 */
+		HWMON_P_INPUT | HWMON_P_LABEL,   /* power6: Pin 5 */
+		HWMON_P_INPUT | HWMON_P_LABEL),  /* power7: Pin 6 */
 	HWMON_CHANNEL_INFO(temp,
-		HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL,
-		HWMON_T_INPUT | HWMON_T_LABEL),
+		HWMON_T_INPUT | HWMON_T_LABEL,   /* temp1: Onboard In */
+		HWMON_T_INPUT | HWMON_T_LABEL,   /* temp2: Onboard Out */
+		HWMON_T_INPUT | HWMON_T_LABEL,   /* temp3: External 1 */
+		HWMON_T_INPUT | HWMON_T_LABEL),  /* temp4: External 2 */
+	HWMON_CHANNEL_INFO(fan,
+		HWMON_F_INPUT),                  /* fan1: duty % */
+	HWMON_CHANNEL_INFO(intrusion,
+		HWMON_INTRUSION_ALARM,           /* intrusion0: fault status */
+		HWMON_INTRUSION_ALARM),          /* intrusion1: fault log */
 	NULL
 };
 

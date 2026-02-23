@@ -28,7 +28,7 @@
 #define WELCOME_MSG  "Thermal Grizzly WireView Pro II"
 
 #define WIREVIEW_MAGIC   0x57565032
-#define WIREVIEW_VERSION 1
+#define WIREVIEW_VERSION 2
 
 #define CMD_READ_SENSOR_VALUES 0x04
 
@@ -38,14 +38,22 @@ static volatile int running = 1;
 struct __attribute__((packed)) hwmon_data {
 	uint32_t magic;
 	uint32_t version;
-	int32_t  voltage_mv[6];
-	int32_t  current_ma[6];
-	int64_t  power_uw;
-	int32_t  temp_mc[4];
-	uint64_t _reserved;
+	int32_t  voltage_mv[6];       /* per-pin voltages (mV) */
+	int32_t  current_ma[6];       /* per-pin currents (mA) */
+	int64_t  total_power_uw;      /* total power (uW) */
+	int32_t  temp_mc[4];          /* temperatures (millidegrees C) */
+	int64_t  pin_power_uw[6];     /* per-pin power (uW) */
+	int32_t  total_current_ma;    /* total current (mA) */
+	int32_t  avg_voltage_mv;      /* average voltage (mV) */
+	int32_t  vdd_mv;              /* supply voltage (mV) */
+	uint8_t  fan_duty;            /* fan duty 0-100% */
+	uint8_t  psu_cap;             /* PSU capability enum */
+	uint16_t fault_status;        /* active fault bitmask */
+	uint16_t fault_log;           /* historical fault bitmask */
+	uint16_t _pad;
 };
 
-_Static_assert(sizeof(struct hwmon_data) == 88, "hwmon_data size mismatch");
+_Static_assert(sizeof(struct hwmon_data) == 148, "hwmon_data size mismatch");
 
 /*
  * SensorStruct from the WireView firmware (Pack=4, little-endian).
@@ -246,10 +254,11 @@ static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 		hd.voltage_mv[i] = ss->pins[i].voltage;
 		hd.current_ma[i] = (int32_t)ss->pins[i].current;
 		/* mV * mA = microwatts */
-		power_sum += (int64_t)ss->pins[i].voltage *
-			     (int64_t)ss->pins[i].current;
+		hd.pin_power_uw[i] = (int64_t)ss->pins[i].voltage *
+				     (int64_t)ss->pins[i].current;
+		power_sum += hd.pin_power_uw[i];
 	}
-	hd.power_uw = power_sum;
+	hd.total_power_uw = power_sum;
 
 	for (i = 0; i < 4; i++) {
 		int16_t raw = ss->ts[i];
@@ -260,6 +269,14 @@ static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 		else
 			hd.temp_mc[i] = (int32_t)raw * 100;
 	}
+
+	hd.total_current_ma = (int32_t)ss->total_current;
+	hd.avg_voltage_mv = (int32_t)ss->avg_voltage;
+	hd.vdd_mv = (int32_t)ss->vdd;
+	hd.fan_duty = ss->fan_duty;
+	hd.psu_cap = ss->hpwr_cap;
+	hd.fault_status = ss->fault_status;
+	hd.fault_log = ss->fault_log;
 
 	if (write(hwmon_fd, &hd, sizeof(hd)) != sizeof(hd))
 		return -1;
