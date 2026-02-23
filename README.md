@@ -23,6 +23,8 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
 ## Build
 
 ```bash
+git clone https://github.com/emaspa/wireview-hwmon.git
+cd wireview-hwmon
 make
 ```
 
