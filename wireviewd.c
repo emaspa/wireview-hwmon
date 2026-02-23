@@ -526,7 +526,7 @@ static void handle_client_request(int client_fd, int serial_fd)
 		tcflush(serial_fd, TCIFLUSH);
 
 		int ok = 1;
-		for (int offset = 0; offset < data_len; offset += 62) {
+		for (int offset = 0; offset < data_len && offset <= 255; offset += 62) {
 			int bytes_to_write = data_len - offset;
 			if (bytes_to_write > 62) bytes_to_write = 62;
 
