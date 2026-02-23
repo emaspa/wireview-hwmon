@@ -264,9 +264,9 @@ static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 	for (i = 0; i < 4; i++) {
 		int16_t raw = ss->ts[i];
 		/* 0.1 degC -> millidegrees: multiply by 100 */
-		/* Invalid temps (disconnected sensor) read as ~-32768 */
-		if (raw < -1000 || raw > 2000)
-			hd.temp_mc[i] = 0;
+		/* Disconnected sensors report out-of-range values */
+		if (raw < -400 || raw > 2000)
+			hd.temp_mc[i] = INT32_MIN;
 		else
 			hd.temp_mc[i] = (int32_t)raw * 100;
 	}

@@ -90,8 +90,8 @@ wireviewd [-i interval_ms] [-d /dev/ttyACMx]
 | External Temp 1 | `temp3_input` | millidegrees C |
 | External Temp 2 | `temp4_input` | millidegrees C |
 | Fan Duty | `fan1_input` | % (0-100) |
-| Fault Status | `intrusion0_alarm` | 0/1 |
-| Fault Log | `intrusion1_alarm` | 0/1 |
+| Fault Status | `intrusion0_alarm` (`intrusion0_label`) | 0/1 |
+| Fault Log | `intrusion1_alarm` (`intrusion1_label`) | 0/1 |
 
 All voltage, current, power, and temperature channels also expose `_label` attributes for tool-friendly names.
 
@@ -127,8 +127,8 @@ Onboard Out: +42.1°C
 External 1:  +38.7°C
 External 2:    N/A
 fan1:           75
-intrusion0:  ALARM
-intrusion1:  OK
+Fault Status:  ALARM
+Fault Log:     OK
 ```
 
 ## Notes

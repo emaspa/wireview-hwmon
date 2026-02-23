@@ -118,6 +118,38 @@ static const char * const temp_labels[] = {
 	"Onboard In", "Onboard Out", "External 1", "External 2"
 };
 
+/* ---- extra sysfs attributes (intrusion labels) ---- */
+
+static ssize_t intrusion0_label_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "Fault Status\n");
+}
+
+static ssize_t intrusion1_label_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "Fault Log\n");
+}
+
+static DEVICE_ATTR_RO(intrusion0_label);
+static DEVICE_ATTR_RO(intrusion1_label);
+
+static struct attribute *wireview_extra_attrs[] = {
+	&dev_attr_intrusion0_label.attr,
+	&dev_attr_intrusion1_label.attr,
+	NULL
+};
+
+static const struct attribute_group wireview_extra_group = {
+	.attrs = wireview_extra_attrs,
+};
+
+static const struct attribute_group *wireview_extra_groups[] = {
+	&wireview_extra_group,
+	NULL
+};
+
 /* ---- hwmon callbacks ---- */
 
 static umode_t wireview_is_visible(const void *drvdata,
@@ -196,6 +228,10 @@ static int wireview_read(struct device *dev, enum hwmon_sensor_types type,
 			*val = priv->data.pin_power_uw[channel - 1];
 		break;
 	case hwmon_temp:
+		if (priv->data.temp_mc[channel] == S32_MIN) {
+			mutex_unlock(&priv->lock);
+			return -ENODATA;
+		}
 		*val = priv->data.temp_mc[channel];
 		break;
 	case hwmon_fan:
@@ -309,7 +345,7 @@ static int wireview_probe(struct platform_device *pdev)
 							 "wireview",
 							 priv,
 							 &wireview_chip_info,
-							 NULL);
+							 wireview_extra_groups);
 	if (IS_ERR(hwmon_dev))
 		return PTR_ERR(hwmon_dev);
 
