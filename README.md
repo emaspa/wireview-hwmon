@@ -2,7 +2,7 @@
 
 Linux hwmon driver and daemon for the [Thermal Grizzly WireView Pro II](https://www.thermal-grizzly.com/en/wireview-pro-ii-gpu/s-tg-wv-p2) power monitor. Exposes voltage, current, power, and temperature sensor data through the standard Linux hwmon subsystem.
 
-This is a standalone alternative to the [wireview-linux](https://github.com/emaspa/wireview-linux) GUI application. Use this if you want sensor data accessible to `sensors`, Grafana, conky, btop, and other monitoring tools without running the full app.
+Works standalone or alongside the [wireview-linux](https://github.com/emaspa/wireview-linux) GUI application. When both are used together, the app reads sensor data from hwmon and sends commands through the daemon's Unix socket — giving you full app functionality plus system-wide sensor integration.
 
 ## How it works
 
@@ -92,6 +92,9 @@ wireviewd [-i interval_ms] [-d /dev/ttyACMx]
 | Fan Duty | `fan1_input` | % (0-100) |
 | Fault Status | `intrusion0_alarm` (`intrusion0_label`) | 0/1 |
 | Fault Log | `intrusion1_alarm` (`intrusion1_label`) | 0/1 |
+| Fault Status (raw) | `fault_status_raw` | bitmask |
+| Fault Log (raw) | `fault_log_raw` | bitmask |
+| PSU Capability | `psu_cap` | enum (0-4) |
 
 All voltage, current, power, and temperature channels also expose `_label` attributes for tool-friendly names.
 
@@ -131,9 +134,27 @@ Fault Status:  ALARM
 Fault Log:     OK
 ```
 
+## Daemon socket
+
+The daemon listens on a Unix socket at `/run/wireviewd.sock`, allowing external programs (including the [wireview-linux](https://github.com/emaspa/wireview-linux) app) to send commands to the device without direct serial access. Supported commands:
+
+| Command | Description |
+|---------|-------------|
+| GET_DEVICE_INFO | Query firmware version, config version, UID, build string |
+| CLEAR_FAULTS | Clear fault status and/or fault log |
+| READ_CONFIG | Read the device configuration |
+| WRITE_CONFIG | Write a new device configuration |
+| SCREEN_CMD | Send a screen command (change display page) |
+| NVM_CMD | Send an NVM command (store/recall configuration) |
+| READ_BUILD | Read the firmware build string |
+| ENTER_BOOTLOADER | Restart the device into DFU bootloader mode |
+
+The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`.
+
 ## Notes
 
-- The daemon and the wireview-linux GUI app both use the serial port, so only run one at a time.
+- When used with the wireview-linux app, the daemon handles the serial port and the app communicates through hwmon (sensors) and the daemon socket (commands). Both can run simultaneously.
+- When used standalone (without the app), the daemon owns the serial port exclusively.
 - If the device is disconnected, the daemon will wait and reconnect automatically.
 - Sensor readings become stale (report N/A) if no data is received for 5 seconds.
 

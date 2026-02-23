@@ -118,7 +118,7 @@ static const char * const temp_labels[] = {
 	"Onboard In", "Onboard Out", "External 1", "External 2"
 };
 
-/* ---- extra sysfs attributes (intrusion labels) ---- */
+/* ---- extra sysfs attributes ---- */
 
 static ssize_t intrusion0_label_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)
@@ -132,12 +132,69 @@ static ssize_t intrusion1_label_show(struct device *dev,
 	return sysfs_emit(buf, "Fault Log\n");
 }
 
+static ssize_t fault_status_raw_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct wireview_priv *priv = dev_get_drvdata(dev);
+	u16 val;
+
+	mutex_lock(&priv->lock);
+	if (!priv->data_valid) {
+		mutex_unlock(&priv->lock);
+		return -ENODATA;
+	}
+	val = priv->data.fault_status;
+	mutex_unlock(&priv->lock);
+
+	return sysfs_emit(buf, "%u\n", val);
+}
+
+static ssize_t fault_log_raw_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct wireview_priv *priv = dev_get_drvdata(dev);
+	u16 val;
+
+	mutex_lock(&priv->lock);
+	if (!priv->data_valid) {
+		mutex_unlock(&priv->lock);
+		return -ENODATA;
+	}
+	val = priv->data.fault_log;
+	mutex_unlock(&priv->lock);
+
+	return sysfs_emit(buf, "%u\n", val);
+}
+
+static ssize_t psu_cap_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	struct wireview_priv *priv = dev_get_drvdata(dev);
+	u8 val;
+
+	mutex_lock(&priv->lock);
+	if (!priv->data_valid) {
+		mutex_unlock(&priv->lock);
+		return -ENODATA;
+	}
+	val = priv->data.psu_cap;
+	mutex_unlock(&priv->lock);
+
+	return sysfs_emit(buf, "%u\n", val);
+}
+
 static DEVICE_ATTR_RO(intrusion0_label);
 static DEVICE_ATTR_RO(intrusion1_label);
+static DEVICE_ATTR_RO(fault_status_raw);
+static DEVICE_ATTR_RO(fault_log_raw);
+static DEVICE_ATTR_RO(psu_cap);
 
 static struct attribute *wireview_extra_attrs[] = {
 	&dev_attr_intrusion0_label.attr,
 	&dev_attr_intrusion1_label.attr,
+	&dev_attr_fault_status_raw.attr,
+	&dev_attr_fault_log_raw.attr,
+	&dev_attr_psu_cap.attr,
 	NULL
 };
 
