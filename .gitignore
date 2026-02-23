@@ -13,3 +13,10 @@ modules.order
 wireviewd
 !wireviewd.c
 !wireviewd.service
+
+# CLI tool binary
+wireviewctl
+!wireviewctl.c
+
+# Draft posts
+reddit-post.md
