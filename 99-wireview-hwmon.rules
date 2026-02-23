@@ -1,0 +1,6 @@
+# WireView Pro II udev rules
+# Serial port access
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", MODE="0666", TAG+="uaccess"
+
+# hwmon misc device — allow daemon write access
+KERNEL=="wireview-hwmon", SUBSYSTEM=="misc", MODE="0222"

@@ -1,0 +1,15 @@
+# Kernel module build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+.module-common.o.cmd
+.tmp_versions/
+
+# Daemon binary
+wireviewd
+!wireviewd.c
+!wireviewd.service
