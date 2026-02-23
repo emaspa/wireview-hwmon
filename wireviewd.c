@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <linux/limits.h>
 
 #define WIREVIEW_VID "0483"
 #define WIREVIEW_PID "5740"
@@ -121,7 +122,7 @@ static int find_device(char *path, size_t path_len)
 {
 	DIR *d = opendir("/sys/class/tty");
 	struct dirent *ent;
-	char sysdir[1024], resolved[1024], check[1024], vid[16], pid[16];
+	char sysdir[PATH_MAX], resolved[PATH_MAX], check[PATH_MAX], vid[16], pid[16];
 	ssize_t len;
 
 	if (!d)
@@ -139,7 +140,7 @@ static int find_device(char *path, size_t path_len)
 
 		/* Make absolute path */
 		if (resolved[0] != '/') {
-			char tmp[1024];
+			char tmp[PATH_MAX];
 			snprintf(tmp, sizeof(tmp), "/sys/class/tty/%s", resolved);
 			char *rp = realpath(tmp, resolved);
 			if (!rp)
