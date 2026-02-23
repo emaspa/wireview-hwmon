@@ -12,6 +12,7 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
 
 - **wireview_hwmon.ko** — Kernel module that creates a virtual hwmon device
 - **wireviewd** — Userspace daemon that reads the device over serial and feeds the kernel module
+- **wireviewctl** — CLI tool for querying sensors and sending commands via the daemon
 
 ## Requirements
 
@@ -25,7 +26,7 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
 make
 ```
 
-This builds both the kernel module (`wireview_hwmon.ko`) and the daemon (`wireviewd`).
+This builds the kernel module (`wireview_hwmon.ko`), the daemon (`wireviewd`), and the CLI tool (`wireviewctl`).
 
 ## Quick start
 
@@ -132,6 +133,51 @@ External 2:    N/A
 fan1:           75
 Fault Status:  ALARM
 Fault Log:     OK
+```
+
+## CLI tool
+
+`wireviewctl` lets you query sensor data and send device commands from the terminal or scripts.
+
+```
+wireviewctl <command> [args]
+
+Commands (require wireviewd running):
+  info              Show device firmware, UID, and build info
+  clear-faults      Clear all fault status and log
+  read-config       Read device config (hex to stdout)
+  write-config FILE Write device config (hex from file)
+  screen CMD        Change display (main|simple|current|temp|status|same|pause|resume)
+  nvm CMD           NVM operation (load|store|reset|load-cal|store-cal|load-cal-factory|store-cal-factory)
+  build             Show firmware build string
+  bootloader        Enter DFU bootloader mode
+
+Commands (require wireview_hwmon module):
+  sensors           Show all sensor readings from hwmon sysfs
+```
+
+### Examples
+
+```bash
+# Show device info
+wireviewctl info
+
+# Read all sensors (scriptable key: value format)
+wireviewctl sensors
+
+# Switch to simple display
+wireviewctl screen simple
+
+# Back up and restore config
+wireviewctl read-config > config.hex
+wireviewctl write-config config.hex
+
+# Store config to NVM
+wireviewctl nvm store
+
+# Use in scripts
+POWER=$(wireviewctl sensors | grep total_power_uw | cut -d' ' -f2)
+echo "Total power: $((POWER / 1000000)) W"
 ```
 
 ## Daemon socket
