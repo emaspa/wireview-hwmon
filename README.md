@@ -67,7 +67,7 @@ sudo insmod wireview_hwmon.ko
 sudo ./wireviewd
 
 # In another terminal, check sensor data
-sensors wireview*
+sensors wireview-isa-0000
 ```
 
 ## Install (persistent)
@@ -85,7 +85,7 @@ sudo systemctl enable --now wireviewd
 sudo modprobe wireview_hwmon
 
 # Verify
-sensors wireview*
+sensors wireview-isa-0000
 ```
 
 After rebooting, both the module and daemon will start automatically.
@@ -167,8 +167,8 @@ All voltage, current, power, and temperature channels also expose `_label` attri
 ## Example `sensors` output
 
 ```
-wireview-virtual-0
-Adapter: Virtual device
+wireview-isa-0000
+Adapter: ISA adapter
 Pin 1:       +12.12 V
 Pin 2:       +12.13 V
 Pin 3:       +12.11 V
