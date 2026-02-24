@@ -67,6 +67,41 @@ To auto-load the module on boot:
 echo wireview_hwmon | sudo tee /etc/modules-load.d/wireview-hwmon.conf
 ```
 
+### Secure Boot
+
+If Secure Boot is enabled, the kernel will refuse to load unsigned modules (`Key was rejected by service`). You have two options:
+
+**Option 1: Disable Secure Boot** (easiest)
+
+Reboot, enter BIOS/UEFI settings, disable Secure Boot, then boot back in and load the module normally.
+
+**Option 2: Sign the module** (keeps Secure Boot enabled)
+
+```bash
+# Generate a signing key (one-time)
+sudo mkdir -p /var/lib/shim-signed/mok
+sudo openssl req -new -x509 -newkey rsa:2048 \
+  -keyout /var/lib/shim-signed/mok/MOK.priv \
+  -outform DER -out /var/lib/shim-signed/mok/MOK.der \
+  -nodes -days 36500 -subj "/CN=Local Module Signing/"
+
+# Enroll the key (requires reboot to confirm in MokManager)
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
+
+# Reboot — MokManager will prompt you to enroll the key
+
+# After reboot, sign the module
+sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 \
+  /var/lib/shim-signed/mok/MOK.priv \
+  /var/lib/shim-signed/mok/MOK.der \
+  /lib/modules/$(uname -r)/updates/wireview_hwmon.ko
+
+# Now it loads
+sudo modprobe wireview_hwmon
+```
+
+You only need to generate and enroll the key once. After a kernel update, re-sign the module or rebuild with `sudo make install` and sign again.
+
 ## Uninstall
 
 ```bash
