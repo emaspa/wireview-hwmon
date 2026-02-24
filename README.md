@@ -67,7 +67,7 @@ sudo insmod wireview_hwmon.ko
 sudo ./wireviewd
 
 # In another terminal, check sensor data
-sensors wireview-*
+sensors wireview*
 ```
 
 ## Install (persistent)
@@ -85,7 +85,7 @@ sudo systemctl enable --now wireviewd
 sudo modprobe wireview_hwmon
 
 # Verify
-sensors wireview-*
+sensors wireview*
 ```
 
 After rebooting, both the module and daemon will start automatically.
