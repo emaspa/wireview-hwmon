@@ -18,5 +18,14 @@ wireviewd
 wireviewctl
 !wireviewctl.c
 
+# Debian build artifacts
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper
+debian/wireview-hwmon/
+debian/wireview-hwmon-dkms/
+
 # Draft posts
 reddit-post.md
