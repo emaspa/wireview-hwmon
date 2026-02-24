@@ -53,19 +53,20 @@ sensors wireview-*
 ```bash
 sudo make install  # installs module, daemon, udev rules, and systemd service
 
-# Load module and start daemon
-sudo modprobe wireview_hwmon
+# Auto-load module on boot
+echo wireview_hwmon | sudo tee /etc/modules-load.d/wireview-hwmon.conf
+
+# Enable and start the daemon service
 sudo systemctl enable --now wireviewd
+
+# Load the module now (or reboot)
+sudo modprobe wireview_hwmon
 
 # Verify
 sensors wireview-*
 ```
 
-To auto-load the module on boot:
-
-```bash
-echo wireview_hwmon | sudo tee /etc/modules-load.d/wireview-hwmon.conf
-```
+After rebooting, both the module and daemon will start automatically.
 
 ### Secure Boot
 
