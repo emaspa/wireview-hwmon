@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewd wireviewd.c
+	$(CC) -Wall -Wextra -O2 -o wireviewctl wireviewctl.c
+
+override_dh_auto_install:
+	# Daemon package
+	install -D -m 755 wireviewd debian/wireview-hwmon/usr/bin/wireviewd
+	install -D -m 755 wireviewctl debian/wireview-hwmon/usr/bin/wireviewctl
+	install -D -m 644 debian/wireviewd.service debian/wireview-hwmon/lib/systemd/system/wireviewd.service
+	install -D -m 644 99-wireview-hwmon.rules debian/wireview-hwmon/lib/udev/rules.d/99-wireview-hwmon.rules
+	# DKMS package
+	install -D -m 644 wireview_hwmon.c debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.0/wireview_hwmon.c
+	install -D -m 644 dkms.conf debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.0/dkms.conf
+	install -D -m 644 Makefile.dkms debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.0/Makefile
+
+override_dh_auto_clean:
+	rm -f wireviewd wireviewctl

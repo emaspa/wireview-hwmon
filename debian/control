@@ -1,0 +1,29 @@
+Source: wireview-hwmon
+Section: misc
+Priority: optional
+Maintainer: Emanuele Sparvoli <sparvoli@gmail.com>
+Build-Depends: debhelper (>= 13)
+Standards-Version: 4.6.2
+
+Package: wireview-hwmon-dkms
+Architecture: all
+Depends: dkms, ${misc:Depends}
+Description: WireView Pro II hwmon kernel module (DKMS)
+ Linux hwmon kernel module for the Thermal Grizzly WireView Pro II
+ GPU power monitor. Exposes voltage, current, power, and temperature
+ sensor data through /sys/class/hwmon/.
+ .
+ This package uses DKMS to automatically rebuild the module
+ when the kernel is updated.
+
+Package: wireview-hwmon
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: wireview-hwmon-dkms
+Description: WireView Pro II daemon and CLI tool
+ Userspace daemon and CLI tool for the Thermal Grizzly WireView Pro II
+ GPU power monitor. The daemon reads the device over USB serial and
+ feeds sensor data to the wireview_hwmon kernel module.
+ .
+ Includes wireviewd (daemon), wireviewctl (CLI tool), systemd service,
+ and udev rules.

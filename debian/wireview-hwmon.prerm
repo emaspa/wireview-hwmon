@@ -1,0 +1,7 @@
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ]; then
+    deb-systemd-invoke stop wireviewd.service || true
+    deb-systemd-helper purge wireviewd.service || true
+fi
+#DEBHELPER#

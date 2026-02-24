@@ -14,7 +14,21 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
 - **wireviewd** — Userspace daemon that reads the device over serial and feeds the kernel module
 - **wireviewctl** — CLI tool for querying sensors and sending commands via the daemon
 
-## Requirements
+## Installation
+
+### Ubuntu (PPA)
+
+```bash
+sudo add-apt-repository ppa:sparvoli/wireview-hwmon
+sudo apt update
+sudo apt install wireview-hwmon wireview-hwmon-dkms
+```
+
+This installs the daemon, CLI tool, kernel module (via DKMS), systemd service, and udev rules. The module auto-rebuilds on kernel updates and the daemon starts automatically.
+
+### Build from source
+
+#### Requirements
 
 - Linux with kernel headers (`linux-headers-$(uname -r)`)
 - A Thermal Grizzly WireView Pro II device connected via USB

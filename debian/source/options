@@ -1,0 +1,11 @@
+tar-ignore=*.ko
+tar-ignore=*.o
+tar-ignore=*.mod
+tar-ignore=*.mod.c
+tar-ignore=.*.cmd
+tar-ignore=Module.symvers
+tar-ignore=modules.order
+tar-ignore=.tmp_versions
+tar-ignore=wireviewd
+tar-ignore=wireviewctl
+tar-ignore=reddit-post.md

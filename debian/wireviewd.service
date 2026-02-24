@@ -1,0 +1,12 @@
+[Unit]
+Description=WireView Pro II hwmon daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wireviewd
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

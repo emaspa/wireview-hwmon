@@ -1,0 +1,9 @@
+wireview-hwmon (1.0) noble; urgency=medium
+
+  * Initial release
+  * Kernel hwmon module for WireView Pro II (via DKMS)
+  * Daemon (wireviewd) for USB serial communication
+  * CLI tool (wireviewctl) for scripting device commands
+  * systemd service and udev rules
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Tue, 24 Feb 2026 08:20:04 +0000
