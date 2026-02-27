@@ -490,7 +490,7 @@ static void handle_client_request(int client_fd, int serial_fd)
 		if (payload_len >= 2)
 			config_size = payload[0] | ((int)payload[1] << 8);
 		else
-			config_size = dev_info.config_version == 0 ? 130 : 131;
+			config_size = dev_info.config_version == 0 ? 72 : 74;
 
 		if (config_size > 512 || config_size < 1) {
 			send_response(client_fd, RESP_ERROR, NULL, 0);

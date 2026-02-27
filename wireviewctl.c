@@ -245,17 +245,16 @@ static int cmd_write_config(const char *path)
 
 	size_t nbytes = slen / 2;
 	/* payload: [config_version:1][config_data] */
-	/* We need to figure out config version from the data size.
-	 * V0 config = 130 bytes, V1 config = 131 bytes.
-	 * We send config_version as first byte of payload. */
+	/* Determine config version from data size.
+	 * V0 config = 72 bytes, V1 config = 74 bytes. */
 	uint8_t cfg_ver;
-	if (nbytes == 130)
+	if (nbytes == 72)
 		cfg_ver = 0;
-	else if (nbytes == 131)
+	else if (nbytes == 74)
 		cfg_ver = 1;
 	else {
 		fprintf(stderr, "wireviewctl: unexpected config size %zu bytes "
-			"(expected 130 for v0 or 131 for v1)\n", nbytes);
+			"(expected 72 for v0 or 74 for v1)\n", nbytes);
 		return 1;
 	}
 
