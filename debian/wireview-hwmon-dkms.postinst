@@ -1,8 +1,8 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
-    dkms add -m wireview-hwmon -v 1.0 2>/dev/null || true
-    dkms build -m wireview-hwmon -v 1.0 || true
-    dkms install -m wireview-hwmon -v 1.0 || true
+    dkms add -m wireview-hwmon -v 1.1 2>/dev/null || true
+    dkms build -m wireview-hwmon -v 1.1 || true
+    dkms install -m wireview-hwmon -v 1.1 || true
 fi
 #DEBHELPER#

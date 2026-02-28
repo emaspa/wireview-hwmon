@@ -1,6 +1,6 @@
 #!/bin/sh
 set -e
 if [ "$1" = "remove" ]; then
-    dkms remove -m wireview-hwmon -v 1.0 --all 2>/dev/null || true
+    dkms remove -m wireview-hwmon -v 1.1 --all 2>/dev/null || true
 fi
 #DEBHELPER#
