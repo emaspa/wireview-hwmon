@@ -1,3 +1,9 @@
+wireview-hwmon (1.2) noble; urgency=medium
+
+  * Fix DKMS package scripts to use correct version during upgrades
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Sat, 28 Feb 2026 22:00:00 +0000
+
 wireview-hwmon (1.1) noble; urgency=medium
 
   * Fix config read/write sizes to match firmware struct layout
