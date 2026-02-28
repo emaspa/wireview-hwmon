@@ -1,3 +1,11 @@
+wireview-hwmon (1.1) noble; urgency=medium
+
+  * Fix config read/write sizes to match firmware struct layout
+  * wireviewd: default config read size corrected from 130/131 to 72/74 bytes
+  * wireviewctl: write-config now accepts correct config sizes (72/74 bytes)
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Fri, 28 Feb 2026 18:00:00 +0000
+
 wireview-hwmon (1.0) noble; urgency=medium
 
   * Initial release

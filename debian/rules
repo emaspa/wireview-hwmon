@@ -13,9 +13,9 @@ override_dh_auto_install:
 	install -D -m 644 debian/wireviewd.service debian/wireview-hwmon/lib/systemd/system/wireviewd.service
 	install -D -m 644 99-wireview-hwmon.rules debian/wireview-hwmon/lib/udev/rules.d/99-wireview-hwmon.rules
 	# DKMS package
-	install -D -m 644 wireview_hwmon.c debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.0/wireview_hwmon.c
-	install -D -m 644 dkms.conf debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.0/dkms.conf
-	install -D -m 644 Makefile.dkms debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.0/Makefile
+	install -D -m 644 wireview_hwmon.c debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.1/wireview_hwmon.c
+	install -D -m 644 dkms.conf debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.1/dkms.conf
+	install -D -m 644 Makefile.dkms debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.1/Makefile
 
 override_dh_auto_clean:
 	rm -f wireviewd wireviewctl
