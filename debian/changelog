@@ -1,3 +1,11 @@
+wireview-hwmon (1.3) noble; urgency=medium
+
+  * Add support for firmware 1.0.6 config version 2 (96-byte config)
+  * wireviewd: read config version from device instead of deriving from FW version
+  * wireviewctl: write-config now accepts 96-byte v2 configs
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Sun, 08 Mar 2026 16:00:00 +0000
+
 wireview-hwmon (1.2) noble; urgency=medium
 
   * Fix DKMS package scripts to use correct version during upgrades
