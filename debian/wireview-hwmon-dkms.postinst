@@ -3,6 +3,6 @@ set -e
 if [ "$1" = "configure" ]; then
     dkms add -m wireview-hwmon -v 1.3 2>/dev/null || true
     dkms build -m wireview-hwmon -v 1.3 || true
-    dkms install -m wireview-hwmon -v 1.3 || true
+    dkms install -m wireview-hwmon -v 1.3 --force || true
 fi
 #DEBHELPER#
