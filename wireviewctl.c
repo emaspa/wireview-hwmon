@@ -252,9 +252,11 @@ static int cmd_write_config(const char *path)
 		cfg_ver = 0;
 	else if (nbytes == 74)
 		cfg_ver = 1;
+	else if (nbytes == 96)
+		cfg_ver = 2;
 	else {
 		fprintf(stderr, "wireviewctl: unexpected config size %zu bytes "
-			"(expected 72 for v0 or 74 for v1)\n", nbytes);
+			"(expected 72 for v0, 74 for v1, or 96 for v2)\n", nbytes);
 		return 1;
 	}
 

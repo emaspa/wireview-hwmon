@@ -345,7 +345,6 @@ static int query_device_info(int serial_fd)
 		return -1;
 
 	dev_info.fw_version = buf[2];
-	dev_info.config_version = buf[2] > 2 ? 1 : 0;
 
 	/* CMD_READ_UID (0x02): 12 bytes */
 	cmd = CMD_READ_UID;
@@ -362,6 +361,14 @@ static int query_device_info(int serial_fd)
 	/* BuildInfo starts at offset 35 (3 + 32), 32 bytes max */
 	memcpy(dev_info.build_string, buf + 35, 32);
 	dev_info.build_string[32] = '\0';
+
+	/* Read config version from the config struct's Version field (byte 2).
+	 * Send CMD_READ_CONFIG, read first 4 bytes, extract version. */
+	cmd = CMD_READ_CONFIG;
+	tcflush(serial_fd, TCIFLUSH);
+	if (write(serial_fd, &cmd, 1) != 1) goto done;
+	if (read_exact(serial_fd, buf, 4, 1000) < 0) goto done;
+	dev_info.config_version = buf[2];
 
 done:
 	dev_info.valid = 1;
@@ -490,7 +497,8 @@ static void handle_client_request(int client_fd, int serial_fd)
 		if (payload_len >= 2)
 			config_size = payload[0] | ((int)payload[1] << 8);
 		else
-			config_size = dev_info.config_version == 0 ? 72 : 74;
+			config_size = dev_info.config_version == 0 ? 72 :
+				      dev_info.config_version == 1 ? 74 : 96;
 
 		if (config_size > 512 || config_size < 1) {
 			send_response(client_fd, RESP_ERROR, NULL, 0);
