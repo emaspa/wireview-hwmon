@@ -18,6 +18,7 @@
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
 #include <linux/ktime.h>
+#include <linux/version.h>
 
 #define WIREVIEW_MAGIC   0x57565032  /* "WVP2" */
 #define WIREVIEW_VERSION 2
@@ -420,12 +421,24 @@ static int wireview_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * platform_driver::remove() returned int before Linux 6.11 and void from
+ * 6.11 onwards (commit 0edb555a65d1). Match the running kernel's signature so
+ * the module builds on both older (e.g. RHEL 9, 5.14-based) and newer kernels.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+static int wireview_remove(struct platform_device *pdev)
+#else
 static void wireview_remove(struct platform_device *pdev)
+#endif
 {
 	struct wireview_priv *priv = platform_get_drvdata(pdev);
 
 	wireview_global = NULL;
 	misc_deregister(&priv->misc);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
+	return 0;
+#endif
 }
 
 static struct platform_driver wireview_driver = {
