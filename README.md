@@ -16,7 +16,7 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
 
 ## Installation
 
-### Ubuntu 24.04 (PPA)
+### Ubuntu 24.04 / 26.04 (PPA)
 
 ```bash
 sudo add-apt-repository ppa:sparvoli/wireview-hwmon
@@ -31,7 +31,7 @@ This installs the daemon, CLI tool, kernel module (via DKMS), systemd service, a
 Pre-built `.deb` packages are available on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page. Download and install:
 
 ```bash
-sudo apt install ./wireview-hwmon_1.0_amd64.deb ./wireview-hwmon-dkms_1.0_all.deb
+sudo apt install ./wireview-hwmon_1.3.2_amd64.deb ./wireview-hwmon-dkms_1.3.2_all.deb
 ```
 
 ### Build from source
