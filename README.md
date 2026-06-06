@@ -34,6 +34,27 @@ Pre-built `.deb` packages are available on the [Releases](https://github.com/ema
 sudo apt install ./wireview-hwmon_1.3.2_amd64.deb ./wireview-hwmon-dkms_1.3.2_all.deb
 ```
 
+### Fedora (COPR)
+
+```bash
+sudo dnf copr enable emaspa/wireview-linux
+sudo dnf install wireview-hwmon wireview-hwmon-dkms
+sudo systemctl enable --now wireviewd
+```
+
+The same COPR repo also provides the [WireView GUI](https://github.com/emaspa/wireview-linux) (`wireview-linux`). The DKMS module pulls `kernel-devel` for your running kernel and rebuilds automatically on kernel updates.
+
+### Arch / CachyOS / EndeavourOS (AUR)
+
+```bash
+paru -S wireview-hwmon wireview-hwmon-dkms   # or: yay -S
+sudo systemctl enable --now wireviewd
+```
+
+DKMS needs the matching kernel headers (`linux-headers`, `linux-cachyos-headers`, …) installed; the module then rebuilds automatically on kernel updates.
+
+> **Immutable / atomic distros** (Bazzite, Silverblue, Kinoite) are not supported for the kernel module — DKMS doesn't fit rpm-ostree. On those, run the [WireView GUI Flatpak](https://github.com/emaspa/wireview-linux) in direct-serial mode, which doesn't need this module.
+
 ### Build from source
 
 #### Requirements
