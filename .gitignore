@@ -29,3 +29,6 @@ debian/wireview-hwmon-dkms/
 
 # Draft posts
 reddit-post.md
+
+# Graphify knowledge-graph output (generated)
+graphify-out/
