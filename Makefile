@@ -28,7 +28,8 @@ install: all
 	install -d /etc/avahi/services
 	install -m 644 avahi-wireview.service /etc/avahi/services/wireview.service
 	install -d -m 700 /etc/wireview
-	@echo "Note: to enable remote writes, put a shared passphrase in /etc/wireview/secret (mode 600)"
+	@echo "Note: the LAN listener is OFF by default. To publish this host, put 'enabled=1' in"
+	@echo "      /etc/wireview/secret (mode 600); add 'secret=<passphrase>' to allow authenticated remote writes."
 	udevadm control --reload-rules
 	systemctl daemon-reload
 

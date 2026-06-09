@@ -138,6 +138,7 @@ static int g_have_last;
 /* Write-command auth + relay state for the HTTP POST /command endpoint. */
 static char g_secret[128];      /* shared HMAC secret; empty => writes disabled */
 static int  g_serial_fd = -1;   /* current serial fd, for HTTP command relay */
+static int  g_http_enabled = 0; /* network listener off unless config enables it */
 
 #define HTTP_MAX_BODY    8192
 #define HTTP_AUTH_WINDOW 30     /* seconds of timestamp skew tolerated */
@@ -716,25 +717,58 @@ static int setup_http(void)
 
 /* ---- Write-command auth + relay (HTTP POST /command) ---- */
 
-/* Load the shared HMAC secret from $WIREVIEW_SECRET or /etc/wireview/secret.
- * Empty/missing -> g_secret[0]==0 -> writes are refused (403). */
-static void load_secret(void)
+static int truthy(const char *s)
+{
+	return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
+}
+
+/* Load the network-listener flag and shared HMAC secret from /etc/wireview/secret.
+ * The file holds "key=value" lines: "enabled=0|1" gates the listener (default OFF,
+ * so no port is opened unless explicitly enabled) and "secret=<passphrase>" sets
+ * the write secret; a bare line is taken as the secret (backward compatible).
+ * $WIREVIEW_LISTEN and $WIREVIEW_SECRET override the file. An empty secret leaves
+ * writes refused (403) even when the listener is on. */
+static void load_config(void)
 {
 	g_secret[0] = '\0';
-	const char *env = getenv("WIREVIEW_SECRET");
-	if (env && env[0]) {
-		snprintf(g_secret, sizeof(g_secret), "%s", env);
-		return;
-	}
+	g_http_enabled = 0;
+
 	FILE *f = fopen("/etc/wireview/secret", "r");
-	if (!f) return;
-	if (fgets(g_secret, sizeof(g_secret), f)) {
-		size_t n = strlen(g_secret);
-		while (n && (g_secret[n - 1] == '\n' || g_secret[n - 1] == '\r' ||
-			     g_secret[n - 1] == ' ' || g_secret[n - 1] == '\t'))
-			g_secret[--n] = '\0';
+	if (f) {
+		char line[192];
+		while (fgets(line, sizeof(line), f)) {
+			size_t n = strlen(line);
+			while (n && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+				     line[n - 1] == ' ' || line[n - 1] == '\t'))
+				line[--n] = '\0';
+
+			char *p = line;
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p == '#' || *p == '\0') continue;
+
+			char *eq = strchr(p, '=');
+			if (eq) {
+				*eq = '\0';
+				char *val = eq + 1;
+				while (*val == ' ' || *val == '\t') val++;
+				if (strcmp(p, "enabled") == 0)
+					g_http_enabled = truthy(val);
+				else if (strcmp(p, "secret") == 0 && !g_secret[0])
+					snprintf(g_secret, sizeof(g_secret), "%s", val);
+			} else if (!g_secret[0]) {
+				snprintf(g_secret, sizeof(g_secret), "%s", p);
+			}
+		}
+		fclose(f);
 	}
-	fclose(f);
+
+	/* Environment overrides win over the file. */
+	const char *env = getenv("WIREVIEW_SECRET");
+	if (env && env[0])
+		snprintf(g_secret, sizeof(g_secret), "%s", env);
+	const char *listen = getenv("WIREVIEW_LISTEN");
+	if (listen)
+		g_http_enabled = truthy(listen);
 }
 
 /* Case-insensitive HTTP header value extraction. Returns 1 if found. */
@@ -1065,14 +1099,20 @@ int main(int argc, char **argv)
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
 
-	int http_fd = setup_http();
-	if (http_fd < 0)
-		fprintf(stderr, "wireviewd: warning: HTTP publisher disabled (port %d in use?)\n",
-			HTTP_PORT);
+	load_config();
 
-	load_secret();
-	printf("wireviewd: remote writes %s\n",
-	       g_secret[0] ? "ENABLED (secret configured)" : "disabled (no secret)");
+	int http_fd = -1;
+	if (g_http_enabled) {
+		http_fd = setup_http();
+		if (http_fd < 0)
+			fprintf(stderr, "wireviewd: warning: network listener failed (port %d in use?)\n",
+				HTTP_PORT);
+		else
+			printf("wireviewd: network listener ENABLED on :%d; remote writes %s\n",
+			       HTTP_PORT, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
+	} else {
+		printf("wireviewd: network listener disabled (set enabled=1 in /etc/wireview/secret to publish)\n");
+	}
 
 	printf("wireviewd: starting\n");
 
