@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: GPL-2.0
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,7 @@
 #include <linux/limits.h>
 #include <netinet/in.h>
 #include <sys/time.h>
+#include "sha256.h"
 
 #define WIREVIEW_VID "0483"
 #define WIREVIEW_PID "5740"
@@ -132,6 +134,13 @@ static struct device_info dev_info;
 /* Latest sensor frame, cached for the HTTP /sensors publisher. */
 static struct sensor_struct g_last;
 static int g_have_last;
+
+/* Write-command auth + relay state for the HTTP POST /command endpoint. */
+static char g_secret[128];      /* shared HMAC secret; empty => writes disabled */
+static int  g_serial_fd = -1;   /* current serial fd, for HTTP command relay */
+
+#define HTTP_MAX_BODY    8192
+#define HTTP_AUTH_WINDOW 30     /* seconds of timestamp skew tolerated */
 
 static void sig_handler(int sig)
 {
@@ -705,37 +714,320 @@ static int setup_http(void)
 	return fd;
 }
 
-/* Accept one HTTP connection, answer GET /sensors, close. */
+/* ---- Write-command auth + relay (HTTP POST /command) ---- */
+
+/* Load the shared HMAC secret from $WIREVIEW_SECRET or /etc/wireview/secret.
+ * Empty/missing -> g_secret[0]==0 -> writes are refused (403). */
+static void load_secret(void)
+{
+	g_secret[0] = '\0';
+	const char *env = getenv("WIREVIEW_SECRET");
+	if (env && env[0]) {
+		snprintf(g_secret, sizeof(g_secret), "%s", env);
+		return;
+	}
+	FILE *f = fopen("/etc/wireview/secret", "r");
+	if (!f) return;
+	if (fgets(g_secret, sizeof(g_secret), f)) {
+		size_t n = strlen(g_secret);
+		while (n && (g_secret[n - 1] == '\n' || g_secret[n - 1] == '\r' ||
+			     g_secret[n - 1] == ' ' || g_secret[n - 1] == '\t'))
+			g_secret[--n] = '\0';
+	}
+	fclose(f);
+}
+
+/* Case-insensitive HTTP header value extraction. Returns 1 if found. */
+static int http_header(const char *req, const char *name, char *out, size_t outsz)
+{
+	char key[64];
+	snprintf(key, sizeof(key), "\r\n%s:", name);
+	const char *p = strcasestr(req, key);
+	if (!p) return 0;
+	p += strlen(key);
+	while (*p == ' ' || *p == '\t') p++;
+	size_t i = 0;
+	while (*p && *p != '\r' && *p != '\n' && i < outsz - 1)
+		out[i++] = *p++;
+	out[i] = '\0';
+	return 1;
+}
+
+/* ---- tiny JSON readers for our flat, controlled command schema ---- */
+static const char *json_find(const char *json, const char *key)
+{
+	char k[48];
+	snprintf(k, sizeof(k), "\"%s\"", key);
+	const char *p = strstr(json, k);
+	if (!p) return NULL;
+	p += strlen(k);
+	while (*p == ' ' || *p == ':' || *p == '\t') p++;
+	return p;
+}
+static int json_str(const char *json, const char *key, char *out, size_t n)
+{
+	const char *p = json_find(json, key);
+	if (!p || *p != '"') return 0;
+	p++;
+	size_t i = 0;
+	while (*p && *p != '"' && i < n - 1) {
+		if (*p == '\\' && p[1]) p++;
+		out[i++] = *p++;
+	}
+	out[i] = '\0';
+	return 1;
+}
+static int json_int(const char *json, const char *key, long *out)
+{
+	const char *p = json_find(json, key);
+	if (!p) return 0;
+	char *end;
+	long v = strtol(p, &end, 10);
+	if (end == p) return 0;
+	*out = v;
+	return 1;
+}
+
+static int b64val(char c)
+{
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+static int b64_decode(const char *in, uint8_t *out, size_t outcap)
+{
+	size_t outlen = 0;
+	uint32_t acc = 0;
+	int bits = 0;
+	for (const char *p = in; *p; p++) {
+		if (*p == '=' || *p == '\r' || *p == '\n' || *p == ' ' || *p == '\t')
+			continue;
+		int v = b64val(*p);
+		if (v < 0) return -1;
+		acc = (acc << 6) | (uint32_t)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			if (outlen >= outcap) return -1;
+			out[outlen++] = (uint8_t)(acc >> bits);
+		}
+	}
+	return (int)outlen;
+}
+
+/* ---- serial relay helpers (mirror the WCMD_* socket handlers) ---- */
+static int relay_screen(uint8_t cmd)
+{
+	uint8_t c[2] = { CMD_SCREEN_CHANGE, cmd };
+	tcflush(g_serial_fd, TCIFLUSH);
+	return write(g_serial_fd, c, 2) == 2;
+}
+static int relay_nvm(uint8_t cmd)
+{
+	uint8_t c[6] = { CMD_NVM_CONFIG, 0x55, 0xAA, 0x55, 0xAA, cmd };
+	tcflush(g_serial_fd, TCIFLUSH);
+	return write(g_serial_fd, c, 6) == 6;
+}
+static int relay_clear_faults(uint16_t status, uint16_t log)
+{
+	uint8_t c[5] = { CMD_CLEAR_FAULTS, (uint8_t)(status & 0xFF),
+			 (uint8_t)(status >> 8), (uint8_t)(log & 0xFF),
+			 (uint8_t)(log >> 8) };
+	tcflush(g_serial_fd, TCIFLUSH);
+	return write(g_serial_fd, c, 5) == 5;
+}
+static int relay_write_config(const uint8_t *data, int data_len)
+{
+	uint8_t frame[64];
+	frame[0] = CMD_WRITE_CONFIG;
+	tcflush(g_serial_fd, TCIFLUSH);
+	for (int off = 0; off < data_len && off <= 255; off += 62) {
+		int n = data_len - off;
+		if (n > 62) n = 62;
+		frame[1] = (uint8_t)off;
+		memcpy(frame + 2, data + off, n);
+		if (write(g_serial_fd, frame, n + 2) != n + 2)
+			return 0;
+	}
+	return 1;
+}
+
+static void http_respond(int cfd, int status, const char *text, const char *body)
+{
+	char hdr[256];
+	int blen = body ? (int)strlen(body) : 0;
+	int hn = snprintf(hdr, sizeof(hdr),
+		"HTTP/1.1 %d %s\r\nContent-Type: application/json\r\n"
+		"Connection: close\r\nContent-Length: %d\r\n\r\n",
+		status, text, blen);
+	(void)!write(cfd, hdr, hn);
+	if (blen) (void)!write(cfd, body, blen);
+}
+
+/* Bounded recent-nonce ring for replay rejection within the auth window. */
+#define NONCE_RING 64
+static struct { char nonce[64]; long ts; } g_nonces[NONCE_RING];
+static int g_nonce_idx;
+static int nonce_replay(const char *nonce, long now)
+{
+	for (int i = 0; i < NONCE_RING; i++)
+		if (g_nonces[i].ts && now - g_nonces[i].ts <= HTTP_AUTH_WINDOW &&
+		    strcmp(g_nonces[i].nonce, nonce) == 0)
+			return 1;
+	snprintf(g_nonces[g_nonce_idx].nonce, sizeof(g_nonces[0].nonce), "%s", nonce);
+	g_nonces[g_nonce_idx].ts = now;
+	g_nonce_idx = (g_nonce_idx + 1) % NONCE_RING;
+	return 0;
+}
+
+/* Authenticated write: verify HMAC, then relay the command to the device. */
+static void handle_post_command(int cfd, const char *req, const char *body)
+{
+	if (g_secret[0] == '\0') {
+		http_respond(cfd, 403, "Forbidden", "{\"error\":\"writes disabled\"}");
+		return;
+	}
+
+	char ts[24] = {0}, nonce[48] = {0}, sig[80] = {0};
+	if (!http_header(req, "X-Auth-Ts", ts, sizeof(ts)) ||
+	    !http_header(req, "X-Auth-Nonce", nonce, sizeof(nonce)) ||
+	    !http_header(req, "X-Auth-Sig", sig, sizeof(sig))) {
+		http_respond(cfd, 401, "Unauthorized", "{\"error\":\"missing auth\"}");
+		return;
+	}
+
+	long t = strtol(ts, NULL, 10);
+	long now = (long)time(NULL);
+	if (now - t > HTTP_AUTH_WINDOW || t - now > HTTP_AUTH_WINDOW) {
+		http_respond(cfd, 401, "Unauthorized", "{\"error\":\"stale\"}");
+		return;
+	}
+
+	char msg[HTTP_MAX_BODY + 128];
+	int mlen = snprintf(msg, sizeof(msg), "%s\n%s\n%s", ts, nonce, body);
+	uint8_t mac[32];
+	char machex[65];
+	hmac_sha256((uint8_t *)g_secret, strlen(g_secret),
+		    (uint8_t *)msg, (size_t)mlen, mac);
+	hex_encode(mac, 32, machex);
+	if (!ct_str_equal(machex, sig)) {
+		http_respond(cfd, 401, "Unauthorized", "{\"error\":\"bad signature\"}");
+		return;
+	}
+	if (nonce_replay(nonce, now)) {
+		http_respond(cfd, 401, "Unauthorized", "{\"error\":\"replay\"}");
+		return;
+	}
+
+	if (g_serial_fd < 0) {
+		http_respond(cfd, 503, "Service Unavailable", "{\"error\":\"no device\"}");
+		return;
+	}
+
+	char op[24] = {0};
+	if (!json_str(body, "op", op, sizeof(op))) {
+		http_respond(cfd, 400, "Bad Request", "{\"error\":\"no op\"}");
+		return;
+	}
+
+	int ok = -1; /* -1 = unknown op */
+	long c;
+	if (strcmp(op, "screen") == 0) {
+		ok = json_int(body, "cmd", &c) ? relay_screen((uint8_t)c) : 0;
+	} else if (strcmp(op, "nvm") == 0) {
+		ok = json_int(body, "cmd", &c) ? relay_nvm((uint8_t)c) : 0;
+	} else if (strcmp(op, "clearFaults") == 0) {
+		long s = 0xFFFF, l = 0xFFFF;
+		json_int(body, "statusMask", &s);
+		json_int(body, "logMask", &l);
+		ok = relay_clear_faults((uint16_t)s, (uint16_t)l);
+	} else if (strcmp(op, "writeConfig") == 0) {
+		char data[4096] = {0};
+		uint8_t cfg[1024];
+		ok = 0;
+		if (json_str(body, "data", data, sizeof(data))) {
+			int n = b64_decode(data, cfg, sizeof(cfg));
+			if (n > 0) ok = relay_write_config(cfg, n);
+		}
+	}
+
+	if (ok < 0)
+		http_respond(cfd, 400, "Bad Request", "{\"error\":\"unknown op\"}");
+	else if (ok)
+		http_respond(cfd, 200, "OK", "{\"ok\":true}");
+	else
+		http_respond(cfd, 500, "Internal Server Error", "{\"error\":\"relay failed\"}");
+}
+
+/* Accept one HTTP connection, route GET /sensors and POST /command, close. */
 static void http_handle(int http_fd)
 {
 	int cfd = accept(http_fd, NULL, NULL);
 	if (cfd < 0) return;
 
-	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
 	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-	char req[512];
-	ssize_t r = recv(cfd, req, sizeof(req) - 1, 0);
-	if (r <= 0) { close(cfd); return; }
-	req[r] = '\0';
+	static char buf[HTTP_MAX_BODY + 2048];
+	size_t total = 0;
+	char *hdr_end = NULL;
+	while (total < sizeof(buf) - 1) {
+		ssize_t r = recv(cfd, buf + total, sizeof(buf) - 1 - total, 0);
+		if (r <= 0) break;
+		total += (size_t)r;
+		buf[total] = '\0';
+		if ((hdr_end = strstr(buf, "\r\n\r\n")) != NULL) break;
+	}
+	if (!hdr_end) { close(cfd); return; }
 
-	if (strncmp(req, "GET /sensors", 12) == 0) {
+	char method[8] = {0}, path[64] = {0};
+	if (sscanf(buf, "%7s %63s", method, path) != 2) { close(cfd); return; }
+
+	if (strcmp(method, "GET") == 0 && strcmp(path, "/sensors") == 0) {
 		char body[2048];
 		int bn = build_sensors_json(body, sizeof(body));
 		char hdr[256];
 		int hn = snprintf(hdr, sizeof(hdr),
-			"HTTP/1.1 200 OK\r\n"
-			"Content-Type: application/json\r\n"
-			"Access-Control-Allow-Origin: *\r\n"
-			"Connection: close\r\n"
+			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+			"Access-Control-Allow-Origin: *\r\nConnection: close\r\n"
 			"Content-Length: %d\r\n\r\n", bn);
 		(void)!write(cfd, hdr, hn);
 		(void)!write(cfd, body, bn);
-	} else {
-		const char *resp = "HTTP/1.1 404 Not Found\r\n"
-			"Connection: close\r\nContent-Length: 0\r\n\r\n";
-		(void)!write(cfd, resp, strlen(resp));
+		close(cfd);
+		return;
 	}
+
+	if (strcmp(method, "POST") == 0 && strcmp(path, "/command") == 0) {
+		char clbuf[16];
+		size_t want = 0;
+		if (http_header(buf, "Content-Length", clbuf, sizeof(clbuf)))
+			want = (size_t)strtoul(clbuf, NULL, 10);
+		if (want > HTTP_MAX_BODY) {
+			http_respond(cfd, 413, "Payload Too Large", "{\"error\":\"too large\"}");
+			close(cfd);
+			return;
+		}
+		size_t body_off = (size_t)(hdr_end + 4 - buf);
+		while (total - body_off < want && total < sizeof(buf) - 1) {
+			ssize_t r = recv(cfd, buf + total, sizeof(buf) - 1 - total, 0);
+			if (r <= 0) break;
+			total += (size_t)r;
+		}
+		if (body_off + want < sizeof(buf))
+			buf[body_off + want] = '\0';
+		else
+			buf[total] = '\0';
+		handle_post_command(cfd, buf, buf + body_off);
+		close(cfd);
+		return;
+	}
+
+	const char *resp = "HTTP/1.1 404 Not Found\r\n"
+		"Connection: close\r\nContent-Length: 0\r\n\r\n";
+	(void)!write(cfd, resp, strlen(resp));
 	close(cfd);
 }
 
@@ -777,6 +1069,10 @@ int main(int argc, char **argv)
 	if (http_fd < 0)
 		fprintf(stderr, "wireviewd: warning: HTTP publisher disabled (port %d in use?)\n",
 			HTTP_PORT);
+
+	load_secret();
+	printf("wireviewd: remote writes %s\n",
+	       g_secret[0] ? "ENABLED (secret configured)" : "disabled (no secret)");
 
 	printf("wireviewd: starting\n");
 
@@ -838,6 +1134,9 @@ int main(int argc, char **argv)
 			sleep(2);
 			continue;
 		}
+
+		/* Device is ready; allow HTTP command relay. */
+		g_serial_fd = serial_fd;
 
 		/* Set up command socket */
 		sock_fd = setup_socket();
@@ -968,6 +1267,7 @@ int main(int argc, char **argv)
 		}
 		cleanup_socket(sock_fd);
 
+		g_serial_fd = -1;
 		close(hwmon_fd);
 		close(serial_fd);
 		dev_path[0] = '\0';

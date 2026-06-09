@@ -8,8 +8,8 @@ all: module wireviewd wireviewctl
 module:
 	$(MAKE) -C $(KDIR) M=$(MDIR) modules
 
-wireviewd: wireviewd.c
-	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewd wireviewd.c
+wireviewd: wireviewd.c sha256.c sha256.h
+	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewd wireviewd.c sha256.c
 
 wireviewctl: wireviewctl.c
 	$(CC) -Wall -Wextra -O2 -o wireviewctl wireviewctl.c
@@ -27,6 +27,8 @@ install: all
 	install -m 644 99-wireview-hwmon.rules /etc/udev/rules.d/99-wireview-hwmon.rules
 	install -d /etc/avahi/services
 	install -m 644 avahi-wireview.service /etc/avahi/services/wireview.service
+	install -d -m 700 /etc/wireview
+	@echo "Note: to enable remote writes, put a shared passphrase in /etc/wireview/secret (mode 600)"
 	udevadm control --reload-rules
 	systemctl daemon-reload
 
