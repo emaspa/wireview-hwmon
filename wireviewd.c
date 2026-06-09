@@ -889,6 +889,43 @@ static int relay_write_config(const uint8_t *data, int data_len)
 	return 1;
 }
 
+/* Read the device config over serial into cfg[] (needs >= 512). Sets *version
+ * and returns the config byte length, or -1 on error. */
+static int relay_read_config(uint8_t *cfg, uint8_t *version)
+{
+	int size = dev_info.config_version == 0 ? 72 :
+		   dev_info.config_version == 1 ? 74 : 96;
+	uint8_t cmd = CMD_READ_CONFIG;
+	tcflush(g_serial_fd, TCIFLUSH);
+	if (write(g_serial_fd, &cmd, 1) != 1)
+		return -1;
+	if (read_exact(g_serial_fd, cfg, size, 2000) < 0)
+		return -1;
+	*version = dev_info.config_version;
+	return size;
+}
+
+static void b64_encode(const uint8_t *in, int len, char *out)
+{
+	static const char T[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	int i, o = 0;
+	for (i = 0; i + 2 < len; i += 3) {
+		uint32_t n = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8) | in[i + 2];
+		out[o++] = T[(n >> 18) & 63]; out[o++] = T[(n >> 12) & 63];
+		out[o++] = T[(n >> 6) & 63];  out[o++] = T[n & 63];
+	}
+	if (i < len) {
+		uint32_t n = (uint32_t)in[i] << 16;
+		if (i + 1 < len) n |= (uint32_t)in[i + 1] << 8;
+		out[o++] = T[(n >> 18) & 63];
+		out[o++] = T[(n >> 12) & 63];
+		out[o++] = (i + 1 < len) ? T[(n >> 6) & 63] : '=';
+		out[o++] = '=';
+	}
+	out[o] = '\0';
+}
+
 static void http_respond(int cfd, int status, const char *text, const char *body)
 {
 	char hdr[256];
@@ -1030,6 +1067,32 @@ static void http_handle(int http_fd)
 			"Content-Length: %d\r\n\r\n", bn);
 		(void)!write(cfd, hdr, hn);
 		(void)!write(cfd, body, bn);
+		close(cfd);
+		return;
+	}
+
+	if (strcmp(method, "GET") == 0 && strcmp(path, "/config") == 0) {
+		if (g_serial_fd < 0) {
+			http_respond(cfd, 503, "Service Unavailable", "{\"error\":\"no device\"}");
+			close(cfd);
+			return;
+		}
+		uint8_t cfg[512], ver = 0;
+		int n = relay_read_config(cfg, &ver);
+		if (n < 0) {
+			http_respond(cfd, 500, "Internal Server Error", "{\"error\":\"read failed\"}");
+			close(cfd);
+			return;
+		}
+		char uid[25];
+		for (int i = 0; i < 12; i++)
+			snprintf(uid + i * 2, 3, "%02X", dev_info.uid[i]);
+		char b64[720];
+		b64_encode(cfg, n, b64);
+		char body[1024];
+		snprintf(body, sizeof(body),
+			"{\"deviceId\":\"%s\",\"version\":%d,\"data\":\"%s\"}", uid, ver, b64);
+		http_respond(cfd, 200, "OK", body);
 		close(cfd);
 		return;
 	}
