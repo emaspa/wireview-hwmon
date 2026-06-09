@@ -1,0 +1,14 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  Advertises wireviewd's HTTP /sensors publisher on the LAN as _wireview._tcp,
+  so WireView desktop clients (and the CLI) auto-discover this host's device.
+  Installed to /etc/avahi/services/wireview.service; avahi-daemon picks it up.
+-->
+<service-group>
+  <name replace-wildcards="yes">WireView Pro II on %h</name>
+  <service>
+    <type>_wireview._tcp</type>
+    <port>9876</port>
+  </service>
+</service-group>

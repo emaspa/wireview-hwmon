@@ -25,6 +25,8 @@ install: all
 	install -m 755 wireviewctl /usr/local/bin/wireviewctl
 	install -m 644 wireviewd.service /etc/systemd/system/wireviewd.service
 	install -m 644 99-wireview-hwmon.rules /etc/udev/rules.d/99-wireview-hwmon.rules
+	install -d /etc/avahi/services
+	install -m 644 avahi-wireview.service /etc/avahi/services/wireview.service
 	udevadm control --reload-rules
 	systemctl daemon-reload
 
@@ -35,6 +37,7 @@ uninstall:
 	rm -f /usr/local/bin/wireviewctl
 	rm -f /etc/systemd/system/wireviewd.service
 	rm -f /etc/udev/rules.d/99-wireview-hwmon.rules
+	rm -f /etc/avahi/services/wireview.service
 	rm -f /lib/modules/$(shell uname -r)/extra/wireview_hwmon.ko
 	depmod -a
 	udevadm control --reload-rules

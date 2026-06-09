@@ -27,11 +27,14 @@
 #include <sys/un.h>
 #include <sys/ioctl.h>
 #include <linux/limits.h>
+#include <netinet/in.h>
+#include <sys/time.h>
 
 #define WIREVIEW_VID "0483"
 #define WIREVIEW_PID "5740"
 #define HWMON_DEV    "/dev/wireview-hwmon"
 #define SOCK_PATH    "/run/wireviewd.sock"
+#define HTTP_PORT    9876
 
 #define WIREVIEW_MAGIC   0x57565032
 #define WIREVIEW_VERSION 2
@@ -125,6 +128,10 @@ struct device_info {
 };
 
 static struct device_info dev_info;
+
+/* Latest sensor frame, cached for the HTTP /sensors publisher. */
+static struct sensor_struct g_last;
+static int g_have_last;
 
 static void sig_handler(int sig)
 {
@@ -603,6 +610,135 @@ static void handle_client_request(int client_fd, int serial_fd)
 	}
 }
 
+/* ---- HTTP /sensors publisher (read-only LAN exposure) ---- */
+
+static int psu_cap_watts(uint8_t cap)
+{
+	switch (cap) {
+	case 0: return 600;
+	case 1: return 450;
+	case 2: return 300;
+	case 3: return 150;
+	default: return 0;
+	}
+}
+
+/*
+ * Build the GET /sensors JSON body. Matches the WireViewSensorDto schema the
+ * desktop app consumes (camelCase; UID is uppercase hex to match the app).
+ * This daemon manages a single device.
+ */
+static int build_sensors_json(char *out, size_t cap)
+{
+	char host[64] = "wireview";
+	gethostname(host, sizeof(host) - 1);
+
+	char ts[32];
+	time_t now = time(NULL);
+	struct tm tmv;
+	gmtime_r(&now, &tmv);
+	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+
+	/* No device / no frame yet -> empty list so consumers drop it. */
+	if (!g_have_last || !dev_info.valid)
+		return snprintf(out, cap,
+			"{\"host\":\"%s\",\"appVersion\":\"wireviewd\",\"devices\":[]}",
+			host);
+
+	char uid[25];
+	for (int i = 0; i < 12; i++)
+		snprintf(uid + i * 2, 3, "%02X", dev_info.uid[i]);
+
+	double pv[6], pc[6], sum_p = 0, sum_c = 0;
+	for (int i = 0; i < 6; i++) {
+		pv[i] = g_last.pins[i].voltage / 1000.0;
+		pc[i] = g_last.pins[i].current / 1000.0;
+		sum_p += pv[i] * pc[i];
+		sum_c += pc[i];
+	}
+	double t[4];
+	for (int i = 0; i < 4; i++) {
+		int16_t raw = g_last.ts[i];
+		t[i] = (raw < -400 || raw > 2000) ? 0.0 : raw / 10.0;
+	}
+
+	return snprintf(out, cap,
+		"{\"host\":\"%s\",\"appVersion\":\"wireviewd\",\"devices\":[{"
+		"\"id\":\"%s\",\"name\":\"WireView Pro II\",\"connected\":true,"
+		"\"hwRev\":\"\",\"fwVer\":\"%d\",\"timestamp\":\"%s\","
+		"\"pinVoltage\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
+		"\"pinCurrent\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
+		"\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
+		"\"psuCapW\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
+		"\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f}]}",
+		host, uid, dev_info.fw_version, ts,
+		pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
+		pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
+		t[0], t[1], t[2], t[3],
+		psu_cap_watts(g_last.hpwr_cap),
+		g_last.fault_status, g_last.fault_log,
+		sum_c, sum_p);
+}
+
+static int setup_http(void)
+{
+	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	if (fd < 0) return -1;
+
+	int yes = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	addr.sin_port = htons(HTTP_PORT);
+
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+	if (listen(fd, 8) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* Accept one HTTP connection, answer GET /sensors, close. */
+static void http_handle(int http_fd)
+{
+	int cfd = accept(http_fd, NULL, NULL);
+	if (cfd < 0) return;
+
+	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	char req[512];
+	ssize_t r = recv(cfd, req, sizeof(req) - 1, 0);
+	if (r <= 0) { close(cfd); return; }
+	req[r] = '\0';
+
+	if (strncmp(req, "GET /sensors", 12) == 0) {
+		char body[2048];
+		int bn = build_sensors_json(body, sizeof(body));
+		char hdr[256];
+		int hn = snprintf(hdr, sizeof(hdr),
+			"HTTP/1.1 200 OK\r\n"
+			"Content-Type: application/json\r\n"
+			"Access-Control-Allow-Origin: *\r\n"
+			"Connection: close\r\n"
+			"Content-Length: %d\r\n\r\n", bn);
+		(void)!write(cfd, hdr, hn);
+		(void)!write(cfd, body, bn);
+	} else {
+		const char *resp = "HTTP/1.1 404 Not Found\r\n"
+			"Connection: close\r\nContent-Length: 0\r\n\r\n";
+		(void)!write(cfd, resp, strlen(resp));
+	}
+	close(cfd);
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s [-i interval_ms] [-d /dev/ttyACMx]\n", prog);
@@ -636,6 +772,11 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
+
+	int http_fd = setup_http();
+	if (http_fd < 0)
+		fprintf(stderr, "wireviewd: warning: HTTP publisher disabled (port %d in use?)\n",
+			HTTP_PORT);
 
 	printf("wireviewd: starting\n");
 
@@ -720,6 +861,15 @@ int main(int argc, char **argv)
 				nfds++;
 			}
 
+			/* HTTP /sensors listener */
+			int http_pfd_idx = -1;
+			if (http_fd >= 0) {
+				http_pfd_idx = nfds;
+				pfds[nfds].fd = http_fd;
+				pfds[nfds].events = POLLIN;
+				nfds++;
+			}
+
 			/* Client sockets */
 			int client_pfd_start = nfds;
 			for (int i = 0; i < num_clients; i++) {
@@ -752,6 +902,11 @@ int main(int argc, char **argv)
 					}
 				}
 			}
+
+			/* Serve an HTTP /sensors request */
+			if (http_pfd_idx >= 0 &&
+			    (pfds[http_pfd_idx].revents & POLLIN))
+				http_handle(http_fd);
 
 			/* Handle client requests */
 			for (int i = 0; i < num_clients; ) {
@@ -793,6 +948,9 @@ int main(int argc, char **argv)
 					break;
 				}
 
+				memcpy(&g_last, &ss, sizeof(g_last));
+				g_have_last = 1;
+
 				next_poll.tv_sec = now.tv_sec;
 				next_poll.tv_nsec = now.tv_nsec +
 						    (long)interval_ms * 1000000;
@@ -813,10 +971,14 @@ int main(int argc, char **argv)
 		close(hwmon_fd);
 		close(serial_fd);
 		dev_path[0] = '\0';
+		g_have_last = 0;
 
 		if (running)
 			sleep(2);
 	}
+
+	if (http_fd >= 0)
+		close(http_fd);
 
 	printf("wireviewd: stopped\n");
 	return 0;
