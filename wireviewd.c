@@ -682,13 +682,13 @@ static int build_sensors_json(char *out, size_t cap)
 		"\"pinVoltage\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
 		"\"pinCurrent\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
 		"\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
-		"\"psuCapW\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
+		"\"psuCapW\":%d,\"fan\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
 		"\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f}]}",
 		host, uid, dev_info.fw_version, dev_info.build_string, ts,
 		pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
 		pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
 		t[0], t[1], t[2], t[3],
-		psu_cap_watts(g_last.hpwr_cap),
+		psu_cap_watts(g_last.hpwr_cap), g_last.fan_duty,
 		g_last.fault_status, g_last.fault_log,
 		sum_c, sum_p);
 }

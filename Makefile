@@ -12,7 +12,7 @@ wireviewd: wireviewd.c sha256.c sha256.h
 	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewd wireviewd.c sha256.c
 
 wireviewctl: wireviewctl.c
-	$(CC) -Wall -Wextra -O2 -o wireviewctl wireviewctl.c
+	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewctl wireviewctl.c
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(MDIR) clean
@@ -32,6 +32,7 @@ install: all
 	@echo "Note: the LAN listener is OFF by default. To publish this host, put 'enabled=1' in"
 	@echo "      /etc/wireview/secret (mode 600); add 'secret=<passphrase>' for authenticated remote"
 	@echo "      writes, and 'log_days=<N>' to set audit-log retention (default 14; logs in /var/log/wireview)."
+	@echo "      For 'wireviewctl top', list remote hosts (one host[:port] per line) in /etc/wireview/hosts."
 	udevadm control --reload-rules
 	systemctl daemon-reload
 

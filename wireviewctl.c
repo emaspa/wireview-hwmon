@@ -16,8 +16,15 @@
 #include <stdint.h>
 #include <errno.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <time.h>
+#include <poll.h>
+#include <signal.h>
+#include <termios.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/time.h>
 #include <linux/limits.h>
 
 #define SOCK_PATH "/run/wireviewd.sock"
@@ -531,6 +538,405 @@ static int cmd_sensors(void)
 
 /* ---------- Usage ---------- */
 
+/* ---------- top: live fleet monitor (local sysfs + remote /sensors) ---------- */
+
+#define WV_MAXDEV   32
+#define WV_MAXHOST  32
+#define TEMP_NA     -999.0
+
+/* UTF-8 glyphs + ANSI (explicit bytes so any compiler is happy) */
+#define ESC   "\033"
+#define BLK   "\xe2\x96\x88"   /* full block  */
+#define SHADE "\xe2\x96\x91"   /* light shade */
+#define TL    "\xe2\x95\xad"   /* round corner top-left */
+#define BL    "\xe2\x95\xb0"   /* round corner bottom-left */
+#define HR    "\xe2\x94\x80"   /* horizontal */
+#define VB    "\xe2\x94\x82"   /* vertical */
+#define DEG   "\xc2\xb0"       /* degree */
+
+struct wv_snap {
+	char     source[72];   /* "local" or "host[:port]" */
+	char     name[40];
+	char     fw[12];
+	int      ok;
+	double   pin_v[6], pin_c[6];
+	double   temp[4];      /* TEMP_NA if absent */
+	int      psu_cap_w;
+	int      fan;          /* duty %, -1 if unavailable */
+	unsigned fault_status, fault_log;
+	double   sum_w, sum_a;
+};
+
+/* Best-effort: ask the daemon (if running) for the local device's fw version.
+ * Silent on any failure so it never disturbs the TUI; sysfs has no fw attribute. */
+static void get_local_fw(char *out, size_t n)
+{
+	out[0] = '\0';
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return;
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+		uint8_t hdr[3] = { WCMD_GET_DEVICE_INFO, 0, 0 };
+		uint8_t rh[3];
+		if (write(fd, hdr, 3) == 3 && read(fd, rh, 3) == 3 &&
+		    rh[0] == RESP_OK && (rh[1] | (rh[2] << 8)) >= 1) {
+			uint8_t fw;
+			if (read(fd, &fw, 1) == 1)
+				snprintf(out, n, "%u", fw);
+		}
+	}
+	close(fd);
+}
+
+static int read_local(struct wv_snap *s)
+{
+	char hwmon[PATH_MAX];
+	if (find_hwmon_path(hwmon, sizeof(hwmon)) < 0)
+		return -1;
+
+	memset(s, 0, sizeof(*s));
+	snprintf(s->source, sizeof(s->source), "local");
+	snprintf(s->name, sizeof(s->name), "WireView Pro II");
+
+	long v;
+	char a[24];
+	for (int i = 0; i < 6; i++) {
+		snprintf(a, sizeof(a), "in%d_input", i);
+		s->pin_v[i] = read_sysfs_int(hwmon, a, &v) == 0 ? v / 1000.0 : 0;
+		snprintf(a, sizeof(a), "curr%d_input", i + 1);
+		s->pin_c[i] = read_sysfs_int(hwmon, a, &v) == 0 ? v / 1000.0 : 0;
+	}
+	s->sum_a = read_sysfs_int(hwmon, "curr7_input", &v) == 0 ? v / 1000.0 : 0;
+	s->sum_w = read_sysfs_int(hwmon, "power1_input", &v) == 0 ? v / 1000000.0 : 0;
+	for (int i = 0; i < 4; i++) {
+		snprintf(a, sizeof(a), "temp%d_input", i + 1);
+		s->temp[i] = read_sysfs_int(hwmon, a, &v) == 0 ? v / 1000.0 : TEMP_NA;
+	}
+	s->fault_status = read_sysfs_int(hwmon, "fault_status_raw", &v) == 0 ? (unsigned)v : 0;
+	s->fault_log    = read_sysfs_int(hwmon, "fault_log_raw", &v) == 0 ? (unsigned)v : 0;
+	int cap = read_sysfs_int(hwmon, "psu_cap", &v) == 0 ? (int)v : -1;
+	static const int capw[] = { 600, 450, 300, 150 };
+	s->psu_cap_w = (cap >= 0 && cap <= 3) ? capw[cap] : 0;
+	s->fan = read_sysfs_int(hwmon, "fan1_input", &v) == 0 ? (int)v : -1;
+	get_local_fw(s->fw, sizeof(s->fw));
+	s->ok = 1;
+	return 0;
+}
+
+/* Blocking-with-timeout HTTP GET; body (headers stripped) left in out. */
+static int http_get_sensors(const char *hostport, char *out, size_t cap)
+{
+	char host[128];
+	snprintf(host, sizeof(host), "%s", hostport);
+	int port = 9876;
+	char *colon = strrchr(host, ':');
+	if (colon) { *colon = '\0'; port = atoi(colon + 1); }
+	char portstr[8];
+	snprintf(portstr, sizeof(portstr), "%d", port);
+
+	struct addrinfo hints = {0}, *res = NULL;
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if (getaddrinfo(host, portstr, &hints, &res) != 0)
+		return -1;
+
+	int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+	int rc = -1;
+	if (fd >= 0) {
+		fcntl(fd, F_SETFL, O_NONBLOCK);
+		int cr = connect(fd, res->ai_addr, res->ai_addrlen);
+		if (cr < 0 && errno == EINPROGRESS) {
+			struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+			if (poll(&pfd, 1, 1500) == 1) {
+				int err = 0; socklen_t el = sizeof(err);
+				getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+				cr = err ? -1 : 0;
+			}
+		}
+		if (cr == 0) {
+			fcntl(fd, F_SETFL, 0);
+			struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+			setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+			char req[256];
+			int n = snprintf(req, sizeof(req),
+				"GET /sensors HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
+			if (write(fd, req, n) == n) {
+				size_t total = 0;
+				ssize_t r;
+				while (total < cap - 1 && (r = read(fd, out + total, cap - 1 - total)) > 0)
+					total += (size_t)r;
+				out[total] = '\0';
+				rc = 0;
+			}
+		}
+		close(fd);
+	}
+	freeaddrinfo(res);
+	if (rc < 0)
+		return -1;
+
+	char *body = strstr(out, "\r\n\r\n");
+	if (body)
+		memmove(out, body + 4, strlen(body + 4) + 1);
+	return 0;
+}
+
+/* ---- minimal JSON readers for the flat /sensors schema ---- */
+static const char *j_find(const char *j, const char *key)
+{
+	char k[40];
+	snprintf(k, sizeof(k), "\"%s\"", key);
+	const char *p = strstr(j, k);
+	if (!p) return NULL;
+	p += strlen(k);
+	while (*p == ' ' || *p == ':') p++;
+	return p;
+}
+static double j_num(const char *j, const char *key)
+{
+	const char *p = j_find(j, key);
+	return p ? strtod(p, NULL) : 0;
+}
+static void j_str(const char *j, const char *key, char *out, size_t n)
+{
+	const char *p = j_find(j, key);
+	out[0] = '\0';
+	if (!p || *p != '"') return;
+	p++;
+	size_t i = 0;
+	while (*p && *p != '"' && i < n - 1) out[i++] = *p++;
+	out[i] = '\0';
+}
+static void j_arr6(const char *j, const char *key, double out[6])
+{
+	const char *p = j_find(j, key);
+	if (!p || *p != '[') return;
+	p++;
+	char *end;
+	for (int i = 0; i < 6; i++) {
+		out[i] = strtod(p, &end);
+		if (end == p) break;
+		p = end;
+		while (*p == ',' || *p == ' ') p++;
+	}
+}
+
+static int parse_remote(const char *hostport, const char *body,
+			struct wv_snap *snaps, int max)
+{
+	const char *devs = strstr(body, "\"devices\"");
+	if (!devs) return 0;
+	const char *p = strchr(devs, '[');
+	if (!p) return 0;
+	int n = 0;
+	while (n < max && (p = strchr(p, '{')) != NULL) {
+		const char *end = strchr(p, '}');     /* device objects hold no nested {} */
+		if (!end) break;
+		size_t len = (size_t)(end - p + 1);
+		char obj[2048];
+		if (len >= sizeof(obj)) len = sizeof(obj) - 1;
+		memcpy(obj, p, len);
+		obj[len] = '\0';
+
+		struct wv_snap *s = &snaps[n];
+		memset(s, 0, sizeof(*s));
+		snprintf(s->source, sizeof(s->source), "%s", hostport);
+		j_str(obj, "name", s->name, sizeof(s->name));
+		j_str(obj, "fwVer", s->fw, sizeof(s->fw));
+		j_arr6(obj, "pinVoltage", s->pin_v);
+		j_arr6(obj, "pinCurrent", s->pin_c);
+		s->temp[0] = j_num(obj, "tempInC");
+		s->temp[1] = j_num(obj, "tempOutC");
+		/* Disconnected externals read 0.0 (daemon clamp) or a deeply negative
+		 * sentinel (~-100, app publisher) — treat both as "not present". */
+		double e1 = j_num(obj, "ext1C"), e2 = j_num(obj, "ext2C");
+		s->temp[2] = (e1 == 0.0 || e1 <= -40.0) ? TEMP_NA : e1;
+		s->temp[3] = (e2 == 0.0 || e2 <= -40.0) ? TEMP_NA : e2;
+		s->psu_cap_w = (int)j_num(obj, "psuCapW");
+		s->fault_status = (unsigned)j_num(obj, "faultStatus");
+		s->fault_log = (unsigned)j_num(obj, "faultLog");
+		s->sum_a = j_num(obj, "sumCurrentA");
+		s->sum_w = j_num(obj, "sumPowerW");
+		const char *fp = j_find(obj, "fan");
+		s->fan = fp ? (int)strtod(fp, NULL) : -1;
+		if (s->name[0] == '\0') snprintf(s->name, sizeof(s->name), "WireView");
+		s->ok = 1;
+		n++;
+		p = end + 1;
+	}
+	return n;
+}
+
+static const char *bar_color(double frac)
+{
+	if (frac >= 0.85) return ESC "[91m";
+	if (frac >= 0.60) return ESC "[93m";
+	return ESC "[92m";
+}
+static void print_bar(double frac, int width)
+{
+	if (frac < 0) frac = 0;
+	if (frac > 1) frac = 1;
+	int fill = (int)(frac * width + 0.5);
+	fputs(bar_color(frac), stdout);
+	for (int i = 0; i < fill; i++) fputs(BLK, stdout);
+	fputs(ESC "[90m", stdout);
+	for (int i = fill; i < width; i++) fputs(SHADE, stdout);
+	fputs(ESC "[0m", stdout);
+}
+
+static void draw_panel(const struct wv_snap *s)
+{
+	if (!s->ok) {
+		printf(ESC "[91m" TL HR " %s " HR " offline" ESC "[0m\n\n", s->source);
+		return;
+	}
+
+	printf(ESC "[96m" TL HR " " ESC "[1m%s" ESC "[0;96m " HR " %s", s->source, s->name);
+	if (s->fw[0]) printf(" " HR " fw%s", s->fw);
+	if (s->psu_cap_w) printf(" " HR " cap %dW", s->psu_cap_w);
+	printf(ESC "[0m\n");
+
+	double cap = s->psu_cap_w > 0 ? s->psu_cap_w : 300.0;
+	printf(ESC "[96m" VB ESC "[0m Power   ");
+	print_bar(s->sum_w / cap, 28);
+	printf("  %7.1f W\n", s->sum_w);
+	printf(ESC "[96m" VB ESC "[0m Current ");
+	print_bar(s->sum_a / (cap / 12.0), 28);
+	printf("  %7.2f A\n", s->sum_a);
+
+	/* per-pin breakdown, one metric per row so each is easy to scan/compare */
+	printf(ESC "[96m" VB ESC "[0;90m Pin   ");
+	for (int p = 0; p < 6; p++) printf("%8d", p + 1);
+	printf(ESC "[0m\n");
+	printf(ESC "[96m" VB ESC "[0m Volts ");
+	for (int p = 0; p < 6; p++) printf("%8.2f", s->pin_v[p]);
+	printf("\n");
+	printf(ESC "[96m" VB ESC "[0m Amps  ");
+	for (int p = 0; p < 6; p++) printf("%8.2f", s->pin_c[p]);
+	printf("\n");
+	printf(ESC "[96m" VB ESC "[0m Watts ");
+	for (int p = 0; p < 6; p++) printf("%8.1f", s->pin_v[p] * s->pin_c[p]);
+	printf("\n");
+
+	printf(ESC "[96m" VB ESC "[0m Temp   ");
+	static const char *tn[] = { "In", "Out", "E1", "E2" };
+	for (int t = 0; t < 4; t++) {
+		if (s->temp[t] <= TEMP_NA + 1)
+			printf("%s -- ", tn[t]);
+		else
+			printf("%s %.1f" DEG " ", tn[t], s->temp[t]);
+	}
+	if (s->fan >= 0) printf("  Fan %d%%", s->fan);
+	else printf("  Fan --");
+	if (s->fault_status || s->fault_log)
+		printf("  " ESC "[91mFaults 0x%X/0x%X" ESC "[0m", s->fault_status, s->fault_log);
+	else
+		printf("  " ESC "[92mFaults none" ESC "[0m");
+	printf("\n" ESC "[96m" BL HR ESC "[0m\n\n");
+}
+
+static volatile sig_atomic_t g_quit = 0;
+static struct termios g_orig_termios;
+static int g_termios_saved = 0;
+
+static void on_sig(int s) { (void)s; g_quit = 1; }
+static void term_restore(void)
+{
+	if (g_termios_saved) tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
+	printf(ESC "[?25h" ESC "[?1049l");
+	fflush(stdout);
+}
+
+static int cmd_top(int argc, char **argv)
+{
+	char hosts[WV_MAXHOST][80];
+	int nhost = 0;
+	int interval_ms = 1000;
+
+	FILE *f = fopen("/etc/wireview/hosts", "r");
+	if (f) {
+		char line[100];
+		while (fgets(line, sizeof(line), f) && nhost < WV_MAXHOST) {
+			size_t l = strlen(line);
+			while (l && (line[l-1] == '\n' || line[l-1] == '\r' || line[l-1] == ' ')) line[--l] = '\0';
+			char *t = line;
+			while (*t == ' ' || *t == '\t') t++;
+			if (*t && *t != '#') snprintf(hosts[nhost++], 80, "%s", t);
+		}
+		fclose(f);
+	}
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+			/* one flag may carry several hosts: --host a,b c */
+			char *tok = strtok(argv[++i], ", ");
+			while (tok && nhost < WV_MAXHOST) {
+				snprintf(hosts[nhost++], 80, "%s", tok);
+				tok = strtok(NULL, ", ");
+			}
+		} else if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc)
+			interval_ms = atoi(argv[++i]);
+	}
+	if (interval_ms < 200) interval_ms = 200;
+
+	signal(SIGINT, on_sig);
+	signal(SIGTERM, on_sig);
+	if (isatty(STDIN_FILENO)) {
+		tcgetattr(STDIN_FILENO, &g_orig_termios);
+		g_termios_saved = 1;
+		struct termios raw = g_orig_termios;
+		raw.c_lflag &= ~(ICANON | ECHO);
+		raw.c_cc[VMIN] = 0;
+		raw.c_cc[VTIME] = 0;
+		tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+	}
+	printf(ESC "[?1049h" ESC "[?25l");
+
+	while (!g_quit) {
+		struct wv_snap snaps[WV_MAXDEV];
+		int n = 0;
+		if (read_local(&snaps[n]) == 0) n++;
+		for (int h = 0; h < nhost && n < WV_MAXDEV; h++) {
+			static char buf[16384];
+			if (http_get_sensors(hosts[h], buf, sizeof(buf)) == 0) {
+				n += parse_remote(hosts[h], buf, snaps + n, WV_MAXDEV - n);
+			} else {
+				memset(&snaps[n], 0, sizeof(snaps[n]));
+				snprintf(snaps[n].source, sizeof(snaps[n].source), "%s", hosts[h]);
+				snaps[n].ok = 0;
+				n++;
+			}
+		}
+
+		printf(ESC "[H" ESC "[2J");
+		time_t t = time(NULL);
+		struct tm tmv;
+		localtime_r(&t, &tmv);
+		char ts[16];
+		strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+		printf(ESC "[1;96m WireView top" ESC "[0m  %d device%s  %s  refresh %.1fs  "
+		       ESC "[90mq to quit" ESC "[0m\n\n",
+		       n, n == 1 ? "" : "s", ts, interval_ms / 1000.0);
+		for (int i = 0; i < n; i++)
+			draw_panel(&snaps[i]);
+		fflush(stdout);
+
+		struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+		if (poll(&pfd, 1, interval_ms) == 1) {
+			char c;
+			if (read(STDIN_FILENO, &c, 1) == 1 && (c == 'q' || c == 'Q'))
+				break;
+		}
+	}
+	term_restore();
+	return 0;
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
@@ -548,6 +954,12 @@ static void usage(void)
 		"\n"
 		"Commands (require wireview_hwmon module):\n"
 		"  sensors           Show all sensor readings from hwmon sysfs\n"
+		"\n"
+		"Monitor:\n"
+		"  top [--host H[:port][,H2...]]... [--interval MS]\n"
+		"                    Live fleet dashboard: the local device plus remote hosts.\n"
+		"                    --host repeats and/or takes a comma/space list; hosts are\n"
+		"                    also read from /etc/wireview/hosts. Press q to quit.\n"
 	);
 }
 
@@ -596,6 +1008,8 @@ int main(int argc, char **argv)
 		return cmd_bootloader();
 	if (strcmp(cmd, "sensors") == 0)
 		return cmd_sensors();
+	if (strcmp(cmd, "top") == 0)
+		return cmd_top(argc, argv);
 	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
 		usage();
 		return 0;
