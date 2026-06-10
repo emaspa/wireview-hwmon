@@ -29,7 +29,9 @@
 #include <sys/ioctl.h>
 #include <linux/limits.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/time.h>
+#include <stdarg.h>
 #include "sha256.h"
 
 #define WIREVIEW_VID "0483"
@@ -139,6 +141,7 @@ static int g_have_last;
 static char g_secret[128];      /* shared HMAC secret; empty => writes disabled */
 static int  g_serial_fd = -1;   /* current serial fd, for HTTP command relay */
 static int  g_http_enabled = 0; /* network listener off unless config enables it */
+static int  g_log_retain_days = 14; /* days of audit logs to keep (config: log_days=) */
 
 #define HTTP_MAX_BODY    8192
 #define HTTP_AUTH_WINDOW 30     /* seconds of timestamp skew tolerated */
@@ -715,6 +718,67 @@ static int setup_http(void)
 	return fd;
 }
 
+/* ---- Daily-rotating audit log ---- */
+#define LOG_DIR "/var/log/wireview"
+
+static FILE *g_logf;
+static char  g_log_day[11];   /* YYYY-MM-DD of the currently open file */
+
+/* Remove wireviewd-YYYY-MM-DD.log files older than g_log_retain_days (0 = keep all). */
+static void prune_old_logs(void)
+{
+	if (g_log_retain_days <= 0) return;
+	time_t cutoff_t = time(NULL) - (time_t)g_log_retain_days * 86400;
+	struct tm tmv;
+	char cutoff[11];
+	localtime_r(&cutoff_t, &tmv);
+	strftime(cutoff, sizeof(cutoff), "%Y-%m-%d", &tmv);
+
+	DIR *d = opendir(LOG_DIR);
+	if (!d) return;
+	struct dirent *e;
+	while ((e = readdir(d))) {
+		if (strncmp(e->d_name, "wireviewd-", 10) != 0) continue;
+		if (strncmp(e->d_name + 10, cutoff, 10) < 0) {
+			char path[300];
+			snprintf(path, sizeof(path), "%s/%s", LOG_DIR, e->d_name);
+			unlink(path);
+		}
+	}
+	closedir(d);
+}
+
+/* Append a timestamped line to today's log, rotating to a new file each day. */
+static void wlog(const char *level, const char *fmt, ...)
+{
+	time_t now = time(NULL);
+	struct tm tmv;
+	localtime_r(&now, &tmv);
+	char day[11];
+	strftime(day, sizeof(day), "%Y-%m-%d", &tmv);
+
+	if (!g_logf || strcmp(day, g_log_day) != 0) {
+		if (g_logf) fclose(g_logf);
+		mkdir(LOG_DIR, 0750);
+		char path[300];
+		snprintf(path, sizeof(path), "%s/wireviewd-%s.log", LOG_DIR, day);
+		g_logf = fopen(path, "a");
+		snprintf(g_log_day, sizeof(g_log_day), "%s", day);
+		prune_old_logs();
+	}
+	if (!g_logf) return;
+
+	char tsb[32];
+	strftime(tsb, sizeof(tsb), "%Y-%m-%dT%H:%M:%S", &tmv);
+	fprintf(g_logf, "%s [%s] ", tsb, level);
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(g_logf, fmt, ap);
+	va_end(ap);
+	fputc('\n', g_logf);
+	fflush(g_logf);
+}
+
 /* ---- Write-command auth + relay (HTTP POST /command) ---- */
 
 static int truthy(const char *s)
@@ -755,6 +819,8 @@ static void load_config(void)
 					g_http_enabled = truthy(val);
 				else if (strcmp(p, "secret") == 0 && !g_secret[0])
 					snprintf(g_secret, sizeof(g_secret), "%s", val);
+				else if (strcmp(p, "log_days") == 0)
+					g_log_retain_days = atoi(val);
 			} else if (!g_secret[0]) {
 				snprintf(g_secret, sizeof(g_secret), "%s", p);
 			}
@@ -955,9 +1021,11 @@ static int nonce_replay(const char *nonce, long now)
 }
 
 /* Authenticated write: verify HMAC, then relay the command to the device. */
-static void handle_post_command(int cfd, const char *req, const char *body)
+static void handle_post_command(int cfd, const char *req, const char *body,
+				const char *client_ip)
 {
 	if (g_secret[0] == '\0') {
+		wlog("WARN", "command from %s rejected: writes disabled (no secret)", client_ip);
 		http_respond(cfd, 403, "Forbidden", "{\"error\":\"writes disabled\"}");
 		return;
 	}
@@ -966,6 +1034,7 @@ static void handle_post_command(int cfd, const char *req, const char *body)
 	if (!http_header(req, "X-Auth-Ts", ts, sizeof(ts)) ||
 	    !http_header(req, "X-Auth-Nonce", nonce, sizeof(nonce)) ||
 	    !http_header(req, "X-Auth-Sig", sig, sizeof(sig))) {
+		wlog("WARN", "command from %s rejected: missing auth headers", client_ip);
 		http_respond(cfd, 401, "Unauthorized", "{\"error\":\"missing auth\"}");
 		return;
 	}
@@ -973,6 +1042,7 @@ static void handle_post_command(int cfd, const char *req, const char *body)
 	long t = strtol(ts, NULL, 10);
 	long now = (long)time(NULL);
 	if (now - t > HTTP_AUTH_WINDOW || t - now > HTTP_AUTH_WINDOW) {
+		wlog("WARN", "command from %s rejected: stale timestamp", client_ip);
 		http_respond(cfd, 401, "Unauthorized", "{\"error\":\"stale\"}");
 		return;
 	}
@@ -985,10 +1055,12 @@ static void handle_post_command(int cfd, const char *req, const char *body)
 		    (uint8_t *)msg, (size_t)mlen, mac);
 	hex_encode(mac, 32, machex);
 	if (!ct_str_equal(machex, sig)) {
+		wlog("WARN", "command from %s rejected: bad signature", client_ip);
 		http_respond(cfd, 401, "Unauthorized", "{\"error\":\"bad signature\"}");
 		return;
 	}
 	if (nonce_replay(nonce, now)) {
+		wlog("WARN", "command from %s rejected: replay", client_ip);
 		http_respond(cfd, 401, "Unauthorized", "{\"error\":\"replay\"}");
 		return;
 	}
@@ -1025,19 +1097,27 @@ static void handle_post_command(int cfd, const char *req, const char *body)
 		}
 	}
 
-	if (ok < 0)
+	if (ok < 0) {
+		wlog("WARN", "command from %s: unknown op '%s'", client_ip, op);
 		http_respond(cfd, 400, "Bad Request", "{\"error\":\"unknown op\"}");
-	else if (ok)
+	} else if (ok) {
+		wlog("INFO", "command from %s: op=%s -> executed", client_ip, op);
 		http_respond(cfd, 200, "OK", "{\"ok\":true}");
-	else
+	} else {
+		wlog("WARN", "command from %s: op=%s -> relay failed", client_ip, op);
 		http_respond(cfd, 500, "Internal Server Error", "{\"error\":\"relay failed\"}");
+	}
 }
 
 /* Accept one HTTP connection, route GET /sensors and POST /command, close. */
 static void http_handle(int http_fd)
 {
-	int cfd = accept(http_fd, NULL, NULL);
+	struct sockaddr_in peer;
+	socklen_t plen = sizeof(peer);
+	int cfd = accept(http_fd, (struct sockaddr *)&peer, &plen);
 	if (cfd < 0) return;
+	char client_ip[INET_ADDRSTRLEN] = "?";
+	inet_ntop(AF_INET, &peer.sin_addr, client_ip, sizeof(client_ip));
 
 	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
 	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1092,6 +1172,7 @@ static void http_handle(int http_fd)
 		char body[1024];
 		snprintf(body, sizeof(body),
 			"{\"deviceId\":\"%s\",\"version\":%d,\"data\":\"%s\"}", uid, ver, b64);
+		wlog("INFO", "config read by %s", client_ip);
 		http_respond(cfd, 200, "OK", body);
 		close(cfd);
 		return;
@@ -1117,7 +1198,7 @@ static void http_handle(int http_fd)
 			buf[body_off + want] = '\0';
 		else
 			buf[total] = '\0';
-		handle_post_command(cfd, buf, buf + body_off);
+		handle_post_command(cfd, buf, buf + body_off, client_ip);
 		close(cfd);
 		return;
 	}
@@ -1176,6 +1257,10 @@ int main(int argc, char **argv)
 	} else {
 		printf("wireviewd: network listener disabled (set enabled=1 in /etc/wireview/secret to publish)\n");
 	}
+
+	wlog("INFO", "wireviewd started; listener %s, remote writes %s, log retention %d days",
+	     g_http_enabled ? "enabled" : "disabled",
+	     g_secret[0] ? "enabled" : "disabled", g_log_retain_days);
 
 	printf("wireviewd: starting\n");
 
