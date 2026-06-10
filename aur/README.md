@@ -3,9 +3,9 @@
 A split AUR package (one `pkgbase`, two installable packages) for Arch and
 Arch-based distros (CachyOS, EndeavourOS):
 
-- **`wireview-hwmon`** — the `wireviewd` daemon, `wireviewctl` CLI, systemd unit
-  and udev rule (built from source — small C programs).
-- **`wireview-hwmon-dkms`** — the kernel module, built on the user's machine via
+- **`wireview-hwmon`** - the `wireviewd` daemon, `wireviewctl` CLI, systemd unit
+  and udev rule (built from source - small C programs).
+- **`wireview-hwmon-dkms`** - the kernel module, built on the user's machine via
   DKMS. Arch's `dkms` pacman hooks build/install it automatically on install and
   rebuild it on kernel upgrades, so no custom `.install` is needed.
 

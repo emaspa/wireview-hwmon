@@ -2,13 +2,13 @@
 
 Fedora packaging, served via COPR. One spec produces two packages:
 
-- **`wireview-hwmon`** — the `wireviewd` daemon, `wireviewctl` CLI, systemd unit
+- **`wireview-hwmon`** - the `wireviewd` daemon, `wireviewctl` CLI, systemd unit
   and udev rule (compiled from source with Fedora's hardened build flags).
-- **`wireview-hwmon-dkms`** (noarch) — the kernel module source, built on the
+- **`wireview-hwmon-dkms`** (noarch) - the kernel module source, built on the
   user's machine via DKMS (`%post`/`%preun` scriptlets run `dkms build/install`
   and `dkms remove`).
 
-COPR/mock only need to *package* the module source — the actual module build
+COPR/mock only need to *package* the module source - the actual module build
 happens on the user's machine at install time, so no kernel is required to build
 the RPMs.
 

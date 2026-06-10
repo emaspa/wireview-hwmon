@@ -2,7 +2,7 @@
 
 Linux hwmon driver and daemon for the [Thermal Grizzly WireView Pro II](https://www.thermal-grizzly.com/en/wireview-pro-ii-gpu/s-tg-wv-p2) power monitor. Exposes voltage, current, power, and temperature sensor data through the standard Linux hwmon subsystem.
 
-Works standalone or alongside the [wireview-linux](https://github.com/emaspa/wireview-linux) GUI application. When both are used together, the app reads sensor data from hwmon and sends commands through the daemon's Unix socket — giving you full app functionality plus system-wide sensor integration.
+Works standalone or alongside the [wireview-linux](https://github.com/emaspa/wireview-linux) GUI application. When both are used together, the app reads sensor data from hwmon and sends commands through the daemon's Unix socket - giving you full app functionality plus system-wide sensor integration.
 
 ## How it works
 
@@ -11,9 +11,9 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
                                  └─────────→ HTTP /sensors (opt-in) → LAN: other hosts, the GUI app, wireviewctl top
 ```
 
-- **wireview_hwmon.ko** — Kernel module that creates a virtual hwmon device
-- **wireviewd** — Userspace daemon that reads the device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN
-- **wireviewctl** — CLI tool for querying sensors, sending commands, and a `top` live monitor
+- **wireview_hwmon.ko** - Kernel module that creates a virtual hwmon device
+- **wireviewd** - Userspace daemon that reads the device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN
+- **wireviewctl** - CLI tool for querying sensors, sending commands, and a `top` live monitor
 
 ## Installation
 
@@ -47,7 +47,7 @@ The same COPR repo also provides the [WireView GUI](https://github.com/emaspa/wi
 
 ### Fedora (.rpm packages)
 
-Pre-built `.rpm` packages are on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page (one set works on Fedora 42–44):
+Pre-built `.rpm` packages are on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page (one set works on Fedora 42-44):
 
 ```bash
 sudo dnf install ./wireview-hwmon-1.4.0-1.x86_64.rpm ./wireview-hwmon-dkms-1.4.0-1.noarch.rpm
@@ -63,7 +63,7 @@ sudo systemctl enable --now wireviewd
 
 DKMS needs the matching kernel headers (`linux-headers`, `linux-cachyos-headers`, …) installed; the module then rebuilds automatically on kernel updates.
 
-> **Immutable / atomic distros** (Bazzite, Silverblue, Kinoite) are not supported for the kernel module — DKMS doesn't fit rpm-ostree. On those, run the [WireView GUI Flatpak](https://github.com/emaspa/wireview-linux) in direct-serial mode, which doesn't need this module.
+> **Immutable / atomic distros** (Bazzite, Silverblue, Kinoite) are not supported for the kernel module - DKMS doesn't fit rpm-ostree. On those, run the [WireView GUI Flatpak](https://github.com/emaspa/wireview-linux) in direct-serial mode, which doesn't need this module.
 
 ### Build from source
 
@@ -142,7 +142,7 @@ sudo openssl req -new -x509 -newkey rsa:2048 \
 # Enroll the key (requires reboot to confirm in MokManager)
 sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
 
-# Reboot — MokManager will prompt you to enroll the key
+# Reboot - MokManager will prompt you to enroll the key
 
 # After reboot, sign the module
 sudo /usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 \
@@ -307,19 +307,19 @@ The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, res
 ## LAN monitoring (remote access)
 
 The daemon can publish its readings over the LAN and accept authenticated
-commands, so you can monitor and control WireViews on other machines — from the
+commands, so you can monitor and control WireViews on other machines - from the
 [GUI app](https://github.com/emaspa/wireview-linux), from `wireviewctl top`, or
 from any HTTP client. **It is off by default**: no port is opened unless you
 enable it.
 
 ### Endpoints (port 9876 by default)
 
-- **`GET /sensors`** — JSON snapshot of the device (per-pin V/I, power, temps,
+- **`GET /sensors`** - JSON snapshot of the device (per-pin V/I, power, temps,
   faults, fan duty, PSU cap, firmware build). Open, read-only; the same endpoint
   the GUI app and `wireviewctl top` consume.
-- **`GET /config`** — the device's current configuration, so a remote editor can
+- **`GET /config`** - the device's current configuration, so a remote editor can
   load it.
-- **`POST /command`** — write commands (screen / NVM / clear-faults / writeConfig).
+- **`POST /command`** - write commands (screen / NVM / clear-faults / writeConfig).
   **Authenticated** (see below); the firmware bootloader is never reachable
   over the network.
 
@@ -338,17 +338,17 @@ Then `sudo systemctl restart wireviewd`. Reads stay open; **writes require the s
 
 ### Security model
 
-- **Opt-in** — nothing is exposed unless `remote_enabled=1`.
+- **Opt-in** - nothing is exposed unless `remote_enabled=1`.
 - **Writes are signed with HMAC-SHA256.** Each `POST /command` carries a
   timestamp, nonce, and signature over the body using the shared `secret`, so
   the secret never travels on the wire and replays are rejected (±30 s window).
   An empty secret disables writes (the daemon answers `403`).
-- **Flood protection** — request-size cap and bounded handling.
-- **Audit log** (below). No TLS: this is built for a trusted LAN — the HMAC keeps
+- **Flood protection** - request-size cap and bounded handling.
+- **Audit log** (below). No TLS: this is built for a trusted LAN - the HMAC keeps
   the secret off the wire, but anyone on the LAN can read `/sensors` while the
   listener is on.
 
-### `wireviewctl top` — live monitor
+### `wireviewctl top` - live monitor
 
 A `btop`-style terminal dashboard of every WireView, local and remote:
 
