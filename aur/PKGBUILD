@@ -10,7 +10,7 @@ license=('GPL-2.0-only')
 makedepends=('gcc')
 options=('!debug')
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # regenerate with updpkgsums once the v1.4.0 tag/tarball exists
+sha256sums=('cd72abb2db199371bebbbf2a2d8b9e8cee4f8ea8bbae23d14ae80acef44ea760')
 
 build() {
   cd "$pkgbase-$pkgver"
