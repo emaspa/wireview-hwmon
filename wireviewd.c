@@ -786,9 +786,9 @@ static int truthy(const char *s)
 	return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
 }
 
-/* Load the network-listener flag and shared HMAC secret from /etc/wireview/secret.
- * The file holds "key=value" lines: "enabled=0|1" gates the listener (default OFF,
- * so no port is opened unless explicitly enabled) and "secret=<passphrase>" sets
+/* Load the network-listener flag and shared HMAC secret from /etc/wireview/config.
+ * The file holds "key=value" lines: "remote_enabled=0|1" gates the listener (default
+ * OFF, so no port is opened unless explicitly enabled) and "secret=<passphrase>" sets
  * the write secret; a bare line is taken as the secret (backward compatible).
  * $WIREVIEW_LISTEN and $WIREVIEW_SECRET override the file. An empty secret leaves
  * writes refused (403) even when the listener is on. */
@@ -797,7 +797,7 @@ static void load_config(void)
 	g_secret[0] = '\0';
 	g_http_enabled = 0;
 
-	FILE *f = fopen("/etc/wireview/secret", "r");
+	FILE *f = fopen("/etc/wireview/config", "r");
 	if (f) {
 		char line[192];
 		while (fgets(line, sizeof(line), f)) {
@@ -815,7 +815,7 @@ static void load_config(void)
 				*eq = '\0';
 				char *val = eq + 1;
 				while (*val == ' ' || *val == '\t') val++;
-				if (strcmp(p, "enabled") == 0)
+				if (strcmp(p, "remote_enabled") == 0)
 					g_http_enabled = truthy(val);
 				else if (strcmp(p, "secret") == 0 && !g_secret[0])
 					snprintf(g_secret, sizeof(g_secret), "%s", val);
@@ -1255,7 +1255,7 @@ int main(int argc, char **argv)
 			printf("wireviewd: network listener ENABLED on :%d; remote writes %s\n",
 			       HTTP_PORT, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
 	} else {
-		printf("wireviewd: network listener disabled (set enabled=1 in /etc/wireview/secret to publish)\n");
+		printf("wireviewd: network listener disabled (set remote_enabled=1 in /etc/wireview/config to publish)\n");
 	}
 
 	wlog("INFO", "wireviewd started; listener %s, remote writes %s, log retention %d days",

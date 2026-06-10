@@ -29,8 +29,8 @@ install: all
 	install -m 644 avahi-wireview.service /etc/avahi/services/wireview.service
 	install -d -m 700 /etc/wireview
 	install -d -m 750 /var/log/wireview
-	@echo "Note: the LAN listener is OFF by default. To publish this host, put 'enabled=1' in"
-	@echo "      /etc/wireview/secret (mode 600); add 'secret=<passphrase>' for authenticated remote"
+	@echo "Note: the LAN listener is OFF by default. To publish this host, put 'remote_enabled=1' in"
+	@echo "      /etc/wireview/config (mode 600); add 'secret=<passphrase>' for authenticated remote"
 	@echo "      writes, and 'log_days=<N>' to set audit-log retention (default 14; logs in /var/log/wireview)."
 	@echo "      For 'wireviewctl top', list remote hosts (one host[:port] per line) in /etc/wireview/hosts."
 	udevadm control --reload-rules
