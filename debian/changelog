@@ -1,3 +1,19 @@
+wireview-hwmon (1.4.0~26.04.2) resolute; urgency=medium
+
+  * Fix the wireview-hwmon-dkms maintainer scripts, which hardcoded an old
+    version and so silently skipped building the kernel module on install.
+    The version is now read from the shipped dkms.conf.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 10 Jun 2026 21:00:00 +0000
+
+wireview-hwmon (1.4.0~24.04.2) noble; urgency=medium
+
+  * Fix the wireview-hwmon-dkms maintainer scripts, which hardcoded an old
+    version and so silently skipped building the kernel module on install.
+    The version is now read from the shipped dkms.conf.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 10 Jun 2026 20:30:00 +0000
+
 wireview-hwmon (1.4.0~26.04.1) resolute; urgency=medium
 
   * Build for Ubuntu 26.04 (Resolute Raccoon). LAN monitoring release; see
