@@ -1,4 +1,11 @@
-wireview-hwmon (1.4.0) noble; urgency=medium
+wireview-hwmon (1.4.0~26.04.1) resolute; urgency=medium
+
+  * Build for Ubuntu 26.04 (Resolute Raccoon). LAN monitoring release; see
+    1.4.0~24.04.1 for the full changelog.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 10 Jun 2026 13:00:00 +0000
+
+wireview-hwmon (1.4.0~24.04.1) noble; urgency=medium
 
   * LAN fleet monitoring: opt-in HTTP /sensors publisher (remote_enabled in
     /etc/wireview/config) so other instances can read this host's device.
