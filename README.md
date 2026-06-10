@@ -8,11 +8,12 @@ Works standalone or alongside the [wireview-linux](https://github.com/emaspa/wir
 
 ```
 WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hwmon/ → monitoring tools
+                                 └─────────→ HTTP /sensors (opt-in) → LAN: other hosts, the GUI app, wireviewctl top
 ```
 
 - **wireview_hwmon.ko** — Kernel module that creates a virtual hwmon device
-- **wireviewd** — Userspace daemon that reads the device over serial and feeds the kernel module
-- **wireviewctl** — CLI tool for querying sensors and sending commands via the daemon
+- **wireviewd** — Userspace daemon that reads the device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN
+- **wireviewctl** — CLI tool for querying sensors, sending commands, and a `top` live monitor
 
 ## Installation
 
@@ -31,7 +32,7 @@ This installs the daemon, CLI tool, kernel module (via DKMS), systemd service, a
 Pre-built `.deb` packages are available on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page. Download and install:
 
 ```bash
-sudo apt install ./wireview-hwmon_1.3.2_amd64.deb ./wireview-hwmon-dkms_1.3.2_all.deb
+sudo apt install ./wireview-hwmon_1.4.0_amd64.deb ./wireview-hwmon-dkms_1.4.0_all.deb
 ```
 
 ### Fedora (COPR)
@@ -49,7 +50,7 @@ The same COPR repo also provides the [WireView GUI](https://github.com/emaspa/wi
 Pre-built `.rpm` packages are on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page (one set works on Fedora 42–44):
 
 ```bash
-sudo dnf install ./wireview-hwmon-1.3.2-1.x86_64.rpm ./wireview-hwmon-dkms-1.3.2-1.noarch.rpm
+sudo dnf install ./wireview-hwmon-1.4.0-1.x86_64.rpm ./wireview-hwmon-dkms-1.4.0-1.noarch.rpm
 sudo systemctl enable --now wireviewd
 ```
 
@@ -249,6 +250,10 @@ Commands (require wireviewd running):
 
 Commands (require wireview_hwmon module):
   sensors           Show all sensor readings from hwmon sysfs
+
+Monitor:
+  top [--host H[:port][,H2...]]... [--interval MS]
+                    Live dashboard: local device + remote hosts (q to quit)
 ```
 
 ### Examples
@@ -298,6 +303,86 @@ The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, res
 - When used standalone (without the app), the daemon owns the serial port exclusively.
 - If the device is disconnected, the daemon will wait and reconnect automatically.
 - Sensor readings become stale (report N/A) if no data is received for 5 seconds.
+
+## LAN monitoring (remote access)
+
+The daemon can publish its readings over the LAN and accept authenticated
+commands, so you can monitor and control WireViews on other machines — from the
+[GUI app](https://github.com/emaspa/wireview-linux), from `wireviewctl top`, or
+from any HTTP client. **It is off by default**: no port is opened unless you
+enable it.
+
+### Endpoints (port 9876 by default)
+
+- **`GET /sensors`** — JSON snapshot of the device (per-pin V/I, power, temps,
+  faults, fan duty, PSU cap, firmware build). Open, read-only; the same endpoint
+  the GUI app and `wireviewctl top` consume.
+- **`GET /config`** — the device's current configuration, so a remote editor can
+  load it.
+- **`POST /command`** — write commands (screen / NVM / clear-faults / writeConfig).
+  **Authenticated** (see below); the firmware bootloader is never reachable
+  over the network.
+
+### Enabling it
+
+Edit `/etc/wireview/config` (a documented reference is created on first install):
+
+```ini
+remote_enabled=1        # open the listener (default 0 = off)
+port=9876               # listener port (default)
+secret=your-passphrase  # shared secret for authenticated remote writes (empty = reads only)
+log_days=14             # audit-log retention in days
+```
+
+Then `sudo systemctl restart wireviewd`. Reads stay open; **writes require the secret**.
+
+### Security model
+
+- **Opt-in** — nothing is exposed unless `remote_enabled=1`.
+- **Writes are signed with HMAC-SHA256.** Each `POST /command` carries a
+  timestamp, nonce, and signature over the body using the shared `secret`, so
+  the secret never travels on the wire and replays are rejected (±30 s window).
+  An empty secret disables writes (the daemon answers `403`).
+- **Flood protection** — request-size cap and bounded handling.
+- **Audit log** (below). No TLS: this is built for a trusted LAN — the HMAC keeps
+  the secret off the wire, but anyone on the LAN can read `/sensors` while the
+  listener is on.
+
+### `wireviewctl top` — live monitor
+
+A `btop`-style terminal dashboard of every WireView, local and remote:
+
+```bash
+wireviewctl top                                  # local device only
+wireviewctl top --host 192.168.1.50              # add a remote host
+wireviewctl top --host 192.168.1.50:9876,nas     # several (comma/space list, host[:port])
+wireviewctl top --interval 500                    # refresh every 500 ms
+```
+
+Remote hosts can also be listed (one `host[:port]` per line) in
+`/etc/wireview/hosts`. The local device is read straight from hwmon sysfs;
+remotes via `GET /sensors`. Press **q** to quit.
+
+### Audit log
+
+When the listener is enabled, command activity is recorded to a daily-rotating
+file in `/var/log/wireview/` (retention from `log_days`):
+
+```
+2026-06-10T09:41:08 [INFO] wireviewd started; listener enabled, remote writes enabled, log retention 14 days
+2026-06-10T09:41:12 [INFO] command from 192.168.1.20: op=screen -> executed
+2026-06-10T09:41:15 [WARN] command from 192.168.1.33 rejected: bad signature
+```
+
+High-frequency `/sensors` polls are not logged.
+
+## Configuration files
+
+| File | Purpose |
+|------|---------|
+| `/etc/wireview/config` | Daemon settings: `remote_enabled`, `port`, `secret`, `log_days`. Mode `600`. Read at (re)start. A commented reference is installed if none exists. |
+| `/etc/wireview/hosts` | Optional remote-host list for `wireviewctl top` (one `host[:port]` per line). |
+| `/var/log/wireview/` | Daily-rotating audit logs (created automatically when the listener is on). |
 
 ## License
 

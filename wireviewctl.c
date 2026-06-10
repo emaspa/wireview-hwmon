@@ -538,7 +538,7 @@ static int cmd_sensors(void)
 
 /* ---------- Usage ---------- */
 
-/* ---------- top: live fleet monitor (local sysfs + remote /sensors) ---------- */
+/* ---------- top: live monitor (local sysfs + remote /sensors) ---------- */
 
 #define WV_MAXDEV   32
 #define WV_MAXHOST  32
@@ -957,7 +957,7 @@ static void usage(void)
 		"\n"
 		"Monitor:\n"
 		"  top [--host H[:port][,H2...]]... [--interval MS]\n"
-		"                    Live fleet dashboard: the local device plus remote hosts.\n"
+		"                    Live dashboard: the local device plus remote hosts.\n"
 		"                    --host repeats and/or takes a comma/space list; hosts are\n"
 		"                    also read from /etc/wireview/hosts. Press q to quit.\n"
 	);
