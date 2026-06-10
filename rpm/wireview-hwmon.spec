@@ -1,7 +1,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wireview-hwmon
-Version:        1.3.2
+Version:        1.4.0
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -83,5 +83,10 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
+* Wed Jun 10 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.4.0-1
+- LAN fleet monitoring: opt-in /sensors publisher, HMAC-authenticated remote
+  writes and config, wireviewctl top live monitor, daily audit logging,
+  configurable listener port, reference /etc/wireview/config.
+
 * Sat Jun 06 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.3.2-1
 - Initial RPM / COPR packaging (daemon + CLI + DKMS kernel module)

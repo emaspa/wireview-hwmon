@@ -1,3 +1,17 @@
+wireview-hwmon (1.4.0) noble; urgency=medium
+
+  * LAN fleet monitoring: opt-in HTTP /sensors publisher (remote_enabled in
+    /etc/wireview/config) so other instances can read this host's device.
+  * Authenticated remote writes: POST /command signed with HMAC-SHA256 (shared
+    secret), including remote device config read/write.
+  * wireviewctl top: live terminal fleet monitor of local + remote devices.
+  * Daily-rotating audit log in /var/log/wireview (log_days retention).
+  * Configurable listener port (port=); publish fan duty and firmware build
+    string in /sensors.
+  * Ship a reference /etc/wireview/config documenting the defaults.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 10 Jun 2026 12:00:00 +0000
+
 wireview-hwmon (1.3.2~26.04.1) resolute; urgency=medium
 
   * Rebuild for Ubuntu 26.04 LTS (Resolute Raccoon).
