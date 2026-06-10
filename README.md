@@ -265,6 +265,9 @@ wireviewctl info
 # Read all sensors (scriptable key: value format)
 wireviewctl sensors
 
+# Live dashboard of this host and remotes (q to quit) - see "LAN monitoring" below
+wireviewctl top --host 192.168.1.50
+
 # Switch to simple display
 wireviewctl screen simple
 
@@ -358,6 +361,35 @@ wireviewctl top --host 192.168.1.50              # add a remote host
 wireviewctl top --host 192.168.1.50:9876,nas     # several (comma/space list, host[:port])
 wireviewctl top --interval 500                    # refresh every 500 ms
 ```
+
+Each device gets a panel with colored power/current bar gauges (green/yellow/red
+by load), a per-pin Volts/Amps/Watts breakdown, temperatures, fan duty, and fault
+state. A two-device view (one local, one remote) looks like:
+
+```
+ WireView top  2 devices  14:22:07  refresh 1.0s  q to quit
+
+╭─ local ─ WireView Pro II ─ fw3 ─ cap 600W
+│ Power   ████████████████░░░░░░░░░░░░    372.4 W
+│ Current █████████████████░░░░░░░░░░░     31.2 A
+│ Pin          1       2       3       4       5       6
+│ Volts    12.11   12.13   12.10   12.12   12.11   12.12
+│ Amps      5.21    5.40    5.08    5.33    5.55    4.63
+│ Watts     63.1    65.5    61.4    64.6    67.2    56.1
+│ Temp   In 45.3° Out 42.1° E1 38.7° E2 --   Fan 75%  Faults none
+╰─
+╭─ 192.168.1.50 ─ WireView Pro II ─ fw3 ─ cap 450W
+│ Power   ██████░░░░░░░░░░░░░░░░░░░░░░    118.6 W
+│ Current ███████░░░░░░░░░░░░░░░░░░░░░      9.8 A
+│ Pin          1       2       3       4       5       6
+│ Volts    12.09   12.10   12.08   12.11   12.09   12.10
+│ Amps      1.62    1.70    1.55    1.68    1.61    1.64
+│ Watts     19.6    20.6    18.7    20.3    19.5    19.8
+│ Temp   In 39.8° Out 36.2° E1 -- E2 --   Fan 40%  Faults none
+╰─
+```
+
+(An unreachable host shows a single red `offline` line instead of stalling the view.)
 
 Remote hosts can also be listed (one `host[:port]` per line) in
 `/etc/wireview/hosts`. The local device is read straight from hwmon sysfs;
