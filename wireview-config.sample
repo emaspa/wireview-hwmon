@@ -1,0 +1,18 @@
+# WireView Pro II daemon settings  (/etc/wireview/config)
+#
+# Read once when wireviewd (re)starts. The LAN listener is OFF by default.
+# Values below are the defaults shown for reference - edit as needed.
+
+# Open the LAN listener so other instances can read this host's device(s),
+# and (with a secret set) write to them.  0 = off, 1 = on.
+remote_enabled=0
+
+# Listener port.
+port=9876
+
+# Shared HMAC passphrase for authenticated remote writes.
+# Empty = reads only, no remote writes accepted.  Keep this file mode 600.
+#secret=
+
+# Audit-log retention in days (logs in /var/log/wireview).  0 = keep all.
+log_days=14
