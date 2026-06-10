@@ -141,6 +141,7 @@ static int g_have_last;
 static char g_secret[128];      /* shared HMAC secret; empty => writes disabled */
 static int  g_serial_fd = -1;   /* current serial fd, for HTTP command relay */
 static int  g_http_enabled = 0; /* network listener off unless config enables it */
+static int  g_http_port = HTTP_PORT; /* listener port (config: port=) */
 static int  g_log_retain_days = 14; /* days of audit logs to keep (config: log_days=) */
 
 #define HTTP_MAX_BODY    8192
@@ -705,7 +706,7 @@ static int setup_http(void)
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	addr.sin_port = htons(HTTP_PORT);
+	addr.sin_port = htons((uint16_t)g_http_port);
 
 	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		close(fd);
@@ -821,6 +822,10 @@ static void load_config(void)
 					snprintf(g_secret, sizeof(g_secret), "%s", val);
 				else if (strcmp(p, "log_days") == 0)
 					g_log_retain_days = atoi(val);
+				else if (strcmp(p, "port") == 0) {
+					int pp = atoi(val);
+					if (pp > 0 && pp < 65536) g_http_port = pp;
+				}
 			} else if (!g_secret[0]) {
 				snprintf(g_secret, sizeof(g_secret), "%s", p);
 			}
@@ -1250,10 +1255,10 @@ int main(int argc, char **argv)
 		http_fd = setup_http();
 		if (http_fd < 0)
 			fprintf(stderr, "wireviewd: warning: network listener failed (port %d in use?)\n",
-				HTTP_PORT);
+				g_http_port);
 		else
 			printf("wireviewd: network listener ENABLED on :%d; remote writes %s\n",
-			       HTTP_PORT, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
+			       g_http_port, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
 	} else {
 		printf("wireviewd: network listener disabled (set remote_enabled=1 in /etc/wireview/config to publish)\n");
 	}
