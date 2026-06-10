@@ -38,8 +38,8 @@ monitor, exposing voltage, current, power and temperature through
 
 %build
 %set_build_flags
-cc $CFLAGS $LDFLAGS -Wall -Wextra -Wno-format-truncation -o wireviewd wireviewd.c
-cc $CFLAGS $LDFLAGS -Wall -Wextra -o wireviewctl wireviewctl.c
+cc $CFLAGS $LDFLAGS -Wall -Wextra -Wno-format-truncation -o wireviewd wireviewd.c sha256.c
+cc $CFLAGS $LDFLAGS -Wall -Wextra -Wno-format-truncation -o wireviewctl wireviewctl.c
 
 %install
 install -Dm0755 wireviewd %{buildroot}%{_bindir}/wireviewd
