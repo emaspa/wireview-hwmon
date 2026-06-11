@@ -1434,6 +1434,32 @@ int main(int argc, char **argv)
 					break;
 				}
 
+				/* Debounce fault bits. The serial protocol has no
+				 * framing/CRC, so a desynced read can pulse garbage
+				 * into the trailing fault fields for one poll. Real
+				 * faults persist (the device latches them in
+				 * fault_log until cleared), so require two
+				 * consecutive frames before publishing fault bits,
+				 * and log what gets suppressed for diagnosis. */
+				{
+					static uint16_t prev_status, prev_log;
+					uint16_t raw_status = ss.fault_status;
+					uint16_t raw_log = ss.fault_log;
+
+					if ((raw_status || raw_log) &&
+					    !(prev_status || prev_log)) {
+						wlog("WARN",
+						     "suppressed unconfirmed fault frame: status=0x%04x log=0x%04x (fan=%u pad1=%u pad2=%u)",
+						     raw_status, raw_log,
+						     ss.fan_duty, ss._pad1,
+						     ss._pad2);
+						ss.fault_status = 0;
+						ss.fault_log = 0;
+					}
+					prev_status = raw_status;
+					prev_log = raw_log;
+				}
+
 				if (write_hwmon(hwmon_fd, &ss) < 0) {
 					fprintf(stderr,
 						"wireviewd: hwmon write failed\n");
