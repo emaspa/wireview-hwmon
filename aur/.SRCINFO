@@ -8,7 +8,7 @@ pkgbase = wireview-hwmon
 	makedepends = gcc
 	options = !debug
 	source = wireview-hwmon-1.4.1.tar.gz::https://github.com/emaspa/wireview-hwmon/archive/refs/tags/v1.4.1.tar.gz
-	sha256sums = SKIP
+	sha256sums = 5065356d60c92649a9272b7875659853815eb557f18270a7d8c65cf895e57b13
 
 pkgname = wireview-hwmon
 	pkgdesc = WireView Pro II hwmon daemon and CLI (userspace)
