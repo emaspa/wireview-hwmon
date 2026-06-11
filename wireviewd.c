@@ -1434,14 +1434,25 @@ int main(int argc, char **argv)
 					break;
 				}
 
-				/* Debounce fault bits. The serial protocol has no
-				 * framing/CRC, so a desynced read can pulse garbage
-				 * into the trailing fault fields for one poll. Real
-				 * faults persist (the device latches them in
-				 * fault_log until cleared), so require two
-				 * consecutive frames before publishing fault bits,
-				 * and log what gets suppressed for diagnosis. */
-				{
+				/* The serial protocol has no framing/CRC, so a
+				 * desynced read corrupts arbitrary fields for one
+				 * poll (a real corrupt frame in the field carried
+				 * fan=105, pad1=122, status=0x0607). Two layers:
+				 *
+				 * 1. Discard frames failing sanity checks - real
+				 *    frames always have zero padding and a fan duty
+				 *    <= 100. The next poll's tcflush realigns the
+				 *    stream.
+				 * 2. Debounce fault bits - real faults persist (the
+				 *    device latches them in fault_log until
+				 *    cleared), so require two consecutive frames
+				 *    before publishing fault bits. */
+				if (ss.fan_duty > 100 || ss._pad1 || ss._pad2) {
+					wlog("WARN",
+					     "discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u status=0x%04x log=0x%04x)",
+					     ss.fan_duty, ss._pad1, ss._pad2,
+					     ss.fault_status, ss.fault_log);
+				} else {
 					static uint16_t prev_status, prev_log;
 					uint16_t raw_status = ss.fault_status;
 					uint16_t raw_log = ss.fault_log;
@@ -1449,25 +1460,23 @@ int main(int argc, char **argv)
 					if ((raw_status || raw_log) &&
 					    !(prev_status || prev_log)) {
 						wlog("WARN",
-						     "suppressed unconfirmed fault frame: status=0x%04x log=0x%04x (fan=%u pad1=%u pad2=%u)",
-						     raw_status, raw_log,
-						     ss.fan_duty, ss._pad1,
-						     ss._pad2);
+						     "suppressed unconfirmed fault frame: status=0x%04x log=0x%04x",
+						     raw_status, raw_log);
 						ss.fault_status = 0;
 						ss.fault_log = 0;
 					}
 					prev_status = raw_status;
 					prev_log = raw_log;
-				}
 
-				if (write_hwmon(hwmon_fd, &ss) < 0) {
-					fprintf(stderr,
-						"wireviewd: hwmon write failed\n");
-					break;
-				}
+					if (write_hwmon(hwmon_fd, &ss) < 0) {
+						fprintf(stderr,
+							"wireviewd: hwmon write failed\n");
+						break;
+					}
 
-				memcpy(&g_last, &ss, sizeof(g_last));
-				g_have_last = 1;
+					memcpy(&g_last, &ss, sizeof(g_last));
+					g_have_last = 1;
+				}
 
 				next_poll.tv_sec = now.tv_sec;
 				next_poll.tv_nsec = now.tv_nsec +
