@@ -1,3 +1,19 @@
+wireview-hwmon (1.4.1~26.04.1) resolute; urgency=medium
+
+  * Fix phantom fault alerts: discard corrupt (desynced) serial frames via
+    padding/fan-duty sanity checks, and debounce fault bits across two
+    consecutive frames. Suppressed/discarded frames are audit-logged.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Thu, 11 Jun 2026 18:30:00 +0000
+
+wireview-hwmon (1.4.1~24.04.1) noble; urgency=medium
+
+  * Fix phantom fault alerts: discard corrupt (desynced) serial frames via
+    padding/fan-duty sanity checks, and debounce fault bits across two
+    consecutive frames. Suppressed/discarded frames are audit-logged.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Thu, 11 Jun 2026 18:00:00 +0000
+
 wireview-hwmon (1.4.0~26.04.2) resolute; urgency=medium
 
   * Fix the wireview-hwmon-dkms maintainer scripts, which hardcoded an old

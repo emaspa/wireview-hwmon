@@ -1,7 +1,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wireview-hwmon
-Version:        1.4.0
+Version:        1.4.1
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -83,6 +83,11 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
+* Thu Jun 11 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.4.1-1
+- Fix phantom fault alerts: discard corrupt (desynced) serial frames via
+  padding/fan-duty sanity checks and debounce fault bits across two
+  consecutive frames; suppressed/discarded frames are audit-logged
+
 * Wed Jun 10 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.4.0-1
 - LAN fleet monitoring: opt-in /sensors publisher, HMAC-authenticated remote
   writes and config, wireviewctl top live monitor, daily audit logging,
