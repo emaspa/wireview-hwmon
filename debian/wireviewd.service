@@ -4,6 +4,10 @@ After=local-fs.target
 
 [Service]
 Type=simple
+# The hwmon module is a self-registering platform driver with no modalias, so
+# nothing autoloads it. Pull it in before the daemon starts; ignored if the
+# module isn't installed (e.g. wireview-hwmon-dkms not present).
+ExecStartPre=-/sbin/modprobe wireview_hwmon
 ExecStart=/usr/bin/wireviewd
 Restart=on-failure
 RestartSec=5
