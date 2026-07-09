@@ -66,6 +66,12 @@
 #define WCMD_NVM_CMD           0x06
 #define WCMD_READ_BUILD        0x07
 #define WCMD_ENTER_BOOTLOADER  0x08
+/* Serial handover: the GUI asks the daemon to stop all serial I/O for N
+ * seconds so it can drive the port directly (SPI-flash log reads, theme
+ * asset transfers). The daemon keeps its fd open but goes quiet; sensor
+ * polling resumes automatically at the deadline or on RESUME. */
+#define WCMD_SUSPEND_SERIAL    0x09
+#define WCMD_RESUME_SERIAL     0x0A
 
 /* Response status */
 #define RESP_OK            0
@@ -140,6 +146,25 @@ static int g_have_last;
 /* Write-command auth + relay state for the HTTP POST /command endpoint. */
 static char g_secret[128];      /* shared HMAC secret; empty => writes disabled */
 static int  g_serial_fd = -1;   /* current serial fd, for HTTP command relay */
+static struct timespec g_suspend_until; /* CLOCK_MONOTONIC deadline; 0 = active */
+
+static void wlog(const char *level, const char *fmt, ...);
+
+static int serial_suspended(void)
+{
+	struct timespec now;
+	if (g_suspend_until.tv_sec == 0)
+		return 0;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (now.tv_sec > g_suspend_until.tv_sec ||
+	    (now.tv_sec == g_suspend_until.tv_sec &&
+	     now.tv_nsec >= g_suspend_until.tv_nsec)) {
+		g_suspend_until.tv_sec = 0;
+		g_suspend_until.tv_nsec = 0;
+		return 0;
+	}
+	return 1;
+}
 static int  g_http_enabled = 0; /* network listener off unless config enables it */
 static int  g_http_port = HTTP_PORT; /* listener port (config: port=) */
 static int  g_log_retain_days = 14; /* days of audit logs to keep (config: log_days=) */
@@ -475,6 +500,33 @@ static void handle_client_request(int client_fd, int serial_fd)
 
 	if (serial_fd < 0) {
 		send_response(client_fd, RESP_NOT_CONNECTED, NULL, 0);
+		return;
+	}
+
+	if (cmd_type == WCMD_SUSPEND_SERIAL) {
+		int secs = 60;
+		if (payload_len >= 2)
+			secs = payload[0] | ((int)payload[1] << 8);
+		if (secs < 1) secs = 1;
+		if (secs > 300) secs = 300;
+		clock_gettime(CLOCK_MONOTONIC, &g_suspend_until);
+		g_suspend_until.tv_sec += secs;
+		wlog("INFO", "serial suspended for %d s (GUI direct access)", secs);
+		send_response(client_fd, RESP_OK, NULL, 0);
+		return;
+	}
+	if (cmd_type == WCMD_RESUME_SERIAL) {
+		g_suspend_until.tv_sec = 0;
+		g_suspend_until.tv_nsec = 0;
+		tcflush(serial_fd, TCIFLUSH);
+		wlog("INFO", "serial resumed");
+		send_response(client_fd, RESP_OK, NULL, 0);
+		return;
+	}
+	/* While the GUI owns the port, refuse serial-touching commands; the
+	 * cached GET_DEVICE_INFO is still fine. */
+	if (serial_suspended() && cmd_type != WCMD_GET_DEVICE_INFO) {
+		send_response(client_fd, RESP_ERROR, NULL, 0);
 		return;
 	}
 
@@ -926,18 +978,24 @@ static int b64_decode(const char *in, uint8_t *out, size_t outcap)
 /* ---- serial relay helpers (mirror the WCMD_* socket handlers) ---- */
 static int relay_screen(uint8_t cmd)
 {
+	if (serial_suspended())
+		return 0;
 	uint8_t c[2] = { CMD_SCREEN_CHANGE, cmd };
 	tcflush(g_serial_fd, TCIFLUSH);
 	return write(g_serial_fd, c, 2) == 2;
 }
 static int relay_nvm(uint8_t cmd)
 {
+	if (serial_suspended())
+		return 0;
 	uint8_t c[6] = { CMD_NVM_CONFIG, 0x55, 0xAA, 0x55, 0xAA, cmd };
 	tcflush(g_serial_fd, TCIFLUSH);
 	return write(g_serial_fd, c, 6) == 6;
 }
 static int relay_clear_faults(uint16_t status, uint16_t log)
 {
+	if (serial_suspended())
+		return 0;
 	uint8_t c[5] = { CMD_CLEAR_FAULTS, (uint8_t)(status & 0xFF),
 			 (uint8_t)(status >> 8), (uint8_t)(log & 0xFF),
 			 (uint8_t)(log >> 8) };
@@ -946,6 +1004,8 @@ static int relay_clear_faults(uint16_t status, uint16_t log)
 }
 static int relay_write_config(const uint8_t *data, int data_len)
 {
+	if (serial_suspended())
+		return 0;
 	uint8_t frame[64];
 	frame[0] = CMD_WRITE_CONFIG;
 	tcflush(g_serial_fd, TCIFLUSH);
@@ -964,6 +1024,8 @@ static int relay_write_config(const uint8_t *data, int data_len)
  * and returns the config byte length, or -1 on error. */
 static int relay_read_config(uint8_t *cfg, uint8_t *version)
 {
+	if (serial_suspended())
+		return -1;
 	int size = dev_info.config_version == 0 ? 72 :
 		   dev_info.config_version == 1 ? 74 : 96;
 	uint8_t cmd = CMD_READ_CONFIG;
@@ -1426,6 +1488,26 @@ int main(int argc, char **argv)
 			if (now.tv_sec > next_poll.tv_sec ||
 			    (now.tv_sec == next_poll.tv_sec &&
 			     now.tv_nsec >= next_poll.tv_nsec)) {
+
+				static int was_suspended;
+				if (serial_suspended()) {
+					was_suspended = 1;
+					next_poll.tv_sec = now.tv_sec;
+					next_poll.tv_nsec = now.tv_nsec +
+							    (long)interval_ms * 1000000;
+					if (next_poll.tv_nsec >= 1000000000L) {
+						next_poll.tv_sec +=
+							next_poll.tv_nsec / 1000000000L;
+						next_poll.tv_nsec %= 1000000000L;
+					}
+					continue;
+				}
+				if (was_suspended) {
+					/* Drop whatever the GUI's traffic left in the
+					 * line discipline before reading frames. */
+					tcflush(serial_fd, TCIFLUSH);
+					was_suspended = 0;
+				}
 
 				struct sensor_struct ss;
 				if (read_sensors(serial_fd, &ss) < 0) {
