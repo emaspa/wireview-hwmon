@@ -526,6 +526,7 @@ static void handle_client_request(int client_fd, int serial_fd)
 	/* While the GUI owns the port, refuse serial-touching commands; the
 	 * cached GET_DEVICE_INFO is still fine. */
 	if (serial_suspended() && cmd_type != WCMD_GET_DEVICE_INFO) {
+		wlog("WARN", "relay cmd 0x%02x rejected: serial suspended", cmd_type);
 		send_response(client_fd, RESP_ERROR, NULL, 0);
 		return;
 	}
@@ -631,7 +632,9 @@ static void handle_client_request(int client_fd, int serial_fd)
 		}
 		uint8_t cmd[2] = { CMD_SCREEN_CHANGE, payload[0] };
 		tcflush(serial_fd, TCIFLUSH);
-		if (write(serial_fd, cmd, 2) == 2)
+		ssize_t wr = write(serial_fd, cmd, 2);
+		wlog("INFO", "screen relay 0x%02x -> write=%zd", payload[0], wr);
+		if (wr == 2)
 			send_response(client_fd, RESP_OK, NULL, 0);
 		else
 			send_response(client_fd, RESP_ERROR, NULL, 0);
