@@ -23,6 +23,7 @@ install: all
 	depmod -a
 	install -m 755 wireviewd /usr/local/bin/wireviewd
 	install -m 755 wireviewctl /usr/local/bin/wireviewctl
+	install -D -m 644 firmware/TG-WV-PRO2-FW.hex /usr/share/wireview/TG-WV-PRO2-FW.hex
 	install -m 644 wireviewd.service /etc/systemd/system/wireviewd.service
 	install -m 644 99-wireview-hwmon.rules /etc/udev/rules.d/99-wireview-hwmon.rules
 	install -d /etc/modules-load.d
@@ -46,6 +47,8 @@ uninstall:
 	rm -f /usr/local/bin/wireviewctl
 	rm -f /etc/systemd/system/wireviewd.service
 	rm -f /etc/udev/rules.d/99-wireview-hwmon.rules
+	rm -f /usr/share/wireview/TG-WV-PRO2-FW.hex
+	rmdir /usr/share/wireview 2>/dev/null || true
 	rm -f /etc/modules-load.d/wireview-hwmon.conf
 	rm -f /etc/avahi/services/wireview.service
 	rm -f /lib/modules/$(shell uname -r)/extra/wireview_hwmon.ko

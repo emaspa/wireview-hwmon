@@ -247,8 +247,10 @@ Commands (require wireviewd running):
   nvm CMD           NVM operation (load|store|reset|load-cal|store-cal|load-cal-factory|store-cal-factory)
   build             Show firmware build string
   bootloader        Enter DFU bootloader mode
-flash FILE [-y]   Flash firmware (.hex or .bin) via DFU (needs dfu-util;
-                  works without the daemon if the bootloader is already up)
+  flash [FILE] [-y] Flash firmware (.hex or .bin) via DFU (needs dfu-util;
+                    works without the daemon if the bootloader is already up).
+                    Without FILE, flashes the bundled image at
+                    /usr/share/wireview/TG-WV-PRO2-FW.hex
 
 Commands (require wireview_hwmon module):
   sensors           Show all sensor readings from hwmon sysfs
@@ -272,6 +274,10 @@ wireviewctl top --host 192.168.1.50
 
 # Switch to simple display
 wireviewctl screen simple
+
+# Update the device firmware to the bundled image (no download needed);
+# add -y to skip the confirmation prompt for headless updates
+wireviewctl flash
 
 # Back up and restore config
 wireviewctl read-config > config.hex

@@ -28,6 +28,7 @@ package_wireview-hwmon() {
   install -Dm755 wireviewctl "$pkgdir/usr/bin/wireviewctl"
   install -Dm644 debian/wireviewd.service "$pkgdir/usr/lib/systemd/system/wireviewd.service"
   install -Dm644 99-wireview-hwmon.rules "$pkgdir/usr/lib/udev/rules.d/99-wireview-hwmon.rules"
+  install -Dm644 firmware/TG-WV-PRO2-FW.hex "$pkgdir/usr/share/wireview/TG-WV-PRO2-FW.hex"
   # The kernel module is a self-registering platform driver with no modalias,
   # so nothing autoloads it. Load it when the daemon starts (a no-op if the
   # dkms package isn't installed). Guarded so it stays a no-op should a future

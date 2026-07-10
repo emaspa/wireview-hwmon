@@ -511,6 +511,11 @@ static int dfu_device_present(void)
 	return found;
 }
 
+/* Firmware image bundled with the wireview-hwmon package ("make install"
+ * and all distro packages place it here). Used when "flash" is given no
+ * file argument, so "wireviewctl flash -y" is a complete headless update. */
+#define DEFAULT_FIRMWARE_PATH "/usr/share/wireview/TG-WV-PRO2-FW.hex"
+
 static int cmd_flash(const char *path, int yes)
 {
 	if (system("dfu-util --version >/dev/null 2>&1") != 0) {
@@ -1167,8 +1172,10 @@ static void usage(void)
 		"  nvm CMD           NVM operation (load|store|reset|load-cal|store-cal|load-cal-factory|store-cal-factory)\n"
 		"  build             Show firmware build string\n"
 		"  bootloader        Enter DFU bootloader mode\n"
-		"  flash FILE [-y]   Flash firmware (.hex or .bin) via DFU (needs dfu-util;\n"
-		"                    works without the daemon if the bootloader is already up)\n"
+		"  flash [FILE] [-y] Flash firmware (.hex or .bin) via DFU (needs dfu-util;\n"
+		"                    works without the daemon if the bootloader is already up).\n"
+		"                    Without FILE, flashes the bundled image at\n"
+		"                    " DEFAULT_FIRMWARE_PATH "\n"
 		"\n"
 		"Commands (require wireview_hwmon module):\n"
 		"  sensors           Show all sensor readings from hwmon sysfs\n"
@@ -1223,12 +1230,30 @@ int main(int argc, char **argv)
 	if (strcmp(cmd, "build") == 0)
 		return cmd_build();
 	if (strcmp(cmd, "flash") == 0) {
-		if (argc < 3) {
-			fprintf(stderr, "wireviewctl: flash requires a firmware file path\n");
-			return 1;
+		const char *path = NULL;
+		int yes = 0;
+		for (int i = 2; i < argc; i++) {
+			if (strcmp(argv[i], "-y") == 0) {
+				yes = 1;
+			} else if (!path) {
+				path = argv[i];
+			} else {
+				fprintf(stderr, "wireviewctl: flash takes one firmware file at most\n");
+				return 1;
+			}
 		}
-		int yes = argc > 3 && strcmp(argv[3], "-y") == 0;
-		return cmd_flash(argv[2], yes);
+		if (!path) {
+			if (access(DEFAULT_FIRMWARE_PATH, R_OK) != 0) {
+				fprintf(stderr, "wireviewctl: no firmware file given and the bundled image\n"
+					"is not installed at %s\n"
+					"(install/upgrade the wireview-hwmon package, or pass a file path)\n",
+					DEFAULT_FIRMWARE_PATH);
+				return 1;
+			}
+			path = DEFAULT_FIRMWARE_PATH;
+			printf("using bundled firmware: %s\n", path);
+		}
+		return cmd_flash(path, yes);
 	}
 	if (strcmp(cmd, "bootloader") == 0)
 		return cmd_bootloader();
