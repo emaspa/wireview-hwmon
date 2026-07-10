@@ -10,7 +10,7 @@ license=('GPL-2.0-only')
 makedepends=('gcc')
 options=('!debug')
 source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('5065356d60c92649a9272b7875659853815eb557f18270a7d8c65cf895e57b13')
+sha256sums=('e9226455c4024f7b40f11387fb707344fa1bfbf09c0f038f06660c8de781bff9')
 
 build() {
   cd "$pkgbase-$pkgver"
