@@ -276,7 +276,10 @@ wireviewctl top --host 192.168.1.50
 wireviewctl screen simple
 
 # Update the device firmware to the bundled image (no download needed);
-# add -y to skip the confirmation prompt for headless updates
+# add -y to skip the confirmation prompt for headless updates.
+# Unofficial tool, not affiliated with Thermal Grizzly: flash at your own
+# risk. A power loss mid-flash can leave the device unbootable until
+# reflashed manually.
 wireviewctl flash
 
 # Back up and restore config

@@ -537,7 +537,8 @@ static int cmd_flash(const char *path, int yes)
 		       build[0] ? " (" : "", build, build[0] ? ")" : "");
 
 	if (!yes) {
-		printf("Flash this image to the device? Do not power off during the update. [y/N] ");
+		printf("Unofficial tool, not affiliated with Thermal Grizzly: flash at your own risk.\n"
+		       "Flash this image to the device? Do not power off during the update. [y/N] ");
 		fflush(stdout);
 		char answer[8];
 		if (!fgets(answer, sizeof(answer), stdin)
