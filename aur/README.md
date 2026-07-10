@@ -26,7 +26,7 @@ git clone ssh://aur@aur.archlinux.org/wireview-hwmon.git
 cp PKGBUILD .SRCINFO wireview-hwmon/
 cd wireview-hwmon
 git add PKGBUILD .SRCINFO
-git commit -m "Update to wireview-hwmon 1.4.0"
+git commit -m "Update to wireview-hwmon 1.5.0"
 git push
 ```
 

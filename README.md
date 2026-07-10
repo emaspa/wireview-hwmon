@@ -13,7 +13,7 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
 
 - **wireview_hwmon.ko** - Kernel module that creates a virtual hwmon device
 - **wireviewd** - Userspace daemon that reads the device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN
-- **wireviewctl** - CLI tool for querying sensors, sending commands, and a `top` live monitor
+- **wireviewctl** - CLI tool for querying sensors, sending commands, firmware flashing (`flash`), and a `top` live monitor
 
 ## Installation
 
@@ -32,7 +32,7 @@ This installs the daemon, CLI tool, kernel module (via DKMS), systemd service, a
 Pre-built `.deb` packages are available on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page. Download and install:
 
 ```bash
-sudo apt install ./wireview-hwmon_1.4.0_amd64.deb ./wireview-hwmon-dkms_1.4.0_all.deb
+sudo apt install ./wireview-hwmon_1.5.0_amd64.deb ./wireview-hwmon-dkms_1.5.0_all.deb
 ```
 
 ### Fedora (COPR)
@@ -50,7 +50,7 @@ The same COPR repo also provides the [WireView GUI](https://github.com/emaspa/wi
 Pre-built `.rpm` packages are on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page (one set works on Fedora 42-44):
 
 ```bash
-sudo dnf install ./wireview-hwmon-1.4.0-1.x86_64.rpm ./wireview-hwmon-dkms-1.4.0-1.noarch.rpm
+sudo dnf install ./wireview-hwmon-1.5.0-1.x86_64.rpm ./wireview-hwmon-dkms-1.5.0-1.noarch.rpm
 sudo systemctl enable --now wireviewd
 ```
 
@@ -308,6 +308,8 @@ The daemon listens on a Unix socket at `/run/wireviewd.sock`, allowing external 
 | NVM_CMD | Send an NVM command (store/recall configuration) |
 | READ_BUILD | Read the firmware build string |
 | ENTER_BOOTLOADER | Restart the device into DFU bootloader mode |
+| SUSPEND_SERIAL | Pause daemon polling and release the serial port for a client (1-300 s, re-armable) |
+| RESUME_SERIAL | End a serial handover early and resume polling |
 
 The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`.
 
