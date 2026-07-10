@@ -392,6 +392,222 @@ static int cmd_bootloader(void)
 	return 0;
 }
 
+/* ---------- Firmware flashing (DFU via dfu-util) ---------- */
+
+/* Load .hex (Intel HEX) or raw .bin into a flat image. Returns image length,
+ * sets *base_out to the image base address (0x08000000 assumed for .bin) and
+ * *version_out to the BuildStruct firmware version byte (-1 if unknown). */
+static long load_firmware(const char *path, uint8_t **img_out, uint32_t *base_out,
+			  int *version_out, char *build_out, size_t build_cap)
+{
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		fprintf(stderr, "wireviewctl: cannot open %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	int c = fgetc(f);
+	rewind(f);
+	*version_out = -1;
+	if (build_out && build_cap) build_out[0] = '\0';
+
+	uint8_t *img = NULL;
+	long len = -1;
+	uint32_t base = 0x08000000u;
+
+	if (c == ':') {
+		/* Intel HEX: two passes (find range, then fill). */
+		char line[600];
+		uint32_t upper = 0, minaddr = 0xFFFFFFFFu, maxaddr = 0;
+		int linear = 0;
+		for (int pass = 0; pass < 2; pass++) {
+			rewind(f);
+			upper = 0; linear = 0;
+			while (fgets(line, sizeof(line), f)) {
+				char *t = line;
+				while (*t == ' ' || *t == '\r' || *t == '\n') t++;
+				if (*t != ':' || strlen(t) < 11) continue;
+				unsigned cnt, addr, typ;
+				if (sscanf(t + 1, "%2x%4x%2x", &cnt, &addr, &typ) != 3) continue;
+				if (typ == 1) break;
+				if (typ == 2 || typ == 4) {
+					unsigned v;
+					if (sscanf(t + 9, "%4x", &v) != 1) continue;
+					upper = (typ == 4) ? (uint32_t)v << 16 : (uint32_t)v << 4;
+					linear = (typ == 4);
+					(void)linear;
+					continue;
+				}
+				if (typ != 0) continue;
+				for (unsigned i = 0; i < cnt; i++) {
+					unsigned b;
+					if (sscanf(t + 9 + i * 2, "%2x", &b) != 1) break;
+					uint32_t a = upper + addr + i;
+					if (pass == 0) {
+						if (a < minaddr) minaddr = a;
+						if (a > maxaddr) maxaddr = a;
+					} else {
+						img[a - minaddr] = (uint8_t)b;
+					}
+				}
+			}
+			if (pass == 0) {
+				if (minaddr > maxaddr || maxaddr - minaddr >= 4u * 1024 * 1024) {
+					fprintf(stderr, "wireviewctl: invalid or oversized hex image\n");
+					fclose(f);
+					return -1;
+				}
+				len = (long)(maxaddr - minaddr + 1);
+				img = malloc((size_t)len);
+				if (!img) { fclose(f); return -1; }
+				memset(img, 0xFF, (size_t)len);
+				base = minaddr;
+			}
+		}
+	} else {
+		fseek(f, 0, SEEK_END);
+		len = ftell(f);
+		rewind(f);
+		if (len <= 0 || len >= 4L * 1024 * 1024) {
+			fprintf(stderr, "wireviewctl: invalid firmware size\n");
+			fclose(f);
+			return -1;
+		}
+		img = malloc((size_t)len);
+		if (!img || fread(img, 1, (size_t)len, f) != (size_t)len) {
+			fprintf(stderr, "wireviewctl: read failed\n");
+			free(img);
+			fclose(f);
+			return -1;
+		}
+	}
+	fclose(f);
+
+	/* BuildStruct: version byte at image+194, 32-byte build string at +227. */
+	if (len > 194 + 1)
+		*version_out = img[194];
+	if (build_out && build_cap && len > 227 + 32) {
+		size_t n = 0;
+		while (n < 32 && n + 1 < build_cap && img[227 + n] != 0) {
+			build_out[n] = (char)img[227 + n];
+			n++;
+		}
+		build_out[n] = '\0';
+	}
+
+	*img_out = img;
+	*base_out = base;
+	return len;
+}
+
+static int dfu_device_present(void)
+{
+	FILE *p = popen("dfu-util -l 2>/dev/null", "r");
+	if (!p) return 0;
+	char line[512];
+	int found = 0;
+	while (fgets(line, sizeof(line), p))
+		if (strstr(line, "[0483:df11]")) found = 1;
+	pclose(p);
+	return found;
+}
+
+static int cmd_flash(const char *path, int yes)
+{
+	if (system("dfu-util --version >/dev/null 2>&1") != 0) {
+		fprintf(stderr, "wireviewctl: dfu-util not found; install the dfu-util package\n");
+		return 1;
+	}
+
+	uint8_t *img = NULL;
+	uint32_t base = 0;
+	int version = -1;
+	char build[40];
+	long len = load_firmware(path, &img, &base, &version, build, sizeof(build));
+	if (len < 0)
+		return 1;
+
+	printf("firmware image: %s (%ld bytes, base 0x%08X)\n", path, len, base);
+	if (version >= 0)
+		printf("image version:  v%02d%s%s%s\n", version,
+		       build[0] ? " (" : "", build, build[0] ? ")" : "");
+
+	if (!yes) {
+		printf("Flash this image to the device? Do not power off during the update. [y/N] ");
+		fflush(stdout);
+		char answer[8];
+		if (!fgets(answer, sizeof(answer), stdin)
+		    || (answer[0] != 'y' && answer[0] != 'Y')) {
+			fprintf(stderr, "aborted\n");
+			free(img);
+			return 1;
+		}
+	}
+
+	if (!dfu_device_present()) {
+		uint8_t *resp = NULL;
+		uint16_t rlen = 0;
+		printf("entering bootloader...\n");
+		if (sock_command(WCMD_ENTER_BOOTLOADER, NULL, 0, &resp, &rlen) < 0)
+			fprintf(stderr, "warning: could not reach wireviewd; waiting for a "
+					"manually started DFU bootloader\n");
+		free(resp);
+
+		int waited = 0;
+		while (!dfu_device_present() && waited < 25) {
+			sleep(1);
+			waited++;
+		}
+		if (!dfu_device_present()) {
+			fprintf(stderr, "wireviewctl: DFU bootloader (0483:df11) did not appear; "
+					"check the udev rules and connection\n");
+			free(img);
+			return 1;
+		}
+	}
+
+	char tmp[] = "/tmp/wireviewctl-fw-XXXXXX";
+	int fd = mkstemp(tmp);
+	if (fd < 0 || write(fd, img, (size_t)len) != (ssize_t)len) {
+		fprintf(stderr, "wireviewctl: temp file write failed\n");
+		if (fd >= 0) { close(fd); unlink(tmp); }
+		free(img);
+		return 1;
+	}
+	close(fd);
+	free(img);
+
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd),
+		 "dfu-util -d 0483:df11 -a 0 -s 0x%08X:leave -D %s 2>&1", base, tmp);
+	printf("running: %s\n", cmd);
+
+	/* dfu-util exits non-zero when the device detaches right after ":leave"
+	 * even though the download finished; scan its output for the success
+	 * marker instead of trusting the exit code. */
+	FILE *proc = popen(cmd, "r");
+	if (!proc) {
+		fprintf(stderr, "wireviewctl: failed to run dfu-util\n");
+		unlink(tmp);
+		return 1;
+	}
+	char line[512];
+	int downloaded = 0;
+	while (fgets(line, sizeof(line), proc)) {
+		fputs(line, stdout);
+		if (strstr(line, "File downloaded successfully"))
+			downloaded = 1;
+	}
+	int rc = pclose(proc);
+	unlink(tmp);
+
+	if (downloaded) {
+		printf("flash complete; the device is rebooting into the new firmware\n");
+		return 0;
+	}
+	fprintf(stderr, "wireviewctl: flash failed (dfu-util exit status %d)\n", rc);
+	return 1;
+}
+
 /* ---------- Sensors (sysfs, no daemon needed) ---------- */
 
 static int find_hwmon_path(char *buf, size_t bufsize)
@@ -951,6 +1167,8 @@ static void usage(void)
 		"  nvm CMD           NVM operation (load|store|reset|load-cal|store-cal|load-cal-factory|store-cal-factory)\n"
 		"  build             Show firmware build string\n"
 		"  bootloader        Enter DFU bootloader mode\n"
+		"  flash FILE [-y]   Flash firmware (.hex or .bin) via DFU (needs dfu-util;\n"
+		"                    works without the daemon if the bootloader is already up)\n"
 		"\n"
 		"Commands (require wireview_hwmon module):\n"
 		"  sensors           Show all sensor readings from hwmon sysfs\n"
@@ -1004,6 +1222,14 @@ int main(int argc, char **argv)
 	}
 	if (strcmp(cmd, "build") == 0)
 		return cmd_build();
+	if (strcmp(cmd, "flash") == 0) {
+		if (argc < 3) {
+			fprintf(stderr, "wireviewctl: flash requires a firmware file path\n");
+			return 1;
+		}
+		int yes = argc > 3 && strcmp(argv[3], "-y") == 0;
+		return cmd_flash(argv[2], yes);
+	}
 	if (strcmp(cmd, "bootloader") == 0)
 		return cmd_bootloader();
 	if (strcmp(cmd, "sensors") == 0)

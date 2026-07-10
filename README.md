@@ -247,6 +247,8 @@ Commands (require wireviewd running):
   nvm CMD           NVM operation (load|store|reset|load-cal|store-cal|load-cal-factory|store-cal-factory)
   build             Show firmware build string
   bootloader        Enter DFU bootloader mode
+flash FILE [-y]   Flash firmware (.hex or .bin) via DFU (needs dfu-util;
+                  works without the daemon if the bootloader is already up)
 
 Commands (require wireview_hwmon module):
   sensors           Show all sensor readings from hwmon sysfs
