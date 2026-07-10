@@ -1,8 +1,8 @@
 # Maintainer: Emanuele Sparvoli <sparvoli@gmail.com>
 pkgbase=wireview-hwmon
 pkgname=('wireview-hwmon' 'wireview-hwmon-dkms')
-pkgver=1.4.1
-pkgrel=3
+pkgver=1.5.0
+pkgrel=1
 pkgdesc="WireView Pro II hwmon daemon, CLI and DKMS kernel module"
 arch=('x86_64')
 url="https://github.com/emaspa/wireview-hwmon"
@@ -22,7 +22,8 @@ build() {
 package_wireview-hwmon() {
   pkgdesc="WireView Pro II hwmon daemon and CLI (userspace)"
   depends=('glibc')
-  optdepends=('wireview-hwmon-dkms: kernel module exposing sensors via /sys/class/hwmon')
+  optdepends=('wireview-hwmon-dkms: kernel module exposing sensors via /sys/class/hwmon'
+              'dfu-util: device firmware updates via "wireviewctl flash"')
   cd "$pkgbase-$pkgver"
   install -Dm755 wireviewd "$pkgdir/usr/bin/wireviewd"
   install -Dm755 wireviewctl "$pkgdir/usr/bin/wireviewctl"

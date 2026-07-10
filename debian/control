@@ -19,7 +19,7 @@ Description: WireView Pro II hwmon kernel module (DKMS)
 Package: wireview-hwmon
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Recommends: wireview-hwmon-dkms
+Recommends: wireview-hwmon-dkms, dfu-util
 Description: WireView Pro II daemon and CLI tool
  Userspace daemon and CLI tool for the Thermal Grizzly WireView Pro II
  GPU power monitor. The daemon reads the device over USB serial and

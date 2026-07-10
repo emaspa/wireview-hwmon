@@ -1,3 +1,35 @@
+wireview-hwmon (1.5.0~26.04.1) resolute; urgency=medium
+
+  * wireviewd: serial handover protocol (suspend/resume serial) so clients
+    like the WireView Linux app can borrow the USB serial port for device
+    log reads, theme uploads, and firmware flashing while the daemon pauses
+    polling; relayed commands are logged and rejected while suspended.
+  * wireviewctl: new "flash" command - update the device firmware over DFU
+    via dfu-util, enters the bootloader through the daemon when needed and
+    works headless with -y.
+  * Ship the official firmware image (v05) at
+    /usr/share/wireview/TG-WV-PRO2-FW.hex; "wireviewctl flash" with no file
+    argument uses it, so "wireviewctl flash -y" is a complete update.
+  * Recommend dfu-util (used by the flash command).
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Fri, 10 Jul 2026 10:40:00 +0000
+
+wireview-hwmon (1.5.0~24.04.1) noble; urgency=medium
+
+  * wireviewd: serial handover protocol (suspend/resume serial) so clients
+    like the WireView Linux app can borrow the USB serial port for device
+    log reads, theme uploads, and firmware flashing while the daemon pauses
+    polling; relayed commands are logged and rejected while suspended.
+  * wireviewctl: new "flash" command - update the device firmware over DFU
+    via dfu-util, enters the bootloader through the daemon when needed and
+    works headless with -y.
+  * Ship the official firmware image (v05) at
+    /usr/share/wireview/TG-WV-PRO2-FW.hex; "wireviewctl flash" with no file
+    argument uses it, so "wireviewctl flash -y" is a complete update.
+  * Recommend dfu-util (used by the flash command).
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Fri, 10 Jul 2026 10:30:00 +0000
+
 wireview-hwmon (1.4.1~26.04.1) resolute; urgency=medium
 
   * Fix phantom fault alerts: discard corrupt (desynced) serial frames via

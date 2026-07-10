@@ -1,7 +1,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wireview-hwmon
-Version:        1.4.1
+Version:        1.5.0
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -11,6 +11,9 @@ Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.
 
 BuildRequires:  gcc
 BuildRequires:  systemd-rpm-macros
+
+# wireviewctl flash updates the device firmware over DFU via dfu-util
+Recommends:     dfu-util
 
 %description
 Userspace daemon and CLI tool for the Thermal Grizzly WireView Pro II GPU power
@@ -86,6 +89,15 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
+* Fri Jul 10 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.5.0-1
+- wireviewd: serial handover protocol (suspend/resume serial) so clients can
+  borrow the USB serial port for log reads, theme uploads and firmware
+  flashing while the daemon pauses polling
+- wireviewctl: new "flash" command, DFU firmware update via dfu-util; with no
+  file argument it flashes the bundled image, headless with -y
+- Ship the official firmware image (v05) at /usr/share/wireview/TG-WV-PRO2-FW.hex
+- Recommend dfu-util
+
 * Thu Jun 11 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.4.1-1
 - Fix phantom fault alerts: discard corrupt (desynced) serial frames via
   padding/fan-duty sanity checks and debounce fault bits across two
