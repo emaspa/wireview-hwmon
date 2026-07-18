@@ -1,6 +1,25 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
+    # Heal orphans left by pre-1.5.1 upgrades: their prerm only acted on
+    # "remove", so old versions stayed registered in /var/lib/dkms with a
+    # dangling source symlink after /usr/src/wireview-hwmon-<old> was
+    # replaced. Those orphans break the dkms kernel prerm hook whenever an
+    # old kernel is purged. (On an upgrade it is the OLD package's prerm
+    # that runs, so the fixed prerm alone cannot clean existing systems.)
+    for dir in /var/lib/dkms/wireview-hwmon/*/; do
+        [ -d "$dir" ] || continue
+        v=$(basename "$dir")
+        case "$v" in kernel-*) continue ;; esac
+        [ -e "/var/lib/dkms/wireview-hwmon/$v/source/dkms.conf" ] || \
+            rm -rf "/var/lib/dkms/wireview-hwmon/$v"
+    done
+    # Prune registry symlinks left dangling by the cleanup above.
+    for link in /var/lib/dkms/wireview-hwmon/kernel-*; do
+        if [ -L "$link" ] && [ ! -e "$link" ]; then
+            rm -f "$link"
+        fi
+    done
     # Derive the version from the shipped dkms.conf so this never goes stale
     # across releases (the old hardcoded version silently skipped the build).
     VER=$(grep -m1 '^PACKAGE_VERSION=' /usr/src/wireview-hwmon-*/dkms.conf 2>/dev/null | sed 's/.*=//; s/"//g')

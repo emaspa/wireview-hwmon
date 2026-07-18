@@ -1,9 +1,31 @@
 #!/bin/sh
 set -e
-if [ "$1" = "remove" ]; then
-    VER=$(grep -m1 '^PACKAGE_VERSION=' /usr/src/wireview-hwmon-*/dkms.conf 2>/dev/null | sed 's/.*=//; s/"//g')
-    if [ -n "$VER" ]; then
-        dkms remove -m wireview-hwmon -v "$VER" --all 2>/dev/null || true
-    fi
-fi
+# Deregister our DKMS modules on remove AND upgrade. dpkg calls the old
+# package's prerm with "upgrade" when a new version replaces it; acting only
+# on "remove" (as before 1.5.1) left the old version's /var/lib/dkms tree
+# behind with a dangling source symlink once the new package swapped out
+# /usr/src/wireview-hwmon-<old>. Kernel prerm hooks then failed on the
+# orphan ("Could not locate dkms.conf") whenever an old kernel was purged.
+case "$1" in
+remove|upgrade)
+    # Walk the DKMS registry rather than globbing /usr/src: it is the
+    # authoritative list, and it still works when the source tree is gone.
+    for dir in /var/lib/dkms/wireview-hwmon/*/; do
+        [ -d "$dir" ] || continue
+        v=$(basename "$dir")
+        case "$v" in kernel-*) continue ;; esac
+        dkms remove -m wireview-hwmon -v "$v" --all 2>/dev/null || true
+        # dkms remove refuses to touch versions whose source is already
+        # missing; clear those leftovers by hand.
+        [ -e "/var/lib/dkms/wireview-hwmon/$v/source/dkms.conf" ] || \
+            rm -rf "/var/lib/dkms/wireview-hwmon/$v"
+    done
+    # Prune registry symlinks left dangling by the cleanup above.
+    for link in /var/lib/dkms/wireview-hwmon/kernel-*; do
+        if [ -L "$link" ] && [ ! -e "$link" ]; then
+            rm -f "$link"
+        fi
+    done
+    ;;
+esac
 #DEBHELPER#
