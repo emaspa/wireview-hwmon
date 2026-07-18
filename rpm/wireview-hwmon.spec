@@ -1,7 +1,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wireview-hwmon
-Version:        1.5.0
+Version:        1.5.1
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -78,17 +78,40 @@ install -Dm0644 Makefile.dkms   %{buildroot}%{_usrsrc}/%{name}-%{version}/Makefi
 %{_usrsrc}/%{name}-%{version}/
 
 %post dkms
+# Heal orphaned registrations left by upgrades from releases whose %%preun
+# only deregistered on erase: the old version stayed in /var/lib/dkms with a
+# dangling source symlink and broke the dkms kernel prerm hook.
+for dir in /var/lib/dkms/%{name}/*/; do
+    [ -d "$dir" ] || continue
+    v=$(basename "$dir")
+    case "$v" in kernel-*) continue ;; esac
+    [ -e "/var/lib/dkms/%{name}/$v/source/dkms.conf" ] || \
+        rm -rf "/var/lib/dkms/%{name}/$v"
+done
+for link in /var/lib/dkms/%{name}/kernel-*; do
+    if [ -L "$link" ] && [ ! -e "$link" ]; then
+        rm -f "$link"
+    fi
+done
 # Register, build and install the module for the running kernel.
 dkms add -m %{name} -v %{version} --rpm_safe_upgrade 2>/dev/null || true
 dkms build -m %{name} -v %{version} 2>/dev/null || true
 dkms install -m %{name} -v %{version} --force 2>/dev/null || true
 
 %preun dkms
-if [ $1 -eq 0 ]; then
-    dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
-fi
+# Run on erase AND upgrade: --rpm_safe_upgrade coordinates the remove/add
+# pair during upgrades so the outgoing version is deregistered before rpm
+# deletes its /usr/src tree. Gating this on $1 -eq 0 left orphans behind.
+dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
 
 %changelog
+* Sat Jul 18 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.5.1-1
+- dkms: deregister on upgrade as well as erase (drop the $1 -eq 0 guard on
+  preun); upgrades used to leave the old version registered in /var/lib/dkms
+  with a dangling source symlink, breaking the dkms kernel prerm hook.
+- dkms: post heals orphaned registrations left by earlier upgrades.
+- wireviewctl flash: state unofficial, at-your-own-risk in the confirm prompt.
+
 * Fri Jul 10 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.5.0-1
 - wireviewd: serial handover protocol (suspend/resume serial) so clients can
   borrow the USB serial port for log reads, theme uploads and firmware

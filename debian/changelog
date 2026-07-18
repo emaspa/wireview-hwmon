@@ -1,3 +1,29 @@
+wireview-hwmon (1.5.1~26.04.1) resolute; urgency=medium
+
+  * dkms package: deregister DKMS modules on upgrade as well as removal.
+    Upgrades used to leave the outgoing version registered in /var/lib/dkms
+    with a dangling source symlink, which made the dkms kernel prerm hook
+    fail ("Could not locate dkms.conf") whenever an old kernel was purged.
+  * dkms package: postinst heals orphaned registrations left behind by
+    upgrades from earlier releases before registering the new version.
+  * wireviewctl flash: state unofficial, not affiliated with Thermal
+    Grizzly, flash at your own risk in the confirmation prompt.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Sat, 18 Jul 2026 10:00:00 +0000
+
+wireview-hwmon (1.5.1~24.04.1) noble; urgency=medium
+
+  * dkms package: deregister DKMS modules on upgrade as well as removal.
+    Upgrades used to leave the outgoing version registered in /var/lib/dkms
+    with a dangling source symlink, which made the dkms kernel prerm hook
+    fail ("Could not locate dkms.conf") whenever an old kernel was purged.
+  * dkms package: postinst heals orphaned registrations left behind by
+    upgrades from earlier releases before registering the new version.
+  * wireviewctl flash: state unofficial, not affiliated with Thermal
+    Grizzly, flash at your own risk in the confirmation prompt.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Sat, 18 Jul 2026 10:00:00 +0000
+
 wireview-hwmon (1.5.0~26.04.1) resolute; urgency=medium
 
   * wireviewd: serial handover protocol (suspend/resume serial) so clients

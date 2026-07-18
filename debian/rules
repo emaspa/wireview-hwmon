@@ -14,9 +14,9 @@ override_dh_auto_install:
 	install -D -m 644 99-wireview-hwmon.rules debian/wireview-hwmon/lib/udev/rules.d/99-wireview-hwmon.rules
 	install -D -m 644 firmware/TG-WV-PRO2-FW.hex debian/wireview-hwmon/usr/share/wireview/TG-WV-PRO2-FW.hex
 	# DKMS package
-	install -D -m 644 wireview_hwmon.c debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.0/wireview_hwmon.c
-	install -D -m 644 dkms.conf debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.0/dkms.conf
-	install -D -m 644 Makefile.dkms debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.0/Makefile
+	install -D -m 644 wireview_hwmon.c debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.1/wireview_hwmon.c
+	install -D -m 644 dkms.conf debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.1/dkms.conf
+	install -D -m 644 Makefile.dkms debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.1/Makefile
 
 override_dh_auto_clean:
 	rm -f wireviewd wireviewctl

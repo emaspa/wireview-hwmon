@@ -32,7 +32,7 @@ This installs the daemon, CLI tool, kernel module (via DKMS), systemd service, a
 Pre-built `.deb` packages are available on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page. Download and install:
 
 ```bash
-sudo apt install ./wireview-hwmon_1.5.0_amd64.deb ./wireview-hwmon-dkms_1.5.0_all.deb
+sudo apt install ./wireview-hwmon_1.5.1_amd64.deb ./wireview-hwmon-dkms_1.5.1_all.deb
 ```
 
 ### Fedora (COPR)
@@ -50,7 +50,7 @@ The same COPR repo also provides the [WireView GUI](https://github.com/emaspa/wi
 Pre-built `.rpm` packages are on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page (one set works on Fedora 42-44):
 
 ```bash
-sudo dnf install ./wireview-hwmon-1.5.0-1.x86_64.rpm ./wireview-hwmon-dkms-1.5.0-1.noarch.rpm
+sudo dnf install ./wireview-hwmon-1.5.1-1.x86_64.rpm ./wireview-hwmon-dkms-1.5.1-1.noarch.rpm
 sudo systemctl enable --now wireviewd
 ```
 
