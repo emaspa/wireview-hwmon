@@ -42,8 +42,9 @@ so the module can build.
 
 ## Notes
 
-- Validated by building both RPMs and installing the daemon in a Fedora 42
-  container; the kernel module compiles via `dkms build` against `kernel-devel`.
+- Validated by building both RPMs and installing the daemon in a Fedora
+  container (use a currently supported release, e.g. fedora:43); the kernel
+  module compiles via `dkms build` against `kernel-devel`.
 - Immutable distros (Bazzite, Silverblue) are not a target for the kernel module
   (DKMS doesn't fit rpm-ostree). Those users run the WireView GUI Flatpak in
   direct-serial mode.
