@@ -58,8 +58,11 @@ sudo systemctl enable --now wireviewd
 
 ```bash
 paru -S wireview-hwmon wireview-hwmon-dkms   # or: yay -S
+sudo modprobe wireview_hwmon
 sudo systemctl enable --now wireviewd
 ```
+
+Verify with `sensors` (or `wireviewctl info`); a `wireview`-named hwmon device should appear. From the next boot onward everything comes up automatically: the dkms package registers the module in `modules-load.d` and the service also modprobes it on start.
 
 DKMS needs the matching kernel headers (`linux-headers`, `linux-cachyos-headers`, …) installed; the module then rebuilds automatically on kernel updates.
 
