@@ -1290,7 +1290,8 @@ static void usage(const char *prog)
 int main(int argc, char **argv)
 {
 	int interval_ms = 1000;
-	char dev_path[256] = "";
+	char user_dev_path[256] = "";	/* -d: re-used on every reconnect */
+	char dev_path[256] = "";	/* path in use this connection */
 	int opt;
 
 	while ((opt = getopt(argc, argv, "i:d:h")) != -1) {
@@ -1303,7 +1304,7 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 'd':
-			snprintf(dev_path, sizeof(dev_path), "%s", optarg);
+			snprintf(user_dev_path, sizeof(user_dev_path), "%s", optarg);
 			break;
 		default:
 			usage(argv[0]);
@@ -1343,8 +1344,11 @@ int main(int argc, char **argv)
 
 		memset(client_fds, -1, sizeof(client_fds));
 
-		/* Find device if not specified */
-		if (dev_path[0] == '\0') {
+		/* Use the -d path every time; otherwise auto-detect. Clearing
+		 * dev_path below only forgets an auto-detected path. */
+		if (user_dev_path[0] != '\0') {
+			snprintf(dev_path, sizeof(dev_path), "%s", user_dev_path);
+		} else if (dev_path[0] == '\0') {
 			if (find_device(dev_path, sizeof(dev_path)) < 0) {
 				fprintf(stderr, "wireviewd: device not found, retrying in 5s\n");
 				sleep(5);
