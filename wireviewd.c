@@ -175,6 +175,8 @@ static int  g_http_port = HTTP_PORT; /* listener port (config: port=) */
 static int  g_log_retain_days = 14; /* days of audit logs to keep (config: log_days=) */
 
 #define HTTP_MAX_BODY    8192
+#define HTTP_MAX_HEADER  8192   /* request line + headers, before the blank line */
+#define HTTP_DEADLINE_MS 3000   /* whole-connection budget for reading the request */
 #define HTTP_AUTH_WINDOW 30     /* seconds of timestamp skew tolerated */
 
 static void sig_handler(int sig)
@@ -1242,7 +1244,47 @@ static void handle_post_command(int cfd, const char *req, const char *body,
 	}
 }
 
-/* Accept one HTTP connection, route GET /sensors and POST /command, close. */
+/* Milliseconds left until a CLOCK_MONOTONIC deadline (<= 0 once passed). */
+static long ms_until(const struct timespec *deadline)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (deadline->tv_sec - now.tv_sec) * 1000L +
+	       (deadline->tv_nsec - now.tv_nsec) / 1000000L;
+}
+
+/* recv() that never waits past the deadline. Returns bytes read, 0 on
+ * orderly close, -1 on error, or -2 once the deadline has passed. */
+static ssize_t recv_deadline(int fd, void *buf, size_t len,
+			     const struct timespec *deadline)
+{
+	for (;;) {
+		long left = ms_until(deadline);
+		if (left <= 0)
+			return -2;
+
+		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		int pr = poll(&pfd, 1, (int)left);
+		if (pr < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (pr == 0)
+			return -2;
+
+		ssize_t r = recv(fd, buf, len, MSG_DONTWAIT);
+		if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+			      errno == EINTR))
+			continue;
+		return r;
+	}
+}
+
+/* Accept one HTTP connection, route GET /sensors and POST /command, close.
+ * Reading the request is bounded by HTTP_DEADLINE_MS in total (not per
+ * recv), so a slow client cannot stall sensor polling. */
 static void http_handle(int http_fd)
 {
 	struct sockaddr_in peer;
@@ -1252,20 +1294,33 @@ static void http_handle(int http_fd)
 	char client_ip[INET_ADDRSTRLEN] = "?";
 	inet_ntop(AF_INET, &peer.sin_addr, client_ip, sizeof(client_ip));
 
-	struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-	setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	struct timespec deadline;
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += HTTP_DEADLINE_MS / 1000;
+	deadline.tv_nsec += (long)(HTTP_DEADLINE_MS % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
 
-	static char buf[HTTP_MAX_BODY + 2048];
+	/* Room for a maximal header block plus a maximal body. */
+	static char buf[HTTP_MAX_HEADER + 4 + HTTP_MAX_BODY + 1];
 	size_t total = 0;
 	char *hdr_end = NULL;
-	while (total < sizeof(buf) - 1) {
-		ssize_t r = recv(cfd, buf + total, sizeof(buf) - 1 - total, 0);
+	while (total < HTTP_MAX_HEADER + 4) {
+		ssize_t r = recv_deadline(cfd, buf + total,
+					  sizeof(buf) - 1 - total, &deadline);
+		if (r == -2)
+			wlog("WARN", "http from %s: request deadline exceeded", client_ip);
 		if (r <= 0) break;
 		total += (size_t)r;
 		buf[total] = '\0';
 		if ((hdr_end = strstr(buf, "\r\n\r\n")) != NULL) break;
 	}
-	if (!hdr_end) { close(cfd); return; }
+	if (!hdr_end || (size_t)(hdr_end - buf) > HTTP_MAX_HEADER) {
+		close(cfd);
+		return;
+	}
 
 	char method[8] = {0}, path[64] = {0};
 	if (sscanf(buf, "%7s %63s", method, path) != 2) { close(cfd); return; }
@@ -1273,6 +1328,12 @@ static void http_handle(int http_fd)
 	if (strcmp(method, "GET") == 0 && strcmp(path, "/sensors") == 0) {
 		char body[2048];
 		int bn = build_sensors_json(body, sizeof(body));
+		/* snprintf returns the untruncated length; never send more
+		 * than the buffer actually holds. */
+		if (bn < 0)
+			bn = 0;
+		if ((size_t)bn > sizeof(body) - 1)
+			bn = (int)(sizeof(body) - 1);
 		char hdr[256];
 		int hn = snprintf(hdr, sizeof(hdr),
 			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -1323,7 +1384,13 @@ static void http_handle(int http_fd)
 		}
 		size_t body_off = (size_t)(hdr_end + 4 - buf);
 		while (total - body_off < want && total < sizeof(buf) - 1) {
-			ssize_t r = recv(cfd, buf + total, sizeof(buf) - 1 - total, 0);
+			ssize_t r = recv_deadline(cfd, buf + total,
+						  sizeof(buf) - 1 - total, &deadline);
+			if (r == -2) {
+				wlog("WARN", "http from %s: request deadline exceeded", client_ip);
+				close(cfd);
+				return;
+			}
 			if (r <= 0) break;
 			total += (size_t)r;
 		}
