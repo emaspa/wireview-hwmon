@@ -110,7 +110,7 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 
 	uint8_t *data = NULL;
 	if (rlen > 0) {
-		data = malloc(rlen);
+		data = calloc(1, rlen);
 		if (!data) {
 			close(fd);
 			return -1;
