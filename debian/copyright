@@ -6,6 +6,24 @@ Files: *
 Copyright: 2024-2026 Emanuele Sparvoli
 License: GPL-2.0
 
+Files: sha256.c sha256.h
+Copyright: Brad Conte
+License: CC0-1.0
+Comment: Vendored public-domain SHA-256 implementation (HMAC wrapper added
+ by Emanuele Sparvoli).
+
+Files: firmware/TG-WV-PRO2-FW.hex
+Copyright: Thermal Grizzly
+License: other
+ Proprietary device firmware; not covered by the GPL. No license text
+ accompanies the image. Its redistribution status is as granted by Thermal
+ Grizzly for each upstream release, and this package adds or implies no
+ further permission.
+Comment: Official Thermal Grizzly WireView Pro II firmware image,
+ redistributed unmodified from the upstream WireView2 Windows release (see
+ firmware/README.md). Installed as /usr/share/wireview/TG-WV-PRO2-FW.hex for
+ "wireviewctl flash"; it runs on the device, never on the host.
+
 License: GPL-2.0
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License version 2 as
@@ -21,3 +39,11 @@ License: GPL-2.0
  .
  On Debian systems, the full text of the GNU General Public License
  version 2 can be found in /usr/share/common-licenses/GPL-2.
+
+License: CC0-1.0
+ To the extent possible under law, the author(s) have dedicated all
+ copyright and related and neighboring rights to this software to the
+ public domain worldwide. This software is distributed without any warranty.
+ .
+ On Debian systems, the full text of the Creative Commons Zero 1.0
+ Universal license can be found in /usr/share/common-licenses/CC0-1.0.
