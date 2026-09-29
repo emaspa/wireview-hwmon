@@ -8,9 +8,10 @@ when no file argument is given. It runs on the device, never on the host.
 ## License
 
 The image is proprietary Thermal Grizzly software. It is not covered by this
-repository's GPL, and no license text accompanies it: it may be redistributed
-only as Thermal Grizzly permits, and this project grants no further
-permission.
+repository's GPL, and no license text accompanies it. Thermal Grizzly is aware
+of this project; the image is redistributed unmodified on that basis and will
+be removed from the repository and the packages if they ask. This project
+grants no further permission.
 
 To keep it separable from the free code, the distro packages ship it on its
 own:

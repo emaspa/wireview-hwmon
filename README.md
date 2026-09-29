@@ -795,11 +795,6 @@ of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
   `/sensors` schema already has a `devices[]` array, but the daemon handles one
   device: this needs a misc node per device or a device id in the record, and a
   decision on how the hwmon devices are named.
-- **Firmware redistribution.** The Thermal Grizzly image now ships in its own
-  `wireview-hwmon-firmware` package, but the source tarball and the Debian
-  source package still contain it. Either get written permission to
-  redistribute it, or have `wireviewctl flash` fetch it. A clean archive split
-  also needs a separate source package (lintian `archive-liberty-mismatch`).
 - **Remote readings on a par with local ones**: carry average voltage, Vdd and
   the alarms in `GET /sensors`, so `wireviewctl --host h sensors` prints what
   the local command does.

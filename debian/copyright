@@ -16,9 +16,9 @@ Files: firmware/TG-WV-PRO2-FW.hex
 Copyright: Thermal Grizzly
 License: other
  Proprietary device firmware; not covered by the GPL. No license text
- accompanies the image. Its redistribution status is as granted by Thermal
- Grizzly for each upstream release, and this package adds or implies no
- further permission.
+ accompanies the image. It is redistributed unmodified with Thermal
+ Grizzly's knowledge of this project, and will be removed from the packages
+ on their request. This package adds or implies no further permission.
 Comment: Official Thermal Grizzly WireView Pro II firmware image,
  redistributed unmodified from the upstream WireView2 Windows release (see
  firmware/README.md). Shipped only in the wireview-hwmon-firmware binary
