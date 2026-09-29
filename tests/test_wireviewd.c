@@ -457,6 +457,172 @@ static void test_post_command(void)
 	g_nonce_idx = 0;
 }
 
+/* ---- command-socket clients: idle timeout, eviction, handover ---- */
+
+static void test_client_idle(void)
+{
+	struct client cl[MAX_CLIENTS];
+	const struct timespec now = { .tv_sec = 1000, .tv_nsec = 500000000 };
+
+	CHECK_EQ_INT(MAX_CLIENTS, 8);
+	CHECK_EQ_INT(CLIENT_IDLE_S, 60);
+
+	/* Client i last active 10 * i s ago. */
+	memset(cl, 0, sizeof(cl));
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		cl[i].fd = -1;
+		cl[i].id = 100 + (unsigned long)i;
+		cl[i].last_active = now;
+		cl[i].last_active.tv_sec -= 10 * i;
+	}
+	g_suspend_owner = 0;
+	memset(&g_suspend_until, 0, sizeof(g_suspend_until));
+
+	/* Closed CLIENT_IDLE_S after the last activity, to the ms. */
+	CHECK_EQ_INT(client_idle_left(&cl[0], &now), 60000);
+	CHECK_EQ_INT(client_idle_left(&cl[5], &now), 10000);
+	CHECK_EQ_INT(client_idle_left(&cl[6], &now), 0);	/* due now */
+	CHECK_EQ_INT(client_idle_left(&cl[7], &now), -10000);
+	cl[0].last_active.tv_nsec = 0;
+	CHECK_EQ_INT(client_idle_left(&cl[0], &now), 59500);
+	cl[0].last_active.tv_nsec = now.tv_nsec;
+
+	/* A request in flight is the request deadline's business. */
+	cl[7].have = 1;
+	CHECK_EQ_INT(client_idle_left(&cl[7], &now), LONG_MAX);
+	cl[7].have = 0;
+
+	/* The longest idle client makes room, never one mid-request. */
+	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 7);
+	cl[7].have = 3;
+	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 6);
+	cl[7].have = 0;
+	/* Sub-second order counts. */
+	cl[3].last_active = cl[7].last_active;
+	cl[3].last_active.tv_nsec -= 1;
+	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 3);
+	cl[3].last_active = now;
+	cl[3].last_active.tv_sec -= 30;
+
+	/* The client holding a serial handover is kept until it ends, even
+	 * when idle past the timeout, and is never evicted. */
+	g_suspend_owner = cl[7].id;
+	g_suspend_until = now;
+	g_suspend_until.tv_sec += 30;
+	CHECK(client_holds_handover(&cl[7], &now));
+	CHECK(!client_holds_handover(&cl[6], &now));
+	CHECK_EQ_INT(client_idle_left(&cl[7], &now), 30000);
+	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 6);
+	/* Other clients' timers are unaffected. */
+	CHECK_EQ_INT(client_idle_left(&cl[6], &now), 0);
+	/* An owner active recently keeps the later of the two deadlines. */
+	g_suspend_owner = cl[1].id;
+	CHECK_EQ_INT(client_idle_left(&cl[1], &now), 50000);
+	/* Once the handover is over (expired, resumed, or never set), the
+	 * owner is an ordinary client again. */
+	g_suspend_owner = cl[7].id;
+	g_suspend_until = now;
+	g_suspend_until.tv_sec -= 1;
+	CHECK(!client_holds_handover(&cl[7], &now));
+	CHECK_EQ_INT(client_idle_left(&cl[7], &now), -10000);
+	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 7);
+	memset(&g_suspend_until, 0, sizeof(g_suspend_until));
+	CHECK(!client_holds_handover(&cl[7], &now));
+
+	/* Nobody to evict: everyone mid-request, or no clients at all. */
+	for (int i = 0; i < MAX_CLIENTS; i++)
+		cl[i].have = 1;
+	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), -1);
+	CHECK_EQ_INT(client_evict_pick(cl, 0, &now), -1);
+
+	/* client_remove() closes the fd and moves the last client in. */
+	int sp[2];
+	CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+	int n = 3;
+	cl[0].fd = sp[0];
+	cl[2].fd = -7;
+	client_remove(cl, &n, 0);
+	CHECK_EQ_INT(n, 2);
+	CHECK_EQ_INT(cl[0].fd, -7);
+	CHECK_EQ_INT(cl[2].fd, -1);
+	char c;
+	CHECK_EQ_INT(read(sp[1], &c, 1), 0);	/* peer sees EOF */
+	close(sp[1]);
+	g_suspend_owner = 0;
+}
+
+/* Activity and handover ownership as a real connection sets them. */
+static void test_client_activity(void)
+{
+	int sp[2], pp[2];
+	struct client c;
+	uint8_t resp[16];
+	struct timespec t0;
+
+	CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+	CHECK_EQ_INT(pipe(pp), 0);
+	fcntl(sp[0], F_SETFL, O_NONBLOCK);
+	unsigned long seq = g_client_seq;
+	client_init(&c, sp[0]);
+	CHECK(c.id == seq + 1 && c.id != 0);
+	CHECK_EQ_INT(c.uid, getuid());	/* SO_PEERCRED: ourselves */
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	CHECK(client_idle_left(&c, &t0) > CLIENT_IDLE_S * 1000L - 1000);
+
+	/* A partial request is not activity; a complete one is. */
+	c.last_active.tv_sec -= 50;
+	CHECK_EQ_INT(write(sp[1], "\x01", 1), 1);
+	CHECK_EQ_INT(client_read(&c, -1), 0);
+	CHECK_EQ_INT(c.have, 1);
+	CHECK_EQ_INT(client_idle_left(&c, &t0), LONG_MAX);
+	CHECK_EQ_INT(write(sp[1], "\x00\x00", 2), 2);
+	CHECK_EQ_INT(client_read(&c, -1), 0);
+	CHECK_EQ_INT(c.have, 0);
+	CHECK_EQ_INT(read(sp[1], resp, sizeof(resp)), 3);
+	CHECK_EQ_INT(resp[0], RESP_NOT_CONNECTED);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	CHECK(client_idle_left(&c, &t0) > CLIENT_IDLE_S * 1000L - 1000);
+
+	/* SUSPEND_SERIAL records the requesting connection; RESUME and a
+	 * denied request from another peer behave as expected. */
+	memset(&g_suspend_until, 0, sizeof(g_suspend_until));
+	g_suspend_owner = 0;
+	c.privileged = 1;
+	memcpy(c.req, "\x09\x02\x00\x05\x00", 5);	/* 5 s */
+	handle_client_request(&c, pp[1]);
+	CHECK_EQ_INT(read(sp[1], resp, sizeof(resp)), 3);
+	CHECK_EQ_INT(resp[0], RESP_OK);
+	CHECK(g_suspend_owner == c.id);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	CHECK(client_holds_handover(&c, &t0));
+	c.last_active.tv_sec -= 3600;		/* long idle, still kept */
+	long left = client_idle_left(&c, &t0);
+	CHECK(left > 4000 && left <= 5000);
+
+	struct client other = c;
+	other.id = c.id + 1000;
+	other.privileged = 0;
+	memcpy(other.req, "\x0a\x00\x00", 3);	/* RESUME, denied */
+	handle_client_request(&other, pp[1]);
+	CHECK_EQ_INT(read(sp[1], resp, sizeof(resp)), 3);
+	CHECK_EQ_INT(resp[0], RESP_DENIED);
+	CHECK(g_suspend_owner == c.id);
+
+	memcpy(c.req, "\x0a\x00\x00", 3);	/* RESUME */
+	handle_client_request(&c, pp[1]);
+	CHECK_EQ_INT(read(sp[1], resp, sizeof(resp)), 3);
+	CHECK_EQ_INT(resp[0], RESP_OK);
+	CHECK(g_suspend_owner == 0);
+	CHECK(!client_holds_handover(&c, &t0));
+	CHECK(client_idle_left(&c, &t0) < 0);
+
+	close(sp[0]);
+	close(sp[1]);
+	close(pp[0]);
+	close(pp[1]);
+	memset(&g_suspend_until, 0, sizeof(g_suspend_until));
+}
+
 /* ---- http_header ---- */
 
 static void test_http_header(void)
@@ -1244,6 +1410,8 @@ int main(void)
 	test_json_hostile();
 	test_http_header();
 	test_post_command();
+	test_client_idle();
+	test_client_activity();
 	test_hmac();
 	test_frame();
 	test_write_hwmon();

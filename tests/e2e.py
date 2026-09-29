@@ -56,6 +56,8 @@ WCMD_SUSPEND_SERIAL = 0x09
 WCMD_RESUME_SERIAL = 0x0A
 RESP_OK, RESP_NOT_CONNECTED, RESP_DENIED = 0, 2, 3
 SECRET = "e2e-secret"   # POST /command on the loopback listener
+IDLE_S = 2              # CLIENT_IDLE_S of the test build (60 in production)
+MAX_CLIENTS = 8
 
 FW_VERSION = 7
 BUILD = b"FAKE build 1.0"
@@ -117,6 +119,7 @@ def build(tmp, group, programs=("wireviewd", "wireviewctl")):
         f'-DLOG_DIR="{tmp}/log"',
         f'-DCONFIG_PATH="{tmp}/config"',
         f'-DWIREVIEW_GROUP="{group}"',
+        f'-DCLIENT_IDLE_S={IDLE_S}',
     ]
     flags = ["-g", "-O1", "-Wall", "-Wextra", "-Wno-format-truncation"] + san
     for out, srcs in (("wireviewd", ["wireviewd.c", "sha256.c"]),
@@ -155,6 +158,17 @@ class Client:
                 raise EOFError("short response")
             data += c
         return status, data
+
+    def closed_by_daemon(self, timeout=0.0):
+        """True once the daemon has closed this connection (EOF or a
+        reset), waiting up to timeout seconds for it."""
+        r, _, _ = select.select([self.s], [], [], timeout)
+        if not r:
+            return False
+        try:
+            return self.s.recv(1) == b""
+        except OSError:
+            return True
 
     def close(self):
         self.s.close()
@@ -363,6 +377,8 @@ def run(tmp):
         exercise_config(tmp, dev, sock, port)
         exercise_http(tmp, dev, daemon, port)
         exercise_ctl_json(tmp, port)
+        exercise_idle(tmp, dev, sock)
+        exercise_client_limit(tmp, sock)
         unplug_at = exercise_unplug(tmp, dev, daemon, hwmon, sock, port)
     finally:
         stop_daemon(daemon, "daemon")
@@ -790,6 +806,119 @@ def exercise_ctl_json(tmp, port):
           r.stdout + r.stderr)
 
 
+def exercise_idle(tmp, dev, sock):
+    """Idle clients are closed after IDLE_S; a busy client is not, nor is
+    the one holding a serial handover until the handover ends. All three
+    run side by side on one clock."""
+    idle, busy, owner = Client(sock), Client(sock), Client(sock)
+    try:
+        s_idle, _ = idle.request(WCMD_GET_DEVICE_INFO)
+        s_owner, _ = owner.request(WCMD_SUSPEND_SERIAL, struct.pack("<H", 3))
+        t0 = time.monotonic()
+        polls = dev.polls
+        check(s_idle == RESP_OK and s_owner == RESP_OK,
+              "idle test: clients connected, the owner holds a 3 s handover",
+              f"{s_idle} {s_owner}")
+        busy_status, closed_at, next_busy = [], {}, 0.0
+        polls_during = None     # sensor polls 0.5 s past the idle timeout
+        while time.monotonic() - t0 < IDLE_S + 3:
+            now = time.monotonic() - t0
+            if polls_during is None and now >= IDLE_S + 0.5:
+                polls_during = dev.polls - polls
+            if now >= next_busy:
+                try:
+                    busy_status.append(busy.request(WCMD_GET_DEVICE_INFO)[0])
+                except (OSError, EOFError) as e:
+                    busy_status.append(repr(e))
+                next_busy = now + IDLE_S / 4
+            for name, c in (("idle", idle), ("owner", owner)):
+                if name not in closed_at and c.closed_by_daemon():
+                    closed_at[name] = time.monotonic() - t0
+            if len(closed_at) == 2 and now > IDLE_S + 0.5:
+                break
+            time.sleep(0.05)
+        t = closed_at.get("idle")
+        check(t is not None and IDLE_S - 0.3 <= t <= IDLE_S + 1.0,
+              f"an idle client is closed after {IDLE_S} s", f"closed at {t}")
+        check(busy_status and all(s == RESP_OK for s in busy_status) and
+              not busy.closed_by_daemon(),
+              "a client sending a request every IDLE_S/4 stays connected",
+              str(busy_status))
+        t = closed_at.get("owner")
+        check(t is not None and 3.0 - 0.3 <= t <= 3.0 + 1.0,
+              "the handover owner is kept past the idle timeout, then "
+              "closed when its 3 s handover ends", f"closed at {t}")
+        check(polls_during is not None and polls_during <= 1 and
+              dev.wait_for(lambda: dev.polls >= polls + polls_during + 3),
+              "polling pauses for the handover and resumes after it",
+              f"{polls_during} polls during")
+        uid = os.getuid()
+        n = len(re.findall(rf"\[INFO\] socket client uid {uid}: idle for "
+                           r"\d+ s, disconnecting$", audit_log(tmp), re.M))
+        check(n == 2, "each idle close is audited with the uid",
+              f"{n} lines")
+        status, _ = busy.request(WCMD_SCREEN_CMD, b"\xe1")
+        check(status == RESP_OK and
+              dev.wait_for(lambda: b"\xe1" in dev.writes_of(
+                  fd.CMD_SCREEN_CHANGE)),
+              "the busy client still reaches the device afterwards",
+              str(status))
+    finally:
+        for c in (idle, busy, owner):
+            c.close()
+
+
+def exercise_client_limit(tmp, sock):
+    """MAX_CLIENTS connections are served at once; one more replaces the
+    client idle longest, and the socket keeps serving."""
+    clients = []
+    try:
+        statuses = []
+        for _ in range(MAX_CLIENTS):
+            c = Client(sock)
+            clients.append(c)
+            statuses.append(c.request(WCMD_GET_DEVICE_INFO)[0])
+        check(statuses == [RESP_OK] * MAX_CLIENTS,
+              f"{MAX_CLIENTS} clients connected at once are all served "
+              "(the 5th to 8th were refused before)", str(statuses))
+        # clients[0] is the oldest connection but the most recently
+        # active, so the longest idle one is clients[1].
+        clients[0].request(WCMD_GET_DEVICE_INFO)
+        before = audit_log(tmp).count("disconnecting to make room")
+        ninth = Client(sock)
+        clients.append(ninth)
+        status, _ = ninth.request(WCMD_GET_DEVICE_INFO)
+        check(status == RESP_OK, f"connection {MAX_CLIENTS + 1} is served",
+              str(status))
+        check(clients[1].closed_by_daemon(1.0),
+              "it replaced the client idle longest")
+        others = []
+        for i, c in enumerate(clients):
+            if i == 1:
+                continue
+            try:
+                others.append(c.request(WCMD_GET_DEVICE_INFO)[0])
+            except (OSError, EOFError) as e:
+                others.append(repr(e))
+        check(others == [RESP_OK] * MAX_CLIENTS,
+              "every other client is still connected and served",
+              str(others))
+        check(wait_until(lambda: audit_log(tmp).count(
+                  "disconnecting to make room") == before + 1, 2) and
+              re.search(rf"\[INFO\] socket client uid {os.getuid()}: idle "
+                        r"for \d+ s, disconnecting to make room",
+                        audit_log(tmp)),
+              "the eviction is audited with the uid")
+    finally:
+        for c in clients:
+            c.close()
+    status, _ = request(sock, WCMD_GET_DEVICE_INFO)
+    r = ctl(tmp, "info")
+    check(status == RESP_OK and r.returncode == 0,
+          "the socket keeps serving new connections afterwards",
+          f"{status} {r.stderr}")
+
+
 def exercise_unplug(tmp, dev, daemon, hwmon, sock, port):
     """The command socket and its clients outlive a device disappearance.
     Returns the number of frames written before the device went away."""
@@ -800,6 +929,13 @@ def exercise_unplug(tmp, dev, daemon, hwmon, sock, port):
             "read failed, reconnecting")
 
     client = Client(sock)
+
+    def keepalive():
+        """A request now and then, as the GUI's own traffic would be:
+        the test build closes a client idle for IDLE_S."""
+        client.request(WCMD_GET_DEVICE_INFO)
+        return True
+
     try:
         status, _ = client.request(WCMD_GET_DEVICE_INFO)
         check(status == RESP_OK, "long-lived client: RESP_OK before unplug",
@@ -807,7 +943,7 @@ def exercise_unplug(tmp, dev, daemon, hwmon, sock, port):
 
         before = failures()
         dev.unplug()
-        check(wait_until(lambda: failures() > before, 5),
+        check(wait_until(lambda: keepalive() and failures() > before, 5),
               "the daemon notices the device is gone")
 
         status, _ = client.request(WCMD_GET_DEVICE_INFO)
@@ -830,11 +966,13 @@ def exercise_unplug(tmp, dev, daemon, hwmon, sock, port):
         _, _, body = http_get(port, "/sensors")
         check(json.loads(body)["devices"] == [],
               "/sensors lists no device while it is gone", body)
+        keepalive()
         time.sleep(0.2)     # let the sink drain the last frame
         size = hwmon.size()
         time.sleep(0.3)
         check(hwmon.size() == size,
               "no frames reach hwmon while the device is gone")
+        keepalive()
 
         polls = dev.polls
         dev.replug()

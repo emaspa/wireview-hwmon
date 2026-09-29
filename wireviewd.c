@@ -27,6 +27,7 @@
 #include <termios.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <limits.h>
 #include <time.h>
 #include <poll.h>
 #include <sys/stat.h>
@@ -74,12 +75,22 @@
 #define WIREVIEW_MAGIC   0x57565032
 #define WIREVIEW_VERSION 3
 
-#define MAX_CLIENTS 4
+/* Command-socket clients connected at once. When the table is full, a new
+ * connection evicts the client that has been idle longest. */
+#define MAX_CLIENTS 8
 
 /* A socket request (3-byte header + payload) must arrive in full within
  * this many ms of its first byte, or the client is disconnected. */
 #define CLIENT_REQ_TIMEOUT_MS 2000
 #define CLIENT_MAX_PAYLOAD    512
+
+/* A client that has sent no complete request for this long since it
+ * connected or since its last request is disconnected, so abandoned
+ * connections cannot hold slots forever. The GUI reconnects and retries
+ * when it finds its connection closed. Overridable (-D) for tests. */
+#ifndef CLIENT_IDLE_S
+#define CLIENT_IDLE_S 60
+#endif
 
 /* Firmware command bytes */
 #define CMD_READ_VENDOR_DATA   0x01
@@ -210,6 +221,7 @@ static int g_hwmon_v2;
 static char g_secret[128];      /* shared HMAC secret; empty => writes disabled */
 static int  g_serial_fd = -1;   /* current serial fd, for HTTP command relay */
 static struct timespec g_suspend_until; /* CLOCK_MONOTONIC deadline; 0 = active */
+static unsigned long g_suspend_owner;   /* client id that asked for it; 0 = none */
 
 static void wlog(const char *level, const char *fmt, ...);
 
@@ -659,10 +671,14 @@ struct client {
 	int   fd;
 	int   privileged;
 	uid_t uid;
+	unsigned long id;		/* unique per connection, never 0 */
+	struct timespec last_active;	/* accept, then each complete request */
 	size_t have;			/* bytes of the current request in req[] */
 	struct timespec req_deadline;	/* valid while have > 0 */
 	uint8_t req[3 + CLIENT_MAX_PAYLOAD];
 };
+
+static unsigned long g_client_seq;	/* last client id handed out */
 
 static gid_t g_wireview_gid;
 static int   g_have_wireview_gid;	/* 0 => group missing, only root is privileged */
@@ -738,6 +754,10 @@ static void client_init(struct client *c, int fd)
 	c->fd = fd;
 	c->privileged = 0;
 	c->uid = (uid_t)-1;
+	c->id = ++g_client_seq;
+	if (c->id == 0)
+		c->id = ++g_client_seq;
+	clock_gettime(CLOCK_MONOTONIC, &c->last_active);
 	c->have = 0;
 	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 &&
 	    len == sizeof(cred)) {
@@ -811,6 +831,9 @@ static void handle_client_request(const struct client *c, int serial_fd)
 		if (secs > 300) secs = 300;
 		clock_gettime(CLOCK_MONOTONIC, &g_suspend_until);
 		g_suspend_until.tv_sec += secs;
+		/* This connection is not idle-closed until the handover
+		 * ends (see client_idle_left()). */
+		g_suspend_owner = c->id;
 		wlog("INFO", "serial suspended for %d s (GUI direct access)", secs);
 		send_response(client_fd, RESP_OK, NULL, 0);
 		return;
@@ -818,6 +841,7 @@ static void handle_client_request(const struct client *c, int serial_fd)
 	if (cmd_type == WCMD_RESUME_SERIAL) {
 		g_suspend_until.tv_sec = 0;
 		g_suspend_until.tv_nsec = 0;
+		g_suspend_owner = 0;
 		tcflush(serial_fd, TCIFLUSH);
 		wlog("INFO", "serial resumed");
 		send_response(client_fd, RESP_OK, NULL, 0);
@@ -1021,7 +1045,73 @@ static int client_read(struct client *c, int serial_fd)
 
 	handle_client_request(c, serial_fd);
 	c->have = 0;
+	clock_gettime(CLOCK_MONOTONIC, &c->last_active);
 	return 0;
+}
+
+/* a - b in milliseconds. */
+static long ts_diff_ms(const struct timespec *a, const struct timespec *b)
+{
+	return (a->tv_sec - b->tv_sec) * 1000L +
+	       (a->tv_nsec - b->tv_nsec) / 1000000L;
+}
+
+/* Is client c the one holding an unexpired serial handover at now? */
+static int client_holds_handover(const struct client *c,
+				 const struct timespec *now)
+{
+	return c->id == g_suspend_owner && g_suspend_until.tv_sec != 0 &&
+	       ts_diff_ms(&g_suspend_until, now) > 0;
+}
+
+/* Milliseconds from now until client c is closed as idle (<= 0: due).
+ * LONG_MAX while a request is in flight: CLIENT_REQ_TIMEOUT_MS governs
+ * it then, and the idle clock restarts once the request completes. The
+ * client that requested a serial handover is kept at least until the
+ * handover ends: the GUI re-arms it only every 60 s, as long as
+ * CLIENT_IDLE_S itself. */
+static long client_idle_left(const struct client *c, const struct timespec *now)
+{
+	if (c->have > 0)
+		return LONG_MAX;
+
+	long left = CLIENT_IDLE_S * 1000L - ts_diff_ms(now, &c->last_active);
+
+	if (client_holds_handover(c, now)) {
+		long hold = ts_diff_ms(&g_suspend_until, now);
+
+		if (hold > left)
+			left = hold;
+	}
+	return left;
+}
+
+/* The client a new connection replaces when all MAX_CLIENTS slots are
+ * taken: the one idle longest, leaving out a client with a request in
+ * flight and the one holding the serial handover. -1 if none qualifies. */
+static int client_evict_pick(const struct client *cl, int n,
+			     const struct timespec *now)
+{
+	int pick = -1;
+
+	for (int i = 0; i < n; i++) {
+		if (cl[i].have > 0 || client_holds_handover(&cl[i], now))
+			continue;
+		if (pick < 0 ||
+		    cl[i].last_active.tv_sec < cl[pick].last_active.tv_sec ||
+		    (cl[i].last_active.tv_sec == cl[pick].last_active.tv_sec &&
+		     cl[i].last_active.tv_nsec < cl[pick].last_active.tv_nsec))
+			pick = i;
+	}
+	return pick;
+}
+
+/* Close client i and move the last client into its slot. */
+static void client_remove(struct client *cl, int *n, int i)
+{
+	close(cl[i].fd);
+	cl[i] = cl[--*n];
+	cl[*n].fd = -1;
 }
 
 /* ---- HTTP /sensors publisher (read-only LAN exposure) ---- */
@@ -2348,13 +2438,16 @@ int main(int argc, char **argv)
 		 * attempt while the device is absent ... */
 		long wait_ms = ms_until(serial_fd >= 0 ? &next_poll
 						       : &next_reconnect);
-		/* ... or until the earliest partial request expires */
+		/* ... or until the earliest partial request expires, or
+		 * the earliest idle client is due to be closed */
+		struct timespec tnow;
+		clock_gettime(CLOCK_MONOTONIC, &tnow);
 		for (int i = 0; i < num_clients; i++) {
-			if (clients[i].have > 0) {
-				long left = ms_until(&clients[i].req_deadline);
-				if (left < wait_ms)
-					wait_ms = left;
-			}
+			long left = clients[i].have > 0 ?
+				    ms_until(&clients[i].req_deadline) :
+				    client_idle_left(&clients[i], &tnow);
+			if (left < wait_ms)
+				wait_ms = left;
 		}
 		if (wait_ms < 0) wait_ms = 0;
 
@@ -2370,10 +2463,70 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		/* Accept new clients */
+		/* Serve an HTTP /sensors request */
+		if (http_pfd_idx >= 0 &&
+		    (pfds[http_pfd_idx].revents & POLLIN))
+			http_handle(http_fd);
+
+		/* Handle client requests (serial_fd is -1 while the device
+		 * is absent, and requests get RESP_NOT_CONNECTED). Walk
+		 * backwards: removing client i swaps the last client into
+		 * slot i, and that one has already been handled, so slot i
+		 * is never re-read against the removed client's revents.
+		 * New clients are accepted only after this loop. */
+		for (int i = num_clients - 1; i >= 0; i--) {
+			int idx = client_pfd_start + i;
+			if (idx >= nfds || !pfds[idx].revents)
+				continue;
+			int drop = 0;
+			if (pfds[idx].revents & POLLIN)
+				drop = client_read(&clients[i],
+						   serial_fd) < 0;
+			if (drop || (pfds[idx].revents &
+				     (POLLHUP | POLLERR)))
+				client_remove(clients, &num_clients, i);
+		}
+
+		/* Drop clients sitting on an incomplete request, and close
+		 * the ones idle for CLIENT_IDLE_S */
+		clock_gettime(CLOCK_MONOTONIC, &tnow);
+		for (int i = 0; i < num_clients; ) {
+			if (clients[i].have > 0 &&
+			    ms_until(&clients[i].req_deadline) <= 0) {
+				wlog("WARN", "socket client uid %ld: request incomplete after %d ms (%zu bytes), disconnecting",
+				     client_uid(&clients[i]),
+				     CLIENT_REQ_TIMEOUT_MS,
+				     clients[i].have);
+				client_remove(clients, &num_clients, i);
+				continue;
+			}
+			if (client_idle_left(&clients[i], &tnow) <= 0) {
+				wlog("INFO", "socket client uid %ld: idle for %ld s, disconnecting",
+				     client_uid(&clients[i]),
+				     ts_diff_ms(&tnow, &clients[i].last_active) / 1000);
+				client_remove(clients, &num_clients, i);
+				continue;
+			}
+			i++;
+		}
+
+		/* Accept a new client. With every slot taken, it replaces
+		 * the client idle longest; it is refused (status 1) only
+		 * if every client is mid-request or holds the handover. */
 		if (sock_pfd_idx >= 0 && (pfds[sock_pfd_idx].revents & POLLIN)) {
 			int new_fd = accept4(sock_fd, NULL, NULL,
 					     SOCK_NONBLOCK | SOCK_CLOEXEC);
+			if (new_fd >= 0 && num_clients == MAX_CLIENTS) {
+				int v = client_evict_pick(clients, num_clients,
+							  &tnow);
+				if (v >= 0) {
+					wlog("INFO", "socket client uid %ld: idle for %ld s, disconnecting to make room (%d clients)",
+					     client_uid(&clients[v]),
+					     ts_diff_ms(&tnow, &clients[v].last_active) / 1000,
+					     MAX_CLIENTS);
+					client_remove(clients, &num_clients, v);
+				}
+			}
 			if (new_fd >= 0) {
 				if (num_clients < MAX_CLIENTS) {
 					client_init(&clients[num_clients++],
@@ -2384,49 +2537,6 @@ int main(int argc, char **argv)
 					close(new_fd);
 				}
 			}
-		}
-
-		/* Serve an HTTP /sensors request */
-		if (http_pfd_idx >= 0 &&
-		    (pfds[http_pfd_idx].revents & POLLIN))
-			http_handle(http_fd);
-
-		/* Handle client requests (serial_fd is -1 while the device
-		 * is absent, and requests get RESP_NOT_CONNECTED). Walk
-		 * backwards: removing client i swaps the last client into
-		 * slot i, and that one has already been handled (or was
-		 * accepted this round and has no pfd), so slot i is never
-		 * re-read against the removed client's revents. */
-		for (int i = num_clients - 1; i >= 0; i--) {
-			int idx = client_pfd_start + i;
-			if (idx >= nfds || !pfds[idx].revents)
-				continue;
-			int drop = 0;
-			if (pfds[idx].revents & POLLIN)
-				drop = client_read(&clients[i],
-						   serial_fd) < 0;
-			if (drop || (pfds[idx].revents &
-				     (POLLHUP | POLLERR))) {
-				close(clients[i].fd);
-				clients[i] = clients[--num_clients];
-				clients[num_clients].fd = -1;
-			}
-		}
-
-		/* Drop clients sitting on an incomplete request */
-		for (int i = 0; i < num_clients; ) {
-			if (clients[i].have > 0 &&
-			    ms_until(&clients[i].req_deadline) <= 0) {
-				wlog("WARN", "socket client uid %ld: request incomplete after %d ms (%zu bytes), disconnecting",
-				     client_uid(&clients[i]),
-				     CLIENT_REQ_TIMEOUT_MS,
-				     clients[i].have);
-				close(clients[i].fd);
-				clients[i] = clients[--num_clients];
-				clients[num_clients].fd = -1;
-				continue;
-			}
-			i++;
 		}
 
 		if (serial_fd < 0)
@@ -2540,6 +2650,7 @@ disconnect:
 		 * let it hold off polling on the next one. */
 		g_suspend_until.tv_sec = 0;
 		g_suspend_until.tv_nsec = 0;
+		g_suspend_owner = 0;
 		deadline_in(&next_reconnect, 2000);
 	}
 

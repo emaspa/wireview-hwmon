@@ -548,8 +548,21 @@ The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, res
 The socket exists for the daemon's whole life, device or not. Clients stay
 connected across an unplug and replug; while no device is present every
 command gets status 2 (a privileged command from an unprivileged peer still
-gets 3), and the same connection works again once the device is back. Up to 4
-clients can be connected at once; a fifth gets status 1 and is closed.
+gets 3), and the same connection works again once the device is back.
+
+Up to 8 clients can be connected at once. A client that sends no request for
+60 seconds (counted from the connection, then from its last complete request)
+is disconnected, and when all 8 slots are taken a new connection replaces the
+client that has been idle longest. A client should therefore expect the daemon
+to close a connection it left idle, and reconnect and retry when that happens:
+the GUI does this from wireview-linux 1.2.5.0. A request in progress is not
+idle, but it must arrive in full within 2 seconds of its first byte or the
+client is disconnected. The client that requested a SUSPEND_SERIAL handover is
+neither closed as idle nor replaced until the handover ends, since the GUI
+renews it only once a minute. A new connection is refused (status 1, then
+closed) only while every connected client is mid-request or holds the
+handover. Idle disconnects and replacements are logged in the
+[audit log](#audit-log) with the client's uid.
 
 ## Notes
 
