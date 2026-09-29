@@ -138,10 +138,16 @@ void hex_encode(const uint8_t *in, size_t len, char *out)
 	out[len * 2] = '\0';
 }
 
+/* The loop runs over the shorter string, so the time depends on the lengths
+ * (public: a signature is always 64 hex digits) but not on the content. Every
+ * byte of the length difference is folded in: squeezing it into one byte let
+ * lengths 256 apart compare equal when one string is a prefix of the other. */
 int ct_str_equal(const char *a, const char *b)
 {
-	size_t la = strlen(a), lb = strlen(b);
-	unsigned char diff = (unsigned char)(la ^ lb);
+	size_t la = strlen(a), lb = strlen(b), dl = la ^ lb;
+	unsigned char diff = 0;
+	for (size_t i = 0; i < sizeof(dl); ++i)
+		diff |= (unsigned char)(dl >> (8 * i));
 	size_t n = la < lb ? la : lb;
 	for (size_t i = 0; i < n; ++i)
 		diff |= (unsigned char)(a[i] ^ b[i]);

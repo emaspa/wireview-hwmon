@@ -245,6 +245,46 @@ static void test_load_firmware_errors(void)
 	if (len >= 0) { free(img); img = NULL; }
 }
 
+/* sha256.c's constant-time compare (the daemon checks X-Auth-Sig with it). */
+static void test_ct_str_equal(void)
+{
+	static char a[1024], b[1024];
+
+	CHECK(ct_str_equal("", ""));
+	CHECK(ct_str_equal("abc", "abc"));
+	CHECK(!ct_str_equal("abc", "abd"));
+	CHECK(!ct_str_equal("abc", "xbc"));
+	CHECK(!ct_str_equal("DEADBEEF", "deadbeef"));
+
+	/* Equal 64-digit signatures, and one digit off at each end. */
+	memset(a, 'f', 64);
+	a[64] = '\0';
+	memcpy(b, a, 65);
+	CHECK(ct_str_equal(a, b));
+	b[0] = 'e';
+	CHECK(!ct_str_equal(a, b));
+	b[0] = 'f';
+	b[63] = 'e';
+	CHECK(!ct_str_equal(a, b));
+
+	/* One string a prefix of the other, lengths 1, 255, 256 and 512
+	 * apart (256 and 512 used to wrap the one-byte length check to 0). */
+	static const size_t base[] = { 0, 1, 64 };
+	static const size_t delta[] = { 1, 255, 256, 512 };
+	for (size_t i = 0; i < sizeof(base) / sizeof(base[0]); i++) {
+		for (size_t j = 0; j < sizeof(delta) / sizeof(delta[0]); j++) {
+			size_t la = base[i], lb = base[i] + delta[j];
+			memset(a, 'a', la);
+			a[la] = '\0';
+			memset(b, 'a', lb);
+			b[lb] = '\0';
+			CHECK(!ct_str_equal(a, b));
+			CHECK(!ct_str_equal(b, a));
+			CHECK(ct_str_equal(b, b));
+		}
+	}
+}
+
 static void test_parse_fault_mask(void)
 {
 	uint16_t m;
@@ -788,6 +828,7 @@ int main(void)
 	test_load_firmware_handwritten();
 	test_load_firmware_buildstruct();
 	test_load_firmware_errors();
+	test_ct_str_equal();
 	test_parse_fault_mask();
 	test_parse_remote();
 	test_read_local();
