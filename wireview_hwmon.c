@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/hwmon.h>
+#include <linux/hwmon-sysfs.h>
 #include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
@@ -53,6 +54,21 @@ struct wireview_priv {
 };
 
 static struct wireview_priv *wireview_global;
+
+/*
+ * True if a frame has arrived and is recent enough to report, so readers
+ * stop serving the last frame once the daemon/device goes away.
+ * Caller holds priv->lock.
+ */
+static bool wireview_data_fresh(struct wireview_priv *priv)
+{
+	lockdep_assert_held(&priv->lock);
+
+	if (!priv->data_valid)
+		return false;
+
+	return ktime_ms_delta(ktime_get(), priv->last_update) <= WIREVIEW_STALE_MS;
+}
 
 /* ---- misc device: /dev/wireview-hwmon ---- */
 
@@ -133,52 +149,35 @@ static ssize_t intrusion1_label_show(struct device *dev,
 	return sysfs_emit(buf, "Fault Log\n");
 }
 
-static ssize_t fault_status_raw_show(struct device *dev,
-				     struct device_attribute *attr, char *buf)
+enum wireview_raw_attr {
+	WIREVIEW_RAW_FAULT_STATUS,
+	WIREVIEW_RAW_FAULT_LOG,
+	WIREVIEW_RAW_PSU_CAP,
+};
+
+static ssize_t wireview_raw_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
 {
 	struct wireview_priv *priv = dev_get_drvdata(dev);
-	u16 val;
+	unsigned int val;
 
 	mutex_lock(&priv->lock);
-	if (!priv->data_valid) {
+	if (!wireview_data_fresh(priv)) {
 		mutex_unlock(&priv->lock);
 		return -ENODATA;
 	}
-	val = priv->data.fault_status;
-	mutex_unlock(&priv->lock);
 
-	return sysfs_emit(buf, "%u\n", val);
-}
-
-static ssize_t fault_log_raw_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
-{
-	struct wireview_priv *priv = dev_get_drvdata(dev);
-	u16 val;
-
-	mutex_lock(&priv->lock);
-	if (!priv->data_valid) {
-		mutex_unlock(&priv->lock);
-		return -ENODATA;
+	switch (to_sensor_dev_attr(attr)->index) {
+	case WIREVIEW_RAW_FAULT_STATUS:
+		val = priv->data.fault_status;
+		break;
+	case WIREVIEW_RAW_FAULT_LOG:
+		val = priv->data.fault_log;
+		break;
+	default: /* WIREVIEW_RAW_PSU_CAP */
+		val = priv->data.psu_cap;
+		break;
 	}
-	val = priv->data.fault_log;
-	mutex_unlock(&priv->lock);
-
-	return sysfs_emit(buf, "%u\n", val);
-}
-
-static ssize_t psu_cap_show(struct device *dev,
-			    struct device_attribute *attr, char *buf)
-{
-	struct wireview_priv *priv = dev_get_drvdata(dev);
-	u8 val;
-
-	mutex_lock(&priv->lock);
-	if (!priv->data_valid) {
-		mutex_unlock(&priv->lock);
-		return -ENODATA;
-	}
-	val = priv->data.psu_cap;
 	mutex_unlock(&priv->lock);
 
 	return sysfs_emit(buf, "%u\n", val);
@@ -186,16 +185,17 @@ static ssize_t psu_cap_show(struct device *dev,
 
 static DEVICE_ATTR_RO(intrusion0_label);
 static DEVICE_ATTR_RO(intrusion1_label);
-static DEVICE_ATTR_RO(fault_status_raw);
-static DEVICE_ATTR_RO(fault_log_raw);
-static DEVICE_ATTR_RO(psu_cap);
+static SENSOR_DEVICE_ATTR_RO(fault_status_raw, wireview_raw,
+			     WIREVIEW_RAW_FAULT_STATUS);
+static SENSOR_DEVICE_ATTR_RO(fault_log_raw, wireview_raw, WIREVIEW_RAW_FAULT_LOG);
+static SENSOR_DEVICE_ATTR_RO(psu_cap, wireview_raw, WIREVIEW_RAW_PSU_CAP);
 
 static struct attribute *wireview_extra_attrs[] = {
 	&dev_attr_intrusion0_label.attr,
 	&dev_attr_intrusion1_label.attr,
-	&dev_attr_fault_status_raw.attr,
-	&dev_attr_fault_log_raw.attr,
-	&dev_attr_psu_cap.attr,
+	&sensor_dev_attr_fault_status_raw.dev_attr.attr,
+	&sensor_dev_attr_fault_log_raw.dev_attr.attr,
+	&sensor_dev_attr_psu_cap.dev_attr.attr,
 	NULL
 };
 
@@ -249,17 +249,10 @@ static int wireview_read(struct device *dev, enum hwmon_sensor_types type,
 			 u32 attr, int channel, long *val)
 {
 	struct wireview_priv *priv = dev_get_drvdata(dev);
-	ktime_t age;
 
 	mutex_lock(&priv->lock);
 
-	if (!priv->data_valid) {
-		mutex_unlock(&priv->lock);
-		return -ENODATA;
-	}
-
-	age = ktime_sub(ktime_get(), priv->last_update);
-	if (ktime_to_ms(age) > WIREVIEW_STALE_MS) {
+	if (!wireview_data_fresh(priv)) {
 		mutex_unlock(&priv->lock);
 		return -ENODATA;
 	}
