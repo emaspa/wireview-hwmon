@@ -1277,6 +1277,7 @@ static int relay_nvm(uint8_t cmd)
 	tcflush(g_serial_fd, TCIFLUSH);
 	return write(g_serial_fd, c, 6) == 6;
 }
+/* status/log are keep-masks: the firmware does fault &= mask. */
 static int relay_clear_faults(uint16_t status, uint16_t log)
 {
 	if (serial_suspended())
@@ -1435,7 +1436,9 @@ static void handle_post_command(int cfd, const char *req, const char *body,
 	} else if (strcmp(op, "nvm") == 0) {
 		ok = json_int(body, "cmd", &c) ? relay_nvm((uint8_t)c) : 0;
 	} else if (strcmp(op, "clearFaults") == 0) {
-		long s = 0xFFFF, l = 0xFFFF;
+		/* Keep-masks, as the firmware and the GUI use them: fault &= mask,
+		 * so 0 clears everything and ~(1 << bit) clears one fault. */
+		long s = 0, l = 0;
 		json_int(body, "statusMask", &s);
 		json_int(body, "logMask", &l);
 		ok = relay_clear_faults((uint16_t)s, (uint16_t)l);

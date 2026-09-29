@@ -302,6 +302,8 @@ log (masks `FFFF FFFF`). `STATUS_MASK` and `LOG_MASK` are 16-bit hex bitmasks,
 with or without `0x`: a set bit clears that fault, and a missing mask defaults
 to `FFFF`. So `wireviewctl clear-faults 0 FFFF` clears only the log, and
 `wireviewctl clear-faults 0x0004` clears status bit 2 plus the whole log.
+(On the wire the firmware takes the inverse, a keep-mask; `wireviewctl` does
+the inversion, the raw socket and HTTP `clearFaults` do not.)
 
 ### Permissions: the `wireview` group
 
@@ -386,7 +388,7 @@ The daemon listens on a Unix socket at `/run/wireviewd.sock` that any local user
 | Command | Description |
 |---------|-------------|
 | GET_DEVICE_INFO | Query firmware version, config version, UID, build string |
-| CLEAR_FAULTS | Clear fault status and/or fault log (payload: status mask, log mask; u16 LE each, set bit = clear) |
+| CLEAR_FAULTS | Clear fault status and/or fault log (payload: status keep-mask, log keep-mask; u16 LE each, `fault &= mask`, so 0 clears all and a set bit keeps that fault) |
 | READ_CONFIG | Read the device configuration |
 | WRITE_CONFIG * | Write a new device configuration |
 | SCREEN_CMD | Send a screen command (change display page) |

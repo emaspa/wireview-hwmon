@@ -223,8 +223,10 @@ static int parse_fault_mask(const char *s, uint16_t *out)
 }
 
 /*
- * Payload is status_mask (u16 LE) then log_mask (u16 LE). A set bit clears
- * that fault; the default 0xFFFF/0xFFFF clears everything.
+ * The arguments name the bits to CLEAR (default FFFF = everything). On the
+ * wire the firmware takes keep-masks: fault &= mask, so a set bit keeps a
+ * fault and 0 clears all (the GUI sends ~(1 << fault) to clear one fault).
+ * Payload is status_keep (u16 LE) then log_keep (u16 LE).
  */
 static int cmd_clear_faults(const char *status_arg, const char *log_arg)
 {
@@ -237,15 +239,17 @@ static int cmd_clear_faults(const char *status_arg, const char *log_arg)
 	if (log_arg && parse_fault_mask(log_arg, &log_mask) < 0)
 		return 1;
 
+	uint16_t status_keep = (uint16_t)~status_mask;
+	uint16_t log_keep = (uint16_t)~log_mask;
 	uint8_t payload[4] = {
-		status_mask & 0xFF, status_mask >> 8,
-		log_mask & 0xFF, log_mask >> 8,
+		status_keep & 0xFF, status_keep >> 8,
+		log_keep & 0xFF, log_keep >> 8,
 	};
 
 	if (sock_command(WCMD_CLEAR_FAULTS, payload, 4, &data, &len) < 0)
 		return 1;
 
-	printf("faults cleared (status mask 0x%04X, log mask 0x%04X)\n",
+	printf("faults cleared (status bits 0x%04X, log bits 0x%04X)\n",
 	       status_mask, log_mask);
 	free(data);
 	return 0;
