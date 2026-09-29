@@ -24,12 +24,16 @@ package_wireview-hwmon() {
   depends=('glibc')
   optdepends=('wireview-hwmon-dkms: kernel module exposing sensors via /sys/class/hwmon'
               'dfu-util: device firmware updates via "wireviewctl flash"')
+  backup=('etc/wireview/config')
   cd "$pkgbase-$pkgver"
   install -Dm755 wireviewd "$pkgdir/usr/bin/wireviewd"
   install -Dm755 wireviewctl "$pkgdir/usr/bin/wireviewctl"
   install -Dm644 debian/wireviewd.service "$pkgdir/usr/lib/systemd/system/wireviewd.service"
   install -Dm644 99-wireview-hwmon.rules "$pkgdir/usr/lib/udev/rules.d/99-wireview-hwmon.rules"
   install -Dm644 firmware/TG-WV-PRO2-FW.hex "$pkgdir/usr/share/wireview/TG-WV-PRO2-FW.hex"
+  # Reference daemon config; private because it may hold the HMAC secret.
+  install -dm700 "$pkgdir/etc/wireview"
+  install -m600 wireview-config.sample "$pkgdir/etc/wireview/config"
   # The kernel module is a self-registering platform driver with no modalias,
   # so nothing autoloads it. Load it when the daemon starts (a no-op if the
   # dkms package isn't installed). Guarded so it stays a no-op should a future

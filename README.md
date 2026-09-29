@@ -344,7 +344,8 @@ enable it.
 
 ### Enabling it
 
-Edit `/etc/wireview/config` (a documented reference is created on first install):
+Edit `/etc/wireview/config` (a documented reference with the defaults is installed by
+the deb, rpm and AUR packages and by `make install`; upgrades keep your edits):
 
 ```ini
 remote_enabled=1        # open the listener (default 0 = off)
@@ -354,6 +355,20 @@ log_days=14             # audit-log retention in days
 ```
 
 Then `sudo systemctl restart wireviewd`. Reads stay open; **writes require the secret**.
+
+### mDNS discovery (optional)
+
+`make install` also drops `avahi-wireview.service` into `/etc/avahi/services/`,
+so avahi-daemon advertises the listener as `_wireview._tcp` and the GUI app
+finds the host without typing an address. The packages don't ship it (the
+listener is off by default). If you installed a package and enabled the
+listener, copy it from the source tree:
+
+```bash
+sudo install -Dm644 avahi-wireview.service /etc/avahi/services/wireview.service
+```
+
+The file advertises port 9876; edit its `<port>` if you changed `port=`.
 
 ### Security model
 
@@ -408,8 +423,9 @@ state. A two-device view (one local, one remote) looks like:
 (An unreachable host shows a single red `offline` line instead of stalling the view.)
 
 Remote hosts can also be listed (one `host[:port]` per line) in
-`/etc/wireview/hosts`. The local device is read straight from hwmon sysfs;
-remotes via `GET /sensors`. Press **q** to quit.
+`/etc/wireview/hosts`, which you create yourself (nothing installs it). The
+local device is read straight from hwmon sysfs; remotes via `GET /sensors`.
+Press **q** to quit.
 
 ### Audit log
 
@@ -428,9 +444,10 @@ High-frequency `/sensors` polls are not logged.
 
 | File | Purpose |
 |------|---------|
-| `/etc/wireview/config` | Daemon settings: `remote_enabled`, `port`, `secret`, `log_days`. Mode `600`. Read at (re)start. A commented reference is installed if none exists. |
-| `/etc/wireview/hosts` | Optional remote-host list for `wireviewctl top` (one `host[:port]` per line). |
-| `/var/log/wireview/` | Daily-rotating audit logs (created automatically when the listener is on). |
+| `/etc/wireview/config` | Daemon settings: `remote_enabled`, `port`, `secret`, `log_days`. Mode `600`. Read at (re)start. A commented reference is installed by the packages and `make install`. |
+| `/etc/wireview/hosts` | Optional remote-host list for `wireviewctl top` (one `host[:port]` per line). Not installed; create it yourself if you want one. |
+| `/var/log/wireview/` | Daily-rotating audit logs (created by the daemon on its first log write). |
+| `/etc/avahi/services/wireview.service` | Optional mDNS advertisement of the listener. Installed by `make install` only; see [mDNS discovery](#mdns-discovery-optional). |
 
 ## License
 

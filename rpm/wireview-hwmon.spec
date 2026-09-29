@@ -50,6 +50,7 @@ install -Dm0755 wireviewctl %{buildroot}%{_bindir}/wireviewctl
 install -Dm0644 debian/wireviewd.service %{buildroot}%{_unitdir}/wireviewd.service
 install -Dm0644 99-wireview-hwmon.rules %{buildroot}%{_udevrulesdir}/99-wireview-hwmon.rules
 install -Dm0644 firmware/TG-WV-PRO2-FW.hex %{buildroot}%{_datadir}/wireview/TG-WV-PRO2-FW.hex
+install -Dm0600 wireview-config.sample %{buildroot}%{_sysconfdir}/wireview/config
 
 # DKMS module source
 install -Dm0644 wireview_hwmon.c %{buildroot}%{_usrsrc}/%{name}-%{version}/wireview_hwmon.c
@@ -64,6 +65,8 @@ install -Dm0644 Makefile.dkms   %{buildroot}%{_usrsrc}/%{name}-%{version}/Makefi
 %{_udevrulesdir}/99-wireview-hwmon.rules
 %dir %{_datadir}/wireview
 %{_datadir}/wireview/TG-WV-PRO2-FW.hex
+%dir %attr(0700,root,root) %{_sysconfdir}/wireview
+%config(noreplace) %attr(0600,root,root) %{_sysconfdir}/wireview/config
 
 %post
 %systemd_post wireviewd.service
