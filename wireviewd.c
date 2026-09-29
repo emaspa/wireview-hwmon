@@ -66,6 +66,11 @@
 
 #define MAX_CLIENTS 4
 
+/* A socket request (3-byte header + payload) must arrive in full within
+ * this many ms of its first byte, or the client is disconnected. */
+#define CLIENT_REQ_TIMEOUT_MS 2000
+#define CLIENT_MAX_PAYLOAD    512
+
 /* Firmware command bytes */
 #define CMD_READ_VENDOR_DATA   0x01
 #define CMD_READ_UID           0x02
@@ -204,30 +209,65 @@ static void sig_handler(int sig)
 	running = 0;
 }
 
-/* Read exactly n bytes from fd with timeout. Returns 0 on success, -1 on failure. */
+/* Set *deadline to CLOCK_MONOTONIC now + ms. */
+static void deadline_in(struct timespec *deadline, long ms)
+{
+	clock_gettime(CLOCK_MONOTONIC, deadline);
+	deadline->tv_sec += ms / 1000;
+	deadline->tv_nsec += (ms % 1000) * 1000000L;
+	if (deadline->tv_nsec >= 1000000000L) {
+		deadline->tv_sec++;
+		deadline->tv_nsec -= 1000000000L;
+	}
+}
+
+/* Milliseconds left until a CLOCK_MONOTONIC deadline (<= 0 once passed). */
+static long ms_until(const struct timespec *deadline)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (deadline->tv_sec - now.tv_sec) * 1000L +
+	       (deadline->tv_nsec - now.tv_nsec) / 1000000L;
+}
+
+/* Read exactly n bytes from fd with timeout. Returns 0 on success, -1 on
+ * failure (EOF, error or timeout).
+ *
+ * Used on the serial fd, which is blocking with VMIN=0/VTIME=10: read()
+ * returns what has arrived, or 0 after 1 s of silence (treated as
+ * failure, as before). On a non-blocking fd read() returns EAGAIN
+ * instead, and we poll() for the time remaining rather than spin. */
 static int read_exact(int fd, void *buf, size_t n, int timeout_ms)
 {
 	size_t off = 0;
-	struct timespec start, now;
+	struct timespec deadline;
 
-	clock_gettime(CLOCK_MONOTONIC, &start);
+	deadline_in(&deadline, timeout_ms);
 
 	while (off < n) {
 		ssize_t r = read(fd, (char *)buf + off, n - off);
-		if (r > 0) {
-			off += r;
-		} else if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) {
+		int wait = 0;
+
+		if (r > 0)
+			off += (size_t)r;
+		else if (r == 0)
 			return -1;
+		else if (errno == EAGAIN || errno == EWOULDBLOCK)
+			wait = 1;
+		else if (errno != EINTR)
+			return -1;
+
+		if (off == n)
+			break;
+		long left = ms_until(&deadline);
+		if (left <= 0)
+			return -1;
+		if (wait) {
+			struct pollfd pfd = { .fd = fd, .events = POLLIN };
+			if (poll(&pfd, 1, (int)left) == 0)
+				return -1;
 		}
-
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		long elapsed = (now.tv_sec - start.tv_sec) * 1000 +
-			       (now.tv_nsec - start.tv_nsec) / 1000000;
-		if (elapsed > timeout_ms)
-			return -1;
-
-		if (off < n)
-			usleep(1000);
 	}
 	return 0;
 }
@@ -497,11 +537,16 @@ static void cleanup_socket(int sock_fd)
 /* ---- Command socket peer privileges ---- */
 
 /* One connected command-socket client. privileged is decided once at
- * accept time from SO_PEERCRED. */
+ * accept time from SO_PEERCRED. The fd is non-blocking: request bytes are
+ * accumulated in req[] as they arrive, and the request is dispatched only
+ * once complete, so a slow or stalled peer never blocks the poll loop. */
 struct client {
 	int   fd;
 	int   privileged;
 	uid_t uid;
+	size_t have;			/* bytes of the current request in req[] */
+	struct timespec req_deadline;	/* valid while have > 0 */
+	uint8_t req[3 + CLIENT_MAX_PAYLOAD];
 };
 
 static gid_t g_wireview_gid;
@@ -578,6 +623,7 @@ static void client_init(struct client *c, int fd)
 	c->fd = fd;
 	c->privileged = 0;
 	c->uid = (uid_t)-1;
+	c->have = 0;
 	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 &&
 	    len == sizeof(cred)) {
 		c->uid = cred.uid;
@@ -617,32 +663,22 @@ static int send_response(int client_fd, uint8_t status,
 	return 0;
 }
 
+static long client_uid(const struct client *c)
+{
+	return c->uid == (uid_t)-1 ? -1L : (long)c->uid;
+}
+
+/* Execute the complete request held in c->req. */
 static void handle_client_request(const struct client *c, int serial_fd)
 {
 	int client_fd = c->fd;
-	uint8_t hdr[3];
-	uint8_t cmd_type;
-	uint16_t payload_len;
-	uint8_t payload[512];
-
-	if (read_exact(client_fd, hdr, 3, 2000) < 0) return;
-
-	cmd_type = hdr[0];
-	payload_len = hdr[1] | ((uint16_t)hdr[2] << 8);
-
-	if (payload_len > sizeof(payload)) {
-		send_response(client_fd, RESP_ERROR, NULL, 0);
-		return;
-	}
-
-	if (payload_len > 0) {
-		if (read_exact(client_fd, payload, payload_len, 2000) < 0)
-			return;
-	}
+	uint8_t cmd_type = c->req[0];
+	uint16_t payload_len = c->req[1] | ((uint16_t)c->req[2] << 8);
+	const uint8_t *payload = c->req + 3;
 
 	if (cmd_is_privileged(cmd_type) && !c->privileged) {
 		wlog("WARN", "socket cmd 0x%02x from uid %ld denied: not root or in group '%s'",
-		     cmd_type, c->uid == (uid_t)-1 ? -1L : (long)c->uid, WIREVIEW_GROUP);
+		     cmd_type, client_uid(c), WIREVIEW_GROUP);
 		send_response(client_fd, RESP_DENIED, NULL, 0);
 		return;
 	}
@@ -826,6 +862,51 @@ static void handle_client_request(const struct client *c, int serial_fd)
 		send_response(client_fd, RESP_ERROR, NULL, 0);
 		break;
 	}
+}
+
+/* Bytes the current request needs in total: the header, plus the payload
+ * once the header is in. */
+static size_t client_need(const struct client *c)
+{
+	if (c->have < 3)
+		return 3;
+	return 3 + (size_t)(c->req[1] | ((uint16_t)c->req[2] << 8));
+}
+
+/* Called on POLLIN: read what the client has sent without blocking and
+ * dispatch the request once it is complete. The request deadline starts
+ * at its first POLLIN; main() drops clients that miss it. Returns -1 if
+ * the client should be closed (EOF or read error), else 0. */
+static int client_read(struct client *c, int serial_fd)
+{
+	if (c->have == 0)
+		deadline_in(&c->req_deadline, CLIENT_REQ_TIMEOUT_MS);
+
+	while (c->have < client_need(c)) {
+		ssize_t r = read(c->fd, c->req + c->have,
+				 client_need(c) - c->have);
+		if (r == 0)
+			return -1;
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return 0;	/* rest comes on a later POLLIN */
+			return -1;
+		}
+		c->have += (size_t)r;
+
+		if (c->have == 3 && client_need(c) - 3 > CLIENT_MAX_PAYLOAD) {
+			/* Oversized: refuse without reading the payload. */
+			c->have = 0;
+			send_response(c->fd, RESP_ERROR, NULL, 0);
+			return 0;
+		}
+	}
+
+	handle_client_request(c, serial_fd);
+	c->have = 0;
+	return 0;
 }
 
 /* ---- HTTP /sensors publisher (read-only LAN exposure) ---- */
@@ -1380,16 +1461,6 @@ static void handle_post_command(int cfd, const char *req, const char *body,
 	}
 }
 
-/* Milliseconds left until a CLOCK_MONOTONIC deadline (<= 0 once passed). */
-static long ms_until(const struct timespec *deadline)
-{
-	struct timespec now;
-
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	return (deadline->tv_sec - now.tv_sec) * 1000L +
-	       (deadline->tv_nsec - now.tv_nsec) / 1000000L;
-}
-
 /* recv() that never waits past the deadline. Returns bytes read, 0 on
  * orderly close, -1 on error, or -2 once the deadline has passed. */
 static ssize_t recv_deadline(int fd, void *buf, size_t len,
@@ -1433,13 +1504,7 @@ static void http_handle(int http_fd)
 	inet_ntop(AF_INET, &peer.sin_addr, client_ip, sizeof(client_ip));
 
 	struct timespec deadline;
-	clock_gettime(CLOCK_MONOTONIC, &deadline);
-	deadline.tv_sec += HTTP_DEADLINE_MS / 1000;
-	deadline.tv_nsec += (long)(HTTP_DEADLINE_MS % 1000) * 1000000L;
-	if (deadline.tv_nsec >= 1000000000L) {
-		deadline.tv_sec++;
-		deadline.tv_nsec -= 1000000000L;
-	}
+	deadline_in(&deadline, HTTP_DEADLINE_MS);
 
 	/* Room for a maximal header block plus a maximal body. */
 	static char buf[HTTP_MAX_HEADER + 4 + HTTP_MAX_BODY + 1];
@@ -1728,6 +1793,14 @@ int main(int argc, char **argv)
 			clock_gettime(CLOCK_MONOTONIC, &now);
 			long wait_ms = (next_poll.tv_sec - now.tv_sec) * 1000 +
 				       (next_poll.tv_nsec - now.tv_nsec) / 1000000;
+			/* ... or until the earliest partial request expires */
+			for (int i = 0; i < num_clients; i++) {
+				if (clients[i].have > 0) {
+					long left = ms_until(&clients[i].req_deadline);
+					if (left < wait_ms)
+						wait_ms = left;
+				}
+			}
 			if (wait_ms < 0) wait_ms = 0;
 
 			int ret = poll(pfds, nfds, (int)wait_ms);
@@ -1736,7 +1809,8 @@ int main(int argc, char **argv)
 
 			/* Accept new clients */
 			if (sock_fd >= 0 && nfds > 0 && (pfds[0].revents & POLLIN)) {
-				int new_fd = accept(sock_fd, NULL, NULL);
+				int new_fd = accept4(sock_fd, NULL, NULL,
+						     SOCK_NONBLOCK | SOCK_CLOEXEC);
 				if (new_fd >= 0) {
 					if (num_clients < MAX_CLIENTS) {
 						client_init(&clients[num_clients++],
@@ -1754,23 +1828,39 @@ int main(int argc, char **argv)
 			    (pfds[http_pfd_idx].revents & POLLIN))
 				http_handle(http_fd);
 
-			/* Handle client requests */
-			for (int i = 0; i < num_clients; ) {
+			/* Handle client requests. Walk backwards: removing
+			 * client i swaps the last client into slot i, and that
+			 * one has already been handled (or was accepted this
+			 * round and has no pfd), so slot i is never re-read
+			 * against the removed client's revents. */
+			for (int i = num_clients - 1; i >= 0; i--) {
 				int idx = client_pfd_start + i;
-				if (idx < nfds && pfds[idx].revents) {
-					if (pfds[idx].revents & POLLIN) {
-						handle_client_request(
-							&clients[i],
-							serial_fd);
-					}
-					if (pfds[idx].revents &
-					    (POLLHUP | POLLERR)) {
-						close(clients[i].fd);
-						clients[i] =
-							clients[--num_clients];
-						clients[num_clients].fd = -1;
-						continue;
-					}
+				if (idx >= nfds || !pfds[idx].revents)
+					continue;
+				int drop = 0;
+				if (pfds[idx].revents & POLLIN)
+					drop = client_read(&clients[i],
+							   serial_fd) < 0;
+				if (drop || (pfds[idx].revents &
+					     (POLLHUP | POLLERR))) {
+					close(clients[i].fd);
+					clients[i] = clients[--num_clients];
+					clients[num_clients].fd = -1;
+				}
+			}
+
+			/* Drop clients sitting on an incomplete request */
+			for (int i = 0; i < num_clients; ) {
+				if (clients[i].have > 0 &&
+				    ms_until(&clients[i].req_deadline) <= 0) {
+					wlog("WARN", "socket client uid %ld: request incomplete after %d ms (%zu bytes), disconnecting",
+					     client_uid(&clients[i]),
+					     CLIENT_REQ_TIMEOUT_MS,
+					     clients[i].have);
+					close(clients[i].fd);
+					clients[i] = clients[--num_clients];
+					clients[num_clients].fd = -1;
+					continue;
 				}
 				i++;
 			}
