@@ -876,6 +876,11 @@ of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
   `/sensors` schema already has a `devices[]` array, but the daemon handles one
   device: this needs a misc node per device or a device id in the record, and a
   decision on how the hwmon devices are named.
+- **WireView II and its Phanteks Edition** (deferred, products `EF07` and
+  `EF08`). They are a different device: a 104-byte sensor frame with a fan
+  tachometer, two temperature sensors, their own config layout and no display
+  commands. `wireviewd` refuses them with a clear message until hardware or
+  captures are available to test against.
 - **Remote readings on a par with local ones**: carry average voltage, Vdd and
   the alarms in `GET /sensors`, so `wireviewctl --host h sensors` prints what
   the local command does.
