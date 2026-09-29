@@ -12,6 +12,10 @@ every reopen. The daemon reads its config from the temp dir too, with
 the LAN listener on 127.0.0.1 and a free port, and wireviewctl reads a fake
 hwmon sysfs directory through $WIREVIEW_HWMON_PATH.
 
+The main run drives a WireView Pro II (product 5). The same build then
+serves a Noctua Edition (product 6), which must be reported as such, and
+a WireView II (product 7), which must be refused.
+
 Environment: CC (default cc), SAN_FLAGS (extra compiler flags, e.g. ASan),
 WIREVIEW_E2E_KEEP=1 keeps the temp dir.
 """
@@ -387,8 +391,9 @@ def run(tmp):
         hwmon.stop()
     log = open(os.path.join(tmp, "daemon.out")).read()
     check("wireviewd: stopped" in log, "daemon logs a clean stop")
-    check(f"FW v{FW_VERSION}, config v2" in log,
-          "daemon read the fake device info at connect")
+    check(f"wireviewd: WireView Pro II (EF05), FW v{FW_VERSION}, config v2"
+          in log, "daemon read the fake device info at connect and names "
+          "the edition")
     check(not dev.unknown, "daemon sent only known command bytes",
           f"unknown: {dev.unknown}")
 
@@ -608,6 +613,123 @@ def exercise_config(tmp, dev, sock, port):
           f"unknown {dev.unknown}")
 
 
+def start_edition(tmp, product_id, listen, name):
+    """Serve a fake device of product_id to the main test build, now that
+    run() has stopped its daemon (the build's paths are fixed at compile
+    time). Returns (daemon, dev, hwmon, out, port); port is None unless
+    listen."""
+    hwpath = os.path.join(tmp, "hwmon")
+    if os.path.exists(hwpath):
+        os.unlink(hwpath)
+    hwmon = HwmonSink(hwpath)
+    port = free_port() if listen else None
+    with open(os.path.join(tmp, "config"), "w") as f:
+        f.write(f"remote_enabled=1\nbind=127.0.0.1\nport={port}\n"
+                if listen else "remote_enabled=0\n")
+    dev = fd.FakeWireView(fw_version=FW_VERSION, uid=UID, build=BUILD,
+                          product_id=product_id,
+                          sensors=fd.pack_sensors(pins=PINS))
+    dev.start()
+    out = open(os.path.join(tmp, name), "w")
+    daemon = subprocess.Popen(
+        [os.path.join(tmp, "wireviewd"), "-i", "100", "-d", dev.path],
+        env=daemon_env(), stdout=out, stderr=subprocess.STDOUT)
+    return daemon, dev, hwmon, out, port
+
+
+def run_noctua(tmp):
+    """The Noctua Edition (product 6) connects like the Pro II and is
+    reported as itself on the socket, /sensors and /metrics."""
+    sock = os.path.join(tmp, "wireviewd.sock")
+    daemon, dev, hwmon, out, port = start_edition(tmp, 6, True,
+                                                  "daemon6.out")
+    try:
+        if not check(wait_until(lambda: (os.path.exists(sock) and
+                                         hwmon.size() >= 3 * 156) or
+                                daemon.poll() is not None, 10) and
+                     daemon.poll() is None,
+                     "Noctua Edition (EF06): daemon connects and writes "
+                     "hwmon frames"):
+            return
+        status, data = request(sock, WCMD_GET_DEVICE_INFO)
+        check(status == RESP_OK and data[0] == FW_VERSION and
+              data[2:14] == UID and data[14:] == BUILD + b"\0\xef\x06",
+              "Noctua Edition: GET_DEVICE_INFO ends with EF 06 after the "
+              "build string's NUL", f"{status} {data!r}")
+        # An old client stops at the NUL: wireviewctl info shows the build
+        # string alone, with none of the trailing bytes.
+        r = ctl(tmp, "info")
+        check(r.returncode == 0 and
+              f"\nbuild: {BUILD.decode()}\n" in r.stdout and
+              "\xef" not in r.stdout and "\x06" not in r.stdout,
+              "Noctua Edition: wireviewctl info prints the build string "
+              "cleanly", repr(r.stdout + r.stderr))
+
+        status, _, body = http_get(port, "/sensors")
+        doc = json.loads(body) if status == 200 else {}
+        d = (doc.get("devices") or [{}])[0]
+        check(d.get("hwRev") == "EF06" and
+              d.get("name") == "WireView Pro II Noctua Edition" and
+              d.get("id") == UID_HEX and d.get("buildString") ==
+              BUILD.decode(),
+              "Noctua Edition: GET /sensors hwRev EF06, name WireView Pro "
+              "II Noctua Edition", body[:300])
+        _, _, body = http_get(port, "/metrics")
+        samples, bad = parse_metrics(body)
+        check(not bad and
+              metric(samples, "wireview_firmware_info", device=UID_HEX,
+                     version=str(FW_VERSION), build=BUILD.decode(),
+                     product="EF06",
+                     edition="WireView Pro II Noctua Edition") == 1,
+              "Noctua Edition: wireview_firmware_info has product EF06 "
+              "and the edition", f"bad {bad[:3]}")
+    finally:
+        stop_daemon(daemon, "Noctua Edition daemon")
+        out.close()
+        dev.stop()
+        hwmon.stop()
+    log = open(os.path.join(tmp, "daemon6.out")).read()
+    check("wireviewd: WireView Pro II Noctua Edition (EF06), "
+          f"FW v{FW_VERSION}, config v2" in log,
+          "Noctua Edition: the connect line names the edition", log[-400:])
+    check(not dev.unknown, "Noctua Edition: only known command bytes sent",
+          f"unknown: {dev.unknown}")
+
+
+def run_wireview2(tmp):
+    """A WireView II (product 7) is refused with one clear message, however
+    often the daemon retries, and nothing reaches hwmon."""
+    sock = os.path.join(tmp, "wireviewd.sock")
+    msg = "WireView II (product 7) is not supported yet"
+    daemon, dev, hwmon, out, _ = start_edition(tmp, 7, False,
+                                               "daemon7.out")
+    try:
+        # The daemon retries every 2 s: wait for a second attempt.
+        check(wait_until(lambda: dev.vendor_queries >= 2 or
+                         daemon.poll() is not None, 6) and
+              daemon.poll() is None,
+              "WireView II: daemon keeps running and retries",
+              f"{dev.vendor_queries} vendor-data queries")
+        status, _ = request(sock, WCMD_GET_DEVICE_INFO)
+        check(status == RESP_NOT_CONNECTED,
+              "WireView II: GET_DEVICE_INFO gets status 2", str(status))
+    finally:
+        stop_daemon(daemon, "WireView II daemon")
+        out.close()
+        dev.stop()
+        hwmon.stop()
+    log = open(os.path.join(tmp, "daemon7.out")).read()
+    check(log.count(msg) == 1 and log.count("wireviewd: using ") == 1 and
+          "device info query failed" not in log,
+          "WireView II: one 'not supported yet' line across the retries",
+          log[-600:])
+    check(audit_log(tmp).count(msg) == 1,
+          "WireView II: the audit log has it once too")
+    check(hwmon.size() == 0 and dev.polls == 0 and not dev.writes,
+          "WireView II: no sensor read, no frame written to hwmon",
+          f"{hwmon.size()} hwmon bytes, {dev.polls} polls")
+
+
 def run_unprivileged(tmp):
     """A daemon built with a WIREVIEW_GROUP that does not exist, so the
     test user is an unprivileged peer: privileged commands get status 3
@@ -686,6 +808,8 @@ def exercise_http(tmp, dev, daemon, port):
           d.get("fwVer") == str(FW_VERSION) and
           d.get("buildString") == BUILD.decode(),
           "GET /sensors describes the fake device", body[:300])
+    check(d.get("hwRev") == "EF05" and d.get("name") == "WireView Pro II",
+          "GET /sensors: hwRev EF05, name WireView Pro II", body[:300])
     check(d.get("pinVoltage") == [mv / 1000 for mv, _ in PINS] and
           d.get("pinCurrent") == [ma / 1000 for _, ma in PINS],
           "GET /sensors carries the pin readings", body[:300])
@@ -1014,14 +1138,15 @@ def main():
                   "checks will fail")
         build(tmp, group or NO_GROUP)
         check_fake_reassembly()
-        for step in (run, run_unprivileged):
+        for step in (run, run_noctua, run_wireview2, run_unprivileged):
             try:
                 step(tmp)
             except Exception as e:  # report, then go on to the summary
                 check(False, f"e2e {step.__name__}",
                       f"{type(e).__name__}: {e}")
         if failed:
-            for name in ("daemon.out", "u/daemon.out"):
+            for name in ("daemon.out", "daemon6.out", "daemon7.out",
+                         "u/daemon.out"):
                 p = os.path.join(tmp, name)
                 if os.path.exists(p):
                     print(f"--- {name}\n" + open(p).read())

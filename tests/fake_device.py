@@ -2,6 +2,12 @@
 # SPDX-License-Identifier: GPL-2.0
 """Fake Thermal Grizzly WireView Pro II on a pseudo-terminal.
 
+Any edition: product_id 5 is the WireView Pro II (the default), 6 the
+Noctua Edition, which speaks the same protocol. Products 7 and 8 (the
+WireView II family) answer the vendor-data query the same way, so the
+fake can stand in for one to check that wireviewd refuses it; the rest
+of its protocol differs and is not modelled.
+
 Speaks the device's serial protocol closely enough for wireviewd: one
 command byte in, a fixed-size little-endian struct out (layouts as
 documented in wireviewd.c). Write commands are accepted and recorded;
@@ -27,7 +33,7 @@ new /dev/pts number) and run "wireviewd -d <link>":
 
 Standalone, for manual testing ("wireviewd -d <path printed>"):
 
-    python3 tests/fake_device.py [--fw 7] [--build "FAKE 1.0"]
+    python3 tests/fake_device.py [--fw 7] [--build "FAKE 1.0"] [--product 6]
 """
 
 import argparse
@@ -68,7 +74,15 @@ SENSOR_FMT = "<4hHBB" + "hHII" * 6 + "IIHBBHH"
 SENSOR_SIZE = struct.calcsize(SENSOR_FMT)
 assert SENSOR_SIZE == 100
 
-VENDOR_ID = (0xEF, 0x05)    # VendorDataStruct bytes 0-1, checked by wireviewd
+VENDOR_TG = 0xEF            # VendorDataStruct byte 0, checked by wireviewd
+# VendorDataStruct byte 1 and the product name each product reports in its
+# BuildStruct (wireviewd reads the id, not the name).
+PRODUCT_NAMES = {
+    5: b"WireView Pro II",
+    6: b"WireView Pro II Noctua Edition",
+    7: b"WireView II",
+    8: b"WireView II Phanteks Edition",
+}
 BUILD_SIZE = 68             # VendorData(3) + ProductName(32) + BuildInfo(32) + len(1)
 CONFIG_SIZE = {0: 72, 1: 74, 2: 96}
 CONFIG_CHUNK = 62           # data bytes per WRITE_CONFIG frame
@@ -93,11 +107,16 @@ def pack_sensors(ts=(355, 400, 2001, 2001), vdd=3300, fan=42, pad1=0,
 
 class FakeWireView:
     def __init__(self, fw_version=7, uid=bytes(range(1, 13)),
-                 product=b"WireView Pro II", build=b"FAKE build 1.0",
-                 config_version=2, sensors=None):
+                 product=None, build=b"FAKE build 1.0",
+                 config_version=2, sensors=None, product_id=5,
+                 vendor_id=VENDOR_TG):
         self.fw_version = fw_version
         self.uid = uid
-        self.product = product
+        self.vendor_id = vendor_id
+        self.product_id = product_id
+        # The BuildStruct product name; by default the product id's.
+        self.product = product if product is not None else \
+            PRODUCT_NAMES.get(product_id, b"")
         self.build = build
         self.config_version = config_version
         self.config = bytearray(CONFIG_SIZE[config_version])
@@ -106,6 +125,7 @@ class FakeWireView:
         self.corrupt_frame = pack_sensors(vdd=4321, fan=105, pad1=122,
                                           fault_status=0x0607)
         self.polls = 0              # sensor reads answered
+        self.vendor_queries = 0     # READ_VENDOR_DATA answered
         self.corrupt_sent = 0
         self.writes = []            # (cmd, bytes) of every write command
         self.configs_written = []   # config after each complete write
@@ -200,12 +220,14 @@ class FakeWireView:
 
     def _reply(self, cmd):
         if cmd == CMD_READ_VENDOR_DATA:
-            return bytes([*VENDOR_ID, self.fw_version])
+            with self._lock:
+                self.vendor_queries += 1
+            return self._vendor_data()
         if cmd == CMD_READ_UID:
             return self.uid
         if cmd == CMD_READ_BUILD_INFO:
             b = bytearray(BUILD_SIZE)
-            b[0:3] = bytes([*VENDOR_ID, self.fw_version])
+            b[0:3] = self._vendor_data()
             b[3:3 + len(self.product[:32])] = self.product[:32]
             b[35:35 + len(self.build[:32])] = self.build[:32]
             b[67] = len(self.product[:32])
@@ -221,6 +243,10 @@ class FakeWireView:
                     return self.corrupt_frame
             return self.sensors
         return None
+
+    def _vendor_data(self):
+        """VendorDataStruct: vendor id, product id, firmware version."""
+        return bytes([self.vendor_id, self.product_id, self.fw_version])
 
     def _write_len(self, rx):
         """Total length (command byte included) of the write command at
@@ -305,9 +331,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--fw", type=int, default=7, help="firmware version")
     ap.add_argument("--build", default="FAKE build 1.0", help="build string")
+    ap.add_argument("--product", type=int, default=5,
+                    help="product id: 5 Pro II, 6 Noctua Edition, "
+                    "7/8 WireView II (refused by wireviewd)")
+    ap.add_argument("--name", help="BuildStruct product name "
+                    "(default: the product id's)")
     args = ap.parse_args()
 
-    dev = FakeWireView(fw_version=args.fw, build=args.build.encode())
+    dev = FakeWireView(fw_version=args.fw, build=args.build.encode(),
+                       product_id=args.product,
+                       product=args.name.encode() if args.name else None)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     print(dev.start(), flush=True)
     try:

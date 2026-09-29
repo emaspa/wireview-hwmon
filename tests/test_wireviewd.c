@@ -1,7 +1,8 @@
 /*
  * Unit tests for wireviewd's helpers: JSON/base64/HTTP parsing, HMAC, the
  * hwmon record (v3 with energy, v2 fallback), energy integration, the
- * GET /sensors and /metrics bodies, the config file and the listener.
+ * GET /sensors and /metrics bodies, the config file, the listener, the
+ * product table, device info query and GET_DEVICE_INFO reply.
  *
  * wireviewd.c is one file of static functions, so it is compiled into this
  * test directly with its main() renamed out of the way.
@@ -1011,6 +1012,223 @@ static void test_energy(void)
 	energy_reset();
 }
 
+/* ---- products, device info and the GET_DEVICE_INFO reply ---- */
+
+static void test_editions(void)
+{
+	CHECK_EQ_STR(edition_name(0xEF, 5), "WireView Pro II");
+	CHECK_EQ_STR(edition_name(0xEF, 6), "WireView Pro II Noctua Edition");
+	/* The WireView II family and anything else: not driven. */
+	for (int p = 0; p < 256; p++)
+		if (p != 5 && p != 6)
+			CHECK(edition_name(0xEF, (uint8_t)p) == NULL);
+	CHECK(edition_name(0x00, 5) == NULL);
+	CHECK(edition_name(0xEE, 6) == NULL);
+	CHECK(edition_name(0xFF, 5) == NULL);
+
+	CHECK(is_wireview2(0xEF, 7));
+	CHECK(is_wireview2(0xEF, 8));
+	CHECK(!is_wireview2(0xEF, 5));
+	CHECK(!is_wireview2(0xEF, 6));
+	CHECK(!is_wireview2(0xEF, 9));
+	CHECK(!is_wireview2(0x00, 7));
+}
+
+/* Run query_device_info() against a socket preloaded with the device's
+ * answers: tcflush() fails on a socket and discards nothing, so each read
+ * takes the next answer in order. Returns the query's result. */
+static int query_with(const uint8_t *answers, size_t n)
+{
+	int sp[2], rc;
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0)
+		return -100;
+	if (n && write(sp[1], answers, n) != (ssize_t)n) {
+		close(sp[0]);
+		close(sp[1]);
+		return -100;
+	}
+	shutdown(sp[1], SHUT_WR);	/* a short answer ends in EOF */
+	QUIET_OUT(rc = query_device_info(sp[0]));
+	close(sp[0]);
+	close(sp[1]);
+	return rc;
+}
+
+/* The answers of a WireView of this vendor/product: vendor data, UID,
+ * BuildStruct and the first 4 config bytes. Returns the length. */
+static size_t device_answers(uint8_t *a, uint8_t vendor, uint8_t product,
+			     const char *build)
+{
+	size_t n = 0;
+
+	a[n++] = vendor;
+	a[n++] = product;
+	a[n++] = 7;			/* firmware version */
+	for (int i = 0; i < 12; i++)
+		a[n++] = (uint8_t)(0xA1 + i);
+	memset(a + n, 0, 68);		/* BuildStruct */
+	a[n] = vendor;
+	a[n + 1] = product;
+	a[n + 2] = 7;
+	memcpy(a + n + 3, "WireView Pro II", 15);
+	memcpy(a + n + 35, build, strnlen(build, 32));
+	a[n + 67] = 15;
+	n += 68;
+	memcpy(a + n, "\x00\x00\x02\x00", 4);	/* config, version 2 */
+	n += 4;
+	return n;
+}
+
+static void test_query_device_info(void)
+{
+	uint8_t a[128];
+	size_t n;
+
+	/* Both editions are taken, with their ids kept. */
+	for (int p = 5; p <= 6; p++) {
+		n = device_answers(a, 0xEF, (uint8_t)p, "build 1.0");
+		CHECK_EQ_INT(query_with(a, n), 0);
+		CHECK(dev_info.valid);
+		CHECK_EQ_INT(dev_info.vendor_id, 0xEF);
+		CHECK_EQ_INT(dev_info.product_id, p);
+		CHECK_EQ_INT(dev_info.fw_version, 7);
+		CHECK_EQ_INT(dev_info.config_version, 2);
+		CHECK_EQ_INT(dev_info.uid[11], 0xAC);
+		CHECK_EQ_STR(dev_info.build_string, "build 1.0");
+	}
+
+	/* The WireView II family is told apart from the rest; the query
+	 * stops at the vendor data either way. */
+	for (int p = 7; p <= 8; p++) {
+		n = device_answers(a, 0xEF, (uint8_t)p, "build 1.0");
+		CHECK_EQ_INT(query_with(a, n), QUERY_UNSUPPORTED);
+		CHECK(!dev_info.valid);
+		CHECK_EQ_INT(dev_info.product_id, p);
+	}
+	n = device_answers(a, 0xEF, 9, "x");
+	CHECK_EQ_INT(query_with(a, n), -1);
+	n = device_answers(a, 0xEE, 5, "x");
+	CHECK_EQ_INT(query_with(a, n), -1);
+	CHECK_EQ_INT(query_with(a, 2), -1);	/* short vendor data */
+	CHECK(!dev_info.valid);
+	memset(&dev_info, 0, sizeof(dev_info));
+}
+
+/* Read what the daemon sent on fd: status and payload. Returns the
+ * payload length, or -1. */
+static int read_reply(int fd, uint8_t *status, uint8_t *buf, size_t cap)
+{
+	uint8_t hdr[3];
+
+	if (read(fd, hdr, 3) != 3)
+		return -1;
+	*status = hdr[0];
+	size_t len = hdr[1] | ((size_t)hdr[2] << 8);
+	if (len > cap || (len && read(fd, buf, len) != (ssize_t)len))
+		return -1;
+	return (int)len;
+}
+
+static void test_device_info_reply(void)
+{
+	uint8_t out[DEVICE_INFO_MAX], buf[256], status;
+	int sp[2];
+
+	CHECK_EQ_INT(DEVICE_INFO_MAX, 2 + 12 + 64 + 2);
+
+	memset(&dev_info, 0, sizeof(dev_info));
+	dev_info.fw_version = 7;
+	dev_info.config_version = 2;
+	for (int i = 0; i < 12; i++)
+		dev_info.uid[i] = (uint8_t)(0xA1 + i);
+	snprintf(dev_info.build_string, sizeof(dev_info.build_string), "B 1.0");
+	dev_info.vendor_id = 0xEF;
+	dev_info.product_id = 0x06;
+	dev_info.valid = 1;
+
+	/* fw, cfg, uid[12], "B 1.0\0", vendor, product */
+	CHECK_EQ_INT(device_info_reply(out), 2 + 12 + 6 + 2);
+	CHECK_EQ_MEM(out, "\x07\x02\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac"
+		     "B 1.0\0\xef\x06", 22);
+
+	/* An old client's reading: the build string up to the first NUL. */
+	CHECK_EQ_STR((const char *)out + 14, "B 1.0");
+
+	/* Empty build string (BUILD_INFO unanswered): NUL, then the ids. */
+	dev_info.build_string[0] = '\0';
+	CHECK_EQ_INT(device_info_reply(out), 17);
+	CHECK_EQ_MEM(out + 14, "\0\xef\x06", 3);
+
+	/* The longest build string the device can send (32 bytes). */
+	memset(dev_info.build_string, 'x', 32);
+	CHECK_EQ_INT(device_info_reply(out), 2 + 12 + 33 + 2);
+	CHECK(out[46] == 0 && out[47] == 0xEF && out[48] == 0x06);
+	/* Even a string filling the whole field (never from the device)
+	 * stays within DEVICE_INFO_MAX. */
+	memset(dev_info.build_string, 'x', sizeof(dev_info.build_string));
+	CHECK_EQ_INT(device_info_reply(out), DEVICE_INFO_MAX);
+	CHECK(out[DEVICE_INFO_MAX - 3] == 0 && out[DEVICE_INFO_MAX - 1] == 0x06);
+
+	/* The same bytes over the socket, as a Pro II. */
+	snprintf(dev_info.build_string, sizeof(dev_info.build_string), "B 1.0");
+	dev_info.product_id = 0x05;
+	CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+	struct client c;
+	memset(&c, 0, sizeof(c));
+	c.fd = sp[0];
+	memcpy(c.req, "\x01\x00\x00", 3);
+	handle_client_request(&c, 1000);	/* serial fd: only checked >= 0 */
+	CHECK_EQ_INT(read_reply(sp[1], &status, buf, sizeof(buf)), 22);
+	CHECK_EQ_INT(status, RESP_OK);
+	CHECK_EQ_MEM(buf + 14, "B 1.0\0\xef\x05", 8);
+	close(sp[0]);
+	close(sp[1]);
+	memset(&dev_info, 0, sizeof(dev_info));
+}
+
+/* A WireView II is reported once per device, however often the connect
+ * loop retries; a new device or a new path is reported again. */
+static void test_unsupported_report(void)
+{
+	char errs[4096];
+	FILE *tf = tmpfile();
+
+	if (!tf) {
+		CHECK(0);
+		return;
+	}
+	fflush(stderr);
+	int saved = dup(2);
+	dup2(fileno(tf), 2);
+
+	unsupported_forget();
+	CHECK(!unsupported_known("/dev/ttyACM0"));
+	unsupported_report("/dev/ttyACM0", 7);
+	CHECK(unsupported_known("/dev/ttyACM0"));
+	CHECK(!unsupported_known("/dev/ttyACM1"));
+	unsupported_report("/dev/ttyACM0", 7);		/* retry: quiet */
+	unsupported_report("/dev/ttyACM0", 7);
+	unsupported_report("/dev/ttyACM0", 8);		/* another device */
+	unsupported_report("/dev/ttyACM1", 8);		/* another path */
+	unsupported_forget();				/* unplugged */
+	unsupported_report("/dev/ttyACM1", 8);
+	unsupported_forget();
+
+	fflush(stderr);
+	dup2(saved, 2);
+	close(saved);
+	rewind(tf);
+	size_t n = fread(errs, 1, sizeof(errs) - 1, tf);
+	errs[n] = '\0';
+	fclose(tf);
+	CHECK_EQ_STR(errs,
+		     "wireviewd: /dev/ttyACM0: WireView II (product 7) is not supported yet\n"
+		     "wireviewd: /dev/ttyACM0: WireView II (product 8) is not supported yet\n"
+		     "wireviewd: /dev/ttyACM1: WireView II (product 8) is not supported yet\n"
+		     "wireviewd: /dev/ttyACM1: WireView II (product 8) is not supported yet\n");
+}
+
 /* ---- GET /sensors body ---- */
 
 static void test_sensors_json(void)
@@ -1043,6 +1261,8 @@ static void test_sensors_json(void)
 	for (int i = 0; i < 12; i++)
 		dev_info.uid[i] = (uint8_t)(0xA1 + i);
 	snprintf(dev_info.build_string, sizeof(dev_info.build_string), "say \"hi\"");
+	dev_info.vendor_id = 0xEF;
+	dev_info.product_id = 0x05;
 	dev_info.valid = 1;
 	g_have_last = 1;
 	g_energy_uj = 12345678901LL;
@@ -1050,12 +1270,29 @@ static void test_sensors_json(void)
 	n = build_sensors_json(out, sizeof(out));
 	CHECK(n > 0 && (size_t)n < sizeof(out));
 	CHECK(strstr(out, "\"id\":\"A1A2A3A4A5A6A7A8A9AAABAC\"") != NULL);
+	/* name is the edition, hwRev vendor + product in uppercase hex. */
+	CHECK(strstr(out, "\"name\":\"WireView Pro II\",\"connected\":true,"
+		     "\"hwRev\":\"EF05\",\"fwVer\":\"7\"") != NULL);
 	CHECK(strstr(out, "\"fwVer\":\"7\",\"buildString\":\"say \\\"hi\\\"\"") != NULL);
 	CHECK(strstr(out, "\"tempInC\":35.5,\"tempOutC\":-40.0,\"ext1C\":0.0,\"ext2C\":0.0") != NULL);
 	CHECK(strstr(out, "\"psuCapW\":450,\"fan\":42,\"faultStatus\":3,\"faultLog\":256") != NULL);
 	CHECK(strstr(out, "\"sumCurrentA\":48.000,\"sumPowerW\":576.000") != NULL);
 	/* Energy in joules, the last key. */
 	CHECK(strstr(out, "\"energyJ\":12345.679}]}") != NULL);
+
+	/* The Noctua Edition: same document, its own name and hwRev. */
+	char pro2[4096];
+	snprintf(pro2, sizeof(pro2), "%s", out);
+	dev_info.product_id = 0x06;
+	n = build_sensors_json(out, sizeof(out));
+	CHECK(n > 0 && (size_t)n < sizeof(out));
+	CHECK(strstr(out, "\"name\":\"WireView Pro II Noctua Edition\",\"connected\":true,"
+		     "\"hwRev\":\"EF06\",\"fwVer\":\"7\"") != NULL);
+	/* Only name and hwRev differ (the timestamp may have ticked). */
+	const char *ts1 = strstr(pro2, "\"timestamp\":");
+	const char *ts2 = strstr(out, "\"timestamp\":");
+	CHECK(ts1 && ts2 && strcmp(ts1 + 34, ts2 + 34) == 0);
+	CHECK(strncmp(pro2, out, (size_t)(strstr(pro2, "\"name\"") - pro2)) == 0);
 
 	g_have_last = 0;
 	dev_info.valid = 0;
@@ -1419,6 +1656,10 @@ int main(void)
 	test_frame();
 	test_write_hwmon();
 	test_energy();
+	test_editions();
+	test_query_device_info();
+	test_device_info_reply();
+	test_unsupported_report();
 	test_sensors_json();
 	test_prom_escape();
 	test_metrics();
