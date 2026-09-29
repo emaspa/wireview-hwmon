@@ -1830,6 +1830,7 @@ static int cmd_top(int argc, char **argv)
 	char hosts[WV_MAXHOST][80];
 	int nhost = 0;
 	int interval_ms = 1000;
+	int watch_stdin = 1;	/* q to quit; cleared once stdin hits EOF */
 
 	FILE *f = fopen("/etc/wireview/hosts", "r");
 	if (f) {
@@ -1902,11 +1903,19 @@ static int cmd_top(int argc, char **argv)
 			draw_panel(&snaps[i]);
 		fflush(stdout);
 
-		struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+		/* poll() ignores a negative fd, so once stdin is gone this
+		 * is a plain interval sleep. */
+		struct pollfd pfd = { .fd = watch_stdin ? STDIN_FILENO : -1,
+				      .events = POLLIN };
 		if (poll(&pfd, 1, interval_ms) == 1) {
 			char c;
-			if (read(STDIN_FILENO, &c, 1) == 1 && (c == 'q' || c == 'Q'))
+			ssize_t r = read(STDIN_FILENO, &c, 1);
+			if (r == 1 && (c == 'q' || c == 'Q'))
 				break;
+			/* EOF (</dev/null, closed pipe, hung-up tty) stays
+			 * readable forever: stop watching or we spin. */
+			if (r == 0 || (r < 0 && errno != EINTR && errno != EAGAIN))
+				watch_stdin = 0;
 		}
 	}
 	term_restore();
