@@ -6,8 +6,11 @@ if [ "$1" = "configure" ]; then
     # debhelper snippet below (re)starts the daemon, which resolves the group
     # at startup.
     addgroup --system --quiet wireview 2>/dev/null || true
-    udevadm control --reload-rules || true
-    udevadm trigger || true
+    # udev is absent in containers and minimal chroots; nothing to reload.
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger || true
+    fi
 fi
 # dh_installsystemd adds daemon-reload, enable on first install (an admin's
 # "systemctl disable" is kept), start, and restart on upgrade here.
