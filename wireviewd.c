@@ -464,7 +464,7 @@ static int setup_socket(void)
 	int fd;
 	struct sockaddr_un addr;
 
-	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd < 0) return -1;
 
 	unlink(SOCK_PATH);
@@ -950,7 +950,7 @@ static int build_sensors_json(char *out, size_t cap)
 
 static int setup_http(void)
 {
-	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd < 0) return -1;
 
 	int yes = 1;
@@ -1425,7 +1425,9 @@ static void http_handle(int http_fd)
 {
 	struct sockaddr_in peer;
 	socklen_t plen = sizeof(peer);
-	int cfd = accept(http_fd, (struct sockaddr *)&peer, &plen);
+	/* Left blocking: recv_deadline() polls before every recv and
+	 * uses MSG_DONTWAIT, so reads never block. */
+	int cfd = accept4(http_fd, (struct sockaddr *)&peer, &plen, SOCK_CLOEXEC);
 	if (cfd < 0) return;
 	char client_ip[INET_ADDRSTRLEN] = "?";
 	inet_ntop(AF_INET, &peer.sin_addr, client_ip, sizeof(client_ip));
