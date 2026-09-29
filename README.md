@@ -369,7 +369,7 @@ else (`info`, `sensors`, `top`, `read-config`, `screen`, `clear-faults`,
 `build`) works for any user.
 
 The deb, rpm and AUR packages and `make install` create the group. Add
-yourself and log in again for it to take effect:
+yourself; it takes effect on the next connection, no re-login needed:
 
 ```bash
 sudo usermod -aG wireview $USER

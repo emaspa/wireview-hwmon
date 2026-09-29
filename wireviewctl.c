@@ -171,7 +171,7 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 	if (status == RESP_DENIED) {
 		fprintf(stderr, "wireviewctl: permission denied: this command needs root "
 				"or membership of the 'wireview' group\n"
-				"(sudo usermod -aG wireview $USER, then log in again)\n");
+				"(sudo usermod -aG wireview $USER, no re-login needed, membership is checked per connection)\n");
 		free(data);
 		return SOCK_DENIED;
 	}
