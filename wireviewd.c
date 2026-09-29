@@ -1589,6 +1589,9 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
+	/* A peer that hangs up before its reply must not kill the daemon
+	 * (systemd already ignores SIGPIPE; this covers manual runs). */
+	signal(SIGPIPE, SIG_IGN);
 
 	load_config();
 	resolve_wireview_group();
