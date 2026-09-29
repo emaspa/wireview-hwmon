@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/hwmon.h>
 #include <linux/hwmon-sysfs.h>
+#include <linux/fs.h>
 #include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
@@ -434,7 +435,18 @@ static const struct hwmon_ops wireview_ops = {
 	.read_string = wireview_read_string,
 };
 
+/*
+ * hwmon_chip_info::info became "const struct hwmon_channel_info * const *" in
+ * Linux 6.4 (commit d8cc9415a40f); before that, pointing it at a const array
+ * discards a qualifier. RHEL 9 backported the new type in a later minor release
+ * (9.8 has it, 9.0 and 9.2 do not) while still reporting 5.14. A non-const
+ * array converts to either type, so every older version code uses one.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 static const struct hwmon_channel_info * const wireview_info[] = {
+#else
+static const struct hwmon_channel_info *wireview_info[] = {
+#endif
 	HWMON_CHANNEL_INFO(in,
 		HWMON_I_INPUT | HWMON_I_LABEL,   /* in0: Pin 1 */
 		HWMON_I_INPUT | HWMON_I_LABEL,   /* in1: Pin 2 */
