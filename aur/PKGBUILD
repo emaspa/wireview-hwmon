@@ -10,8 +10,10 @@ url="https://github.com/emaspa/wireview-hwmon"
 license=('GPL-2.0-only')
 makedepends=('gcc')
 options=('!debug')
-source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('b518f5f9a01bc6db238c362725e429d73ffb8b6c1eb59fd94303b484bcbbad56')
+source=("$pkgbase-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "$pkgbase.sysusers")
+sha256sums=('b518f5f9a01bc6db238c362725e429d73ffb8b6c1eb59fd94303b484bcbbad56'
+            'dec7ef8e8cc0bcfb7a692a0484b9df3fbd8909f89ee63658f1c3f77ab20d7660')
 
 build() {
   cd "$pkgbase-$pkgver"
@@ -35,6 +37,9 @@ package_wireview-hwmon() {
   # Reference daemon config; private because it may hold the HMAC secret.
   install -dm700 "$pkgdir/etc/wireview"
   install -m600 wireview-config.sample "$pkgdir/etc/wireview/config"
+  # wireview group: members may send wireviewd's privileged socket commands.
+  # Created by the systemd-sysusers pacman hook.
+  install -Dm644 "$srcdir/$pkgbase.sysusers" "$pkgdir/usr/lib/sysusers.d/$pkgbase.conf"
   # The kernel module is a self-registering platform driver with no modalias,
   # so nothing autoloads it. Load it when the daemon starts (a no-op if the
   # dkms package isn't installed). Guarded so it stays a no-op should a future

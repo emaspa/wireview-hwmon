@@ -1,6 +1,11 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
+    # Members of this group may send wireviewd's privileged socket commands
+    # (bootloader, NVM, config write, serial handover). Created before the
+    # debhelper snippet below (re)starts the daemon, which resolves the group
+    # at startup.
+    addgroup --system --quiet wireview 2>/dev/null || true
     udevadm control --reload-rules || true
     udevadm trigger || true
 fi

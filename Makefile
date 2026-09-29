@@ -38,6 +38,7 @@ clean:
 install: all
 	$(MAKE) -C $(KDIR) M=$(MDIR) modules_install
 	depmod -a
+	getent group wireview >/dev/null || groupadd -r wireview
 	install -m 755 wireviewd /usr/local/bin/wireviewd
 	install -m 755 wireviewctl /usr/local/bin/wireviewctl
 	install -D -m 644 firmware/TG-WV-PRO2-FW.hex /usr/share/wireview/TG-WV-PRO2-FW.hex

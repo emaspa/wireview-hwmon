@@ -275,6 +275,25 @@ with or without `0x`: a set bit clears that fault, and a missing mask defaults
 to `FFFF`. So `wireviewctl clear-faults 0 FFFF` clears only the log, and
 `wireviewctl clear-faults 0x0004` clears status bit 2 plus the whole log.
 
+### Permissions: the `wireview` group
+
+Commands that can change or brick the device are accepted only from root or
+members of the `wireview` system group: `bootloader`, `flash`, `nvm` and
+`write-config` (and, for other clients such as the GUI app, the serial
+handover used for log reads, theme uploads and in-app flashing). Everything
+else (`info`, `sensors`, `top`, `read-config`, `screen`, `clear-faults`,
+`build`) works for any user.
+
+The deb, rpm and AUR packages and `make install` create the group. Add
+yourself and log in again for it to take effect:
+
+```bash
+sudo usermod -aG wireview $USER
+```
+
+`flash` needs the group only to ask the daemon to enter the bootloader; with
+the device already in DFU mode it talks to `dfu-util` directly.
+
 ### Examples
 
 ```bash
@@ -300,7 +319,7 @@ wireviewctl flash
 # Clear only the fault log, keep active faults
 wireviewctl clear-faults 0 FFFF
 
-# Back up and restore config
+# Back up and restore config (write-config needs the wireview group)
 wireviewctl read-config > config.hex
 wireviewctl write-config config.hex
 
@@ -314,20 +333,20 @@ echo "Total power: $((POWER / 1000000)) W"
 
 ## Daemon socket
 
-The daemon listens on a Unix socket at `/run/wireviewd.sock`, allowing external programs (including the [wireview-linux](https://github.com/emaspa/wireview-linux) app) to send commands to the device without direct serial access. Supported commands:
+The daemon listens on a Unix socket at `/run/wireviewd.sock`, allowing external programs (including the [wireview-linux](https://github.com/emaspa/wireview-linux) app) to send commands to the device without direct serial access. Commands marked * are privileged: the daemon checks the peer's credentials and accepts them only from root or members of the [`wireview` group](#permissions-the-wireview-group); anyone else gets status 3 (denied). Supported commands:
 
 | Command | Description |
 |---------|-------------|
 | GET_DEVICE_INFO | Query firmware version, config version, UID, build string |
 | CLEAR_FAULTS | Clear fault status and/or fault log (payload: status mask, log mask; u16 LE each, set bit = clear) |
 | READ_CONFIG | Read the device configuration |
-| WRITE_CONFIG | Write a new device configuration |
+| WRITE_CONFIG * | Write a new device configuration |
 | SCREEN_CMD | Send a screen command (change display page) |
-| NVM_CMD | Send an NVM command (store/recall configuration) |
+| NVM_CMD * | Send an NVM command (store/recall configuration) |
 | READ_BUILD | Read the firmware build string |
-| ENTER_BOOTLOADER | Restart the device into DFU bootloader mode |
-| SUSPEND_SERIAL | Pause daemon polling and release the serial port for a client (1-300 s, re-armable) |
-| RESUME_SERIAL | End a serial handover early and resume polling |
+| ENTER_BOOTLOADER * | Restart the device into DFU bootloader mode |
+| SUSPEND_SERIAL * | Pause daemon polling and release the serial port for a client (1-300 s, re-armable) |
+| RESUME_SERIAL * | End a serial handover early and resume polling |
 
 The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`.
 

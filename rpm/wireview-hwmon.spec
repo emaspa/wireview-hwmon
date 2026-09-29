@@ -13,6 +13,8 @@ Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  systemd-rpm-macros
+# %%pre creates the wireview group
+Requires(pre):  shadow-utils
 
 # wireviewctl flash updates the device firmware over DFU via dfu-util
 Recommends:     dfu-util
@@ -73,6 +75,12 @@ chmod 0644 %{buildroot}%{_usrsrc}/%{name}-%{version}/dkms.conf \
 %{_datadir}/wireview/TG-WV-PRO2-FW.hex
 %dir %attr(0700,root,root) %{_sysconfdir}/wireview
 %config(noreplace) %attr(0600,root,root) %{_sysconfdir}/wireview/config
+
+%pre
+# Members of this group may send wireviewd's privileged socket commands
+# (bootloader, NVM, config write, serial handover).
+getent group wireview >/dev/null || groupadd -r wireview
+exit 0
 
 %post
 %systemd_post wireviewd.service
