@@ -89,6 +89,6 @@ check-version:
 
 .PHONY: all module clean install uninstall check-version test
 
-# Unit tests (see tests/Makefile).
+# Unit tests and the fake-device end-to-end test (see tests/Makefile).
 test:
 	$(MAKE) -C tests

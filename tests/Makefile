@@ -1,9 +1,11 @@
-# Unit tests.
+# Unit tests and the fake-device end-to-end test.
 #
 #   make -C tests          build and run everything
 #   make -C tests unit     unit tests only
+#   make -C tests e2e      end-to-end test only (needs python3)
 #
-# SANITIZE=0 builds without ASan/UBSan.
+# SANITIZE=0 builds without ASan/UBSan. WIREVIEW_SKIP_E2E=1 skips the e2e
+# test, which is also skipped when python3 is missing.
 
 TOP := ..
 VERSION := $(strip $(shell cat $(TOP)/VERSION))
@@ -26,7 +28,7 @@ endif
 
 UNIT := test_wireviewd test_wireviewctl
 
-all: unit
+all: unit e2e
 
 unit: $(UNIT)
 	@rc=0; for t in $(UNIT); do ./$$t || rc=1; done; exit $$rc
@@ -37,7 +39,16 @@ test_wireviewd: test_wireviewd.c check.h $(TOP)/wireviewd.c $(TOP)/sha256.c $(TO
 test_wireviewctl: test_wireviewctl.c check.h $(TOP)/wireviewctl.c
 	$(CC) $(TEST_CFLAGS) $(SAN_FLAGS) $(TEST_DEFS) -I$(TOP) -o $@ test_wireviewctl.c
 
+e2e:
+	@if [ -n "$(WIREVIEW_SKIP_E2E)" ]; then \
+		echo "e2e: skipped (WIREVIEW_SKIP_E2E is set)"; \
+	elif ! command -v python3 >/dev/null 2>&1; then \
+		echo "e2e: skipped (python3 not found)"; \
+	else \
+		CC="$(CC)" SAN_FLAGS="$(SAN_FLAGS)" python3 ./e2e.py; \
+	fi
+
 clean:
 	rm -f $(UNIT)
 
-.PHONY: all unit clean
+.PHONY: all unit e2e clean
