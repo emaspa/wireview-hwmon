@@ -185,12 +185,54 @@ struct __attribute__((packed)) sensor_struct {
 	uint16_t fault_log;
 };
 
+/* VendorDataStruct ids (CMD_READ_VENDOR_DATA bytes 0 and 1). Thermal
+ * Grizzly's own client picks the device class by product id. */
+#define WV_VENDOR_TG            0xEF
+#define WV_PRODUCT_PRO2         0x05	/* WireView Pro II */
+#define WV_PRODUCT_PRO2_NOCTUA  0x06	/* same protocol, frame and config */
+#define WV_PRODUCT_WV2          0x07	/* WireView II: other frame/config */
+#define WV_PRODUCT_WV2_PHANTEKS 0x08	/* WireView II Phanteks Edition */
+
+/* Products this daemon drives, with the edition name the Thermal Grizzly
+ * client shows for each. */
+static const struct {
+	uint8_t product_id;
+	const char *name;
+} wv_editions[] = {
+	{ WV_PRODUCT_PRO2,        "WireView Pro II" },
+	{ WV_PRODUCT_PRO2_NOCTUA, "WireView Pro II Noctua Edition" },
+};
+
+/* Edition name of a supported device, or NULL if this daemon does not
+ * drive that vendor/product. */
+static const char *edition_name(uint8_t vendor_id, uint8_t product_id)
+{
+	if (vendor_id != WV_VENDOR_TG)
+		return NULL;
+	for (size_t i = 0; i < sizeof(wv_editions) / sizeof(wv_editions[0]); i++)
+		if (wv_editions[i].product_id == product_id)
+			return wv_editions[i].name;
+	return NULL;
+}
+
+/* A Thermal Grizzly device of the WireView II family: it answers the same
+ * vendor-data query but has a 104-byte sensor frame and its own config,
+ * which this daemon does not speak yet. */
+static int is_wireview2(uint8_t vendor_id, uint8_t product_id)
+{
+	return vendor_id == WV_VENDOR_TG &&
+	       (product_id == WV_PRODUCT_WV2 ||
+		product_id == WV_PRODUCT_WV2_PHANTEKS);
+}
+
 /* Device info read once on connect */
 struct device_info {
 	uint8_t  fw_version;
 	uint8_t  config_version;  /* 0 if fw<=2, 1 if fw>2 */
 	uint8_t  uid[12];
 	char     build_string[64];
+	uint8_t  vendor_id;       /* WV_VENDOR_TG */
+	uint8_t  product_id;      /* a product listed in wv_editions[] */
 	int      valid;
 };
 
@@ -567,6 +609,13 @@ static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 
 /* ---- Device info queries ---- */
 
+/* query_device_info() result for a WireView II (product 7 or 8): known,
+ * but not supported. dev_info.vendor_id/product_id say which. */
+#define QUERY_UNSUPPORTED (-2)
+
+/* Read the device info into dev_info. Returns 0 for a supported device,
+ * QUERY_UNSUPPORTED for a WireView II, or -1 if the device did not answer
+ * or is not a WireView this daemon knows. */
 static int query_device_info(int serial_fd)
 {
 	uint8_t cmd, buf[128];
@@ -580,8 +629,10 @@ static int query_device_info(int serial_fd)
 	if (write(serial_fd, &cmd, 1) != 1) return -1;
 	if (read_exact(serial_fd, buf, 3, 1000) < 0) return -1;
 
-	if (buf[0] != 0xEF || buf[1] != 0x05)
-		return -1;
+	dev_info.vendor_id = buf[0];
+	dev_info.product_id = buf[1];
+	if (!edition_name(buf[0], buf[1]))
+		return is_wireview2(buf[0], buf[1]) ? QUERY_UNSUPPORTED : -1;
 
 	dev_info.fw_version = buf[2];
 
@@ -2218,6 +2269,37 @@ static void http_handle(int http_fd)
 	close(cfd);
 }
 
+/* The WireView II last reported as not supported: its serial path and
+ * product id. The connect loop retries every 2 s; this keeps it to one
+ * report per device rather than one per attempt. Cleared once the path
+ * no longer opens (unplugged) or a supported device connects. */
+static char    g_unsupported_path[256];
+static uint8_t g_unsupported_product;
+
+static void unsupported_forget(void)
+{
+	g_unsupported_path[0] = '\0';
+	g_unsupported_product = 0;
+}
+
+/* Was the device at path already reported as an unsupported WireView II? */
+static int unsupported_known(const char *path)
+{
+	return g_unsupported_path[0] && strcmp(g_unsupported_path, path) == 0;
+}
+
+/* Report the WireView II at path once, until the device there changes. */
+static void unsupported_report(const char *path, uint8_t product_id)
+{
+	if (unsupported_known(path) && g_unsupported_product == product_id)
+		return;
+	fprintf(stderr, "wireviewd: %s: WireView II (product %u) is not supported yet\n",
+		path, product_id);
+	wlog("WARN", "%s: WireView II (product %u) is not supported yet", path, product_id);
+	snprintf(g_unsupported_path, sizeof(g_unsupported_path), "%s", path);
+	g_unsupported_product = product_id;
+}
+
 /* Try to bring the device up: locate and open the serial port and the
  * hwmon node, then read the device info. Returns 0 with *serial_fd and
  * *hwmon_fd open, or the number of ms to wait before the next attempt.
@@ -2226,7 +2308,7 @@ static void http_handle(int http_fd)
 static long device_connect(const char *user_dev_path, char *dev_path,
 			   size_t dev_path_len, int *serial_fd, int *hwmon_fd)
 {
-	int sfd, hfd;
+	int sfd, hfd, rc;
 
 	/* Use the -d path every time; otherwise auto-detect. Clearing
 	 * dev_path below only forgets an auto-detected path. */
@@ -2236,6 +2318,7 @@ static long device_connect(const char *user_dev_path, char *dev_path,
 		if (find_device(dev_path, dev_path_len) < 0) {
 			fprintf(stderr, "wireviewd: device not found, retrying in 5s\n");
 			dev_path[0] = '\0';
+			unsupported_forget();
 			return 5000;
 		}
 	}
@@ -2247,13 +2330,15 @@ static long device_connect(const char *user_dev_path, char *dev_path,
 		return 5000;
 	}
 
-	printf("wireviewd: using %s\n", dev_path);
+	if (!unsupported_known(dev_path))
+		printf("wireviewd: using %s\n", dev_path);
 
 	sfd = open_serial(dev_path);
 	if (sfd < 0) {
 		fprintf(stderr, "wireviewd: failed to open %s: %s\n",
 			dev_path, strerror(errno));
 		dev_path[0] = '\0';
+		unsupported_forget();
 		return 5000;
 	}
 
@@ -2268,14 +2353,19 @@ static long device_connect(const char *user_dev_path, char *dev_path,
 	tcflush(sfd, TCIFLUSH);
 
 	/* Query device info */
-	if (query_device_info(sfd) < 0) {
-		fprintf(stderr, "wireviewd: device info query failed\n");
+	rc = query_device_info(sfd);
+	if (rc < 0) {
+		if (rc == QUERY_UNSUPPORTED)
+			unsupported_report(dev_path, dev_info.product_id);
+		else
+			fprintf(stderr, "wireviewd: device info query failed\n");
 		close(hfd);
 		close(sfd);
 		dev_path[0] = '\0';
 		return 2000;
 	}
 
+	unsupported_forget();
 	*serial_fd = sfd;
 	*hwmon_fd = hfd;
 	return 0;
