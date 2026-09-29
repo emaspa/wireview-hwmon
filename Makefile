@@ -3,16 +3,25 @@ obj-m := wireview_hwmon.o
 KDIR ?= /lib/modules/$(shell uname -r)/build
 MDIR := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 
+# Userspace: distro CFLAGS/CPPFLAGS/LDFLAGS (dpkg-buildflags, %set_build_flags,
+# makepkg) replace the -O2 default; the warnings are always added on top.
+# Kbuild ignores CFLAGS (older kernels even reject kbuild files that set it),
+# so only default it when this file is read as a plain Makefile.
+ifeq ($(KERNELRELEASE),)
+CFLAGS ?= -O2
+endif
+WARNINGS := -Wall -Wextra -Wno-format-truncation
+
 all: module wireviewd wireviewctl
 
 module:
 	$(MAKE) -C $(KDIR) M=$(MDIR) modules
 
 wireviewd: wireviewd.c sha256.c sha256.h
-	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewd wireviewd.c sha256.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewd.c sha256.c $(LDLIBS)
 
 wireviewctl: wireviewctl.c
-	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewctl wireviewctl.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewctl.c $(LDLIBS)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(MDIR) clean

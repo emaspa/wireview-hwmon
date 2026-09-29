@@ -15,8 +15,8 @@ sha256sums=('b518f5f9a01bc6db238c362725e429d73ffb8b6c1eb59fd94303b484bcbbad56')
 build() {
   cd "$pkgbase-$pkgver"
   # Userspace only — the kernel module is built on the user's machine by DKMS.
-  cc -Wall -Wextra -Wno-format-truncation -O2 -o wireviewd wireviewd.c sha256.c
-  cc -Wall -Wextra -O2 -o wireviewctl wireviewctl.c
+  # The Makefile picks up makepkg's CPPFLAGS/CFLAGS/LDFLAGS from the environment.
+  make wireviewd wireviewctl
 }
 
 package_wireview-hwmon() {

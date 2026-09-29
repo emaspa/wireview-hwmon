@@ -10,6 +10,7 @@ URL:            https://github.com/emaspa/wireview-hwmon
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 
 BuildRequires:  gcc
+BuildRequires:  make
 BuildRequires:  systemd-rpm-macros
 
 # wireviewctl flash updates the device firmware over DFU via dfu-util
@@ -41,8 +42,8 @@ monitor, exposing voltage, current, power and temperature through
 
 %build
 %set_build_flags
-cc $CFLAGS $LDFLAGS -Wall -Wextra -Wno-format-truncation -o wireviewd wireviewd.c sha256.c
-cc $CFLAGS $LDFLAGS -Wall -Wextra -Wno-format-truncation -o wireviewctl wireviewctl.c
+# Userspace only; the Makefile picks up the exported CFLAGS/LDFLAGS.
+%make_build wireviewd wireviewctl
 
 %install
 install -Dm0755 wireviewd %{buildroot}%{_bindir}/wireviewd

@@ -1,10 +1,16 @@
 #!/usr/bin/make -f
+
+# Full hardening (adds bindnow to the fortify/stack-protector/PIE/relro
+# defaults); dh_auto_build exports the resulting dpkg-buildflags and the
+# Makefile's userspace rules consume CPPFLAGS/CFLAGS/LDFLAGS.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 %:
 	dh $@
 
+# Userspace only: the default "all" target would also build the kernel
+# module, which DKMS does on the target machine instead.
 override_dh_auto_build:
-	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewd wireviewd.c sha256.c
-	$(CC) -Wall -Wextra -Wno-format-truncation -O2 -o wireviewctl wireviewctl.c
+	dh_auto_build -- wireviewd wireviewctl
 
 override_dh_auto_install:
 	# Daemon package
