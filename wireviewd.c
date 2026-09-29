@@ -4,6 +4,9 @@
  * Reads sensor data from the WireView Pro II device over serial and
  * writes it to /dev/wireview-hwmon for the wireview_hwmon kernel module.
  * Also exposes a Unix socket for bidirectional command relay from apps.
+ * Both editions are driven: the WireView Pro II and the WireView Pro II
+ * Noctua Edition (vendor 0xEF, product 5 or 6). The WireView II family
+ * (products 7 and 8) is recognized but not supported.
  *
  * Usage: wireviewd [-i interval_ms] [-d device_path] [-V]
  *

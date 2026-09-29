@@ -2,6 +2,8 @@
 
 Linux hwmon driver and daemon for the [Thermal Grizzly WireView Pro II](https://www.thermal-grizzly.com/en/wireview-pro-ii-gpu/s-tg-wv-p2) power monitor. Exposes voltage, current, power, and temperature sensor data through the standard Linux hwmon subsystem.
 
+Both editions of the WireView Pro II are supported: the original and the WireView Pro II Noctua Edition, which speaks the same protocol. The WireView II and its Phanteks Edition are different devices and are not supported yet; the daemon says so once in its log and does not drive them.
+
 Works standalone or alongside the [wireview-linux](https://github.com/emaspa/wireview-linux) GUI application. When both are used together, the app reads sensor data from hwmon and sends commands through the daemon's Unix socket - giving you full app functionality plus system-wide sensor integration.
 
 ## How it works
@@ -12,7 +14,7 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
 ```
 
 - **wireview_hwmon.ko** - Kernel module that creates a virtual hwmon device
-- **wireviewd** - Userspace daemon that reads the device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN
+- **wireviewd** - Userspace daemon that reads the device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN. It tells the two editions apart by the product id the device reports (`EF05` WireView Pro II, `EF06` Noctua Edition) and passes it on to clients
 - **wireviewctl** - CLI tool for querying sensors, sending commands, firmware flashing (`flash`), and a `top` live monitor
 
 ## Installation
@@ -548,7 +550,7 @@ The daemon listens on a Unix socket at `/run/wireviewd.sock` that any local user
 
 | Command | Description |
 |---------|-------------|
-| GET_DEVICE_INFO | Query firmware version, config version, UID, build string |
+| GET_DEVICE_INFO | Query firmware version, config version, UID, build string, vendor and product id |
 | CLEAR_FAULTS | Clear fault status and/or fault log (payload: status keep-mask, log keep-mask; u16 LE each, `fault &= mask`, so 0 clears all and a set bit keeps that fault) |
 | READ_CONFIG | Read the device configuration |
 | WRITE_CONFIG * | Write a new device configuration |
@@ -560,6 +562,23 @@ The daemon listens on a Unix socket at `/run/wireviewd.sock` that any local user
 | RESUME_SERIAL * | End a serial handover early and resume polling |
 
 The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`. Status is 0 (ok), 1 (error), 2 (device not connected) or 3 (denied: privileged command from a peer that is not root or in the `wireview` group).
+
+The GET_DEVICE_INFO payload is:
+
+| Bytes | Field |
+|-------|-------|
+| 1 | firmware version |
+| 1 | config version |
+| 12 | UID |
+| n + 1 | build string, NUL-terminated (at most 32 characters) |
+| 1 | vendor id (`0xEF`, Thermal Grizzly) |
+| 1 | product id (`0x05` WireView Pro II, `0x06` WireView Pro II Noctua Edition) |
+
+The vendor and product id came in with wireview-hwmon 1.7.0. They follow the
+build string's NUL, so a client that reads the build string up to the first
+NUL, as the GUI up to 1.2.5.0 and `wireviewctl` up to 1.6.0 do, sees no
+change. A reply that ends at the NUL comes from an older daemon, which only
+ever attached a WireView Pro II: read it as vendor `0xEF`, product `0x05`.
 
 The socket exists for the daemon's whole life, device or not. Clients stay
 connected across an unplug and replug; while no device is present every
@@ -601,7 +620,10 @@ default**: no port is opened unless you enable it.
   faults, fan duty, PSU cap, energy, firmware build; see the example under
   [`wireviewctl sensors` output](#wireviewctl-sensors-output)). Open, read-only;
   the same endpoint the GUI app and `wireviewctl top` consume. With no device,
-  `devices` is empty.
+  `devices` is empty. `name` is the edition (`"WireView Pro II"` or
+  `"WireView Pro II Noctua Edition"`) and `hwRev` its vendor and product id in
+  uppercase hex, as Thermal Grizzly's own client writes them (`"EF05"`,
+  `"EF06"`); daemons before 1.7.0 sent `"WireView Pro II"` and `""`.
 - **`GET /metrics`** - the same readings for Prometheus (see
   [below](#prometheus-get-metrics)). Open, read-only.
 - **`GET /config`** - the device's current configuration, so a remote editor can
@@ -661,7 +683,7 @@ port. It is read-only and, like `/sensors`, not logged. Every sample carries
 | `wireview_fault_log` | gauge | | Latched fault bitmask (debounced) |
 | `wireview_fault_active` | gauge | `fault="chip_over_temp"`, `"sensor_over_temp"`, `"over_current"`, `"wire_over_current"`, `"over_power"`, `"current_imbalance"` | 1 while that fault (bits 0-5) is active |
 | `wireview_energy_joules_total` | counter | | Energy since `wireviewd` started |
-| `wireview_firmware_info` | gauge | `version`, `build` | Always 1 |
+| `wireview_firmware_info` | gauge | `version`, `build`, `product` (`"EF05"`, `"EF06"`), `edition` | Always 1 |
 
 Without a device only `wireview_up 0` is served, labelled with the last device
 seen (unlabelled before the first one), so an `up == 0` alert stays on the same
