@@ -28,8 +28,8 @@ module:
 wireviewd: wireviewd.c sha256.c sha256.h VERSION
 	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewd.c sha256.c $(LDLIBS)
 
-wireviewctl: wireviewctl.c VERSION
-	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewctl.c $(LDLIBS)
+wireviewctl: wireviewctl.c sha256.c sha256.h VERSION
+	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewctl.c sha256.c $(LDLIBS)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(MDIR) clean

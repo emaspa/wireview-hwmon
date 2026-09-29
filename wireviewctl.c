@@ -25,7 +25,10 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/time.h>
+#include <sys/random.h>
 #include <linux/limits.h>
+
+#include "sha256.h"
 
 #ifndef SOCK_PATH
 #define SOCK_PATH "/run/wireviewd.sock"
@@ -55,6 +58,17 @@
 /* sock_command() return values other than 0 */
 #define SOCK_FAIL   (-1)
 #define SOCK_DENIED (-2)
+
+/* Global options. With --host, commands go to that host's wireviewd over
+ * HTTP (writes signed with the shared secret) instead of the local socket. */
+static const char *g_host;		/* "host[:port]", NULL = local */
+static const char *g_secret_file;	/* --secret-file, else $WIREVIEW_SECRET */
+
+/* Remote (--host) implementations, defined with the HTTP client below. */
+static int http_command(const char *json);
+static int remote_info(int build_only);
+static int remote_read_config(void);
+static void b64_encode(const uint8_t *in, size_t len, char *out);
 
 static int sock_connect(void)
 {
@@ -179,6 +193,8 @@ static int cmd_info(void)
 	uint8_t *data = NULL;
 	uint16_t len = 0;
 
+	if (g_host)
+		return remote_info(0);
 	if (sock_command(WCMD_GET_DEVICE_INFO, NULL, 0, &data, &len) < 0)
 		return 1;
 
@@ -241,13 +257,23 @@ static int cmd_clear_faults(const char *status_arg, const char *log_arg)
 
 	uint16_t status_keep = (uint16_t)~status_mask;
 	uint16_t log_keep = (uint16_t)~log_mask;
-	uint8_t payload[4] = {
-		status_keep & 0xFF, status_keep >> 8,
-		log_keep & 0xFF, log_keep >> 8,
-	};
 
-	if (sock_command(WCMD_CLEAR_FAULTS, payload, 4, &data, &len) < 0)
-		return 1;
+	if (g_host) {
+		/* The HTTP clearFaults op takes the same keep-masks. */
+		char json[96];
+		snprintf(json, sizeof(json),
+			 "{\"op\":\"clearFaults\",\"statusMask\":%u,\"logMask\":%u}",
+			 status_keep, log_keep);
+		if (http_command(json))
+			return 1;
+	} else {
+		uint8_t payload[4] = {
+			status_keep & 0xFF, status_keep >> 8,
+			log_keep & 0xFF, log_keep >> 8,
+		};
+		if (sock_command(WCMD_CLEAR_FAULTS, payload, 4, &data, &len) < 0)
+			return 1;
+	}
 
 	printf("faults cleared (status bits 0x%04X, log bits 0x%04X)\n",
 	       status_mask, log_mask);
@@ -260,6 +286,8 @@ static int cmd_read_config(void)
 	uint8_t *data = NULL;
 	uint16_t len = 0;
 
+	if (g_host)
+		return remote_read_config();
 	if (sock_command(WCMD_READ_CONFIG, NULL, 0, &data, &len) < 0)
 		return 1;
 
@@ -341,6 +369,20 @@ static int cmd_write_config(const char *path)
 		payload[1 + i] = (uint8_t)byte;
 	}
 
+	if (g_host) {
+		/* writeConfig takes the raw config bytes; the daemon knows the
+		 * device's config version. */
+		char json[64 + 4 * (96 / 3 + 1)];
+		char b64[4 * (96 / 3 + 1) + 1];
+		b64_encode(payload + 1, nbytes, b64);
+		free(payload);
+		snprintf(json, sizeof(json), "{\"op\":\"writeConfig\",\"data\":\"%s\"}", b64);
+		if (http_command(json))
+			return 1;
+		printf("config written (%zu bytes, version %u)\n", nbytes, cfg_ver);
+		return 0;
+	}
+
 	uint8_t *resp = NULL;
 	uint16_t rlen = 0;
 	int rc = sock_command(WCMD_WRITE_CONFIG, payload, 1 + nbytes, &resp, &rlen);
@@ -371,16 +413,30 @@ static const struct name_val screen_cmds[] = {
 	{ NULL, 0 }
 };
 
+/* screen and nvm: one command byte, as WCMD_* over the socket or as
+ * {"op":OP,"cmd":N} over HTTP. Returns 0 on success, 1 on failure. */
+static int send_byte_command(uint8_t wcmd, const char *op, uint8_t val)
+{
+	if (g_host) {
+		char json[64];
+		snprintf(json, sizeof(json), "{\"op\":\"%s\",\"cmd\":%u}", op, val);
+		return http_command(json);
+	}
+
+	uint8_t *resp = NULL;
+	uint16_t rlen = 0;
+	if (sock_command(wcmd, &val, 1, &resp, &rlen) < 0)
+		return 1;
+	free(resp);
+	return 0;
+}
+
 static int cmd_screen(const char *name)
 {
 	for (const struct name_val *s = screen_cmds; s->name; s++) {
 		if (strcmp(name, s->name) == 0) {
-			uint8_t payload = s->val;
-			uint8_t *resp = NULL;
-			uint16_t rlen = 0;
-			if (sock_command(WCMD_SCREEN_CMD, &payload, 1, &resp, &rlen) < 0)
+			if (send_byte_command(WCMD_SCREEN_CMD, "screen", s->val))
 				return 1;
-			free(resp);
 			printf("screen: %s\n", name);
 			return 0;
 		}
@@ -405,12 +461,8 @@ static int cmd_nvm(const char *name)
 {
 	for (const struct name_val *s = nvm_cmds; s->name; s++) {
 		if (strcmp(name, s->name) == 0) {
-			uint8_t payload = s->val;
-			uint8_t *resp = NULL;
-			uint16_t rlen = 0;
-			if (sock_command(WCMD_NVM_CMD, &payload, 1, &resp, &rlen) < 0)
+			if (send_byte_command(WCMD_NVM_CMD, "nvm", s->val))
 				return 1;
-			free(resp);
 			printf("nvm: %s\n", name);
 			return 0;
 		}
@@ -426,6 +478,8 @@ static int cmd_build(void)
 	uint8_t *data = NULL;
 	uint16_t len = 0;
 
+	if (g_host)
+		return remote_info(1);
 	if (sock_command(WCMD_READ_BUILD, NULL, 0, &data, &len) < 0)
 		return 1;
 
@@ -946,30 +1000,68 @@ static int read_local(struct wv_snap *s)
 #define VB    "\xe2\x94\x82"   /* vertical */
 #define DEG   "\xc2\xb0"       /* degree */
 
+/* ---------- HTTP client (remote daemons: top, --host) ---------- */
 
+#define HTTP_PORT_DEFAULT 9876
 
-/* Blocking-with-timeout HTTP GET; body (headers stripped) left in out. */
-static int http_get_sensors(const char *hostport, char *out, size_t cap)
+/* Split "host", "host:port", "[v6addr]:port" or a bare IPv6 address. */
+static int split_hostport(const char *hostport, char *host, size_t hcap,
+			  char *port, size_t pcap)
 {
-	char host[128];
-	snprintf(host, sizeof(host), "%s", hostport);
-	int port = 9876;
-	char *colon = strrchr(host, ':');
-	if (colon) { *colon = '\0'; port = atoi(colon + 1); }
-	char portstr[8];
-	snprintf(portstr, sizeof(portstr), "%d", port);
+	const char *p = hostport, *colon;
+	size_t hl;
 
+	snprintf(port, pcap, "%d", HTTP_PORT_DEFAULT);
+	if (*p == '[') {
+		const char *rb = strchr(p, ']');
+		if (!rb)
+			return -1;
+		hl = (size_t)(rb - p - 1);
+		if (rb[1] == ':' && rb[2])
+			snprintf(port, pcap, "%s", rb + 2);
+		p++;
+	} else if ((colon = strchr(p, ':')) != NULL && !strchr(colon + 1, ':')) {
+		hl = (size_t)(colon - p);
+		if (colon[1])
+			snprintf(port, pcap, "%s", colon + 1);
+	} else {
+		hl = strlen(p);	/* no port, or a bare IPv6 address */
+	}
+	if (hl == 0 || hl >= hcap)
+		return -1;
+	memcpy(host, p, hl);
+	host[hl] = '\0';
+	return 0;
+}
+
+static int write_all(int fd, const char *buf, size_t len)
+{
+	while (len > 0) {
+		ssize_t w = write(fd, buf, len);
+		if (w <= 0)
+			return -1;
+		buf += w;
+		len -= (size_t)w;
+	}
+	return 0;
+}
+
+/* Connect with a 1.5 s limit, trying every address the name resolves to. */
+static int http_connect(const char *host, const char *port)
+{
 	struct addrinfo hints = {0}, *res = NULL;
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
-	if (getaddrinfo(host, portstr, &hints, &res) != 0)
+	if (getaddrinfo(host, port, &hints, &res) != 0)
 		return -1;
 
-	int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-	int rc = -1;
-	if (fd >= 0) {
+	int fd = -1;
+	for (struct addrinfo *ai = res; ai && fd < 0; ai = ai->ai_next) {
+		fd = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+		if (fd < 0)
+			continue;
 		fcntl(fd, F_SETFL, O_NONBLOCK);
-		int cr = connect(fd, res->ai_addr, res->ai_addrlen);
+		int cr = connect(fd, ai->ai_addr, ai->ai_addrlen);
 		if (cr < 0 && errno == EINPROGRESS) {
 			struct pollfd pfd = { .fd = fd, .events = POLLOUT };
 			if (poll(&pfd, 1, 1500) == 1) {
@@ -978,31 +1070,86 @@ static int http_get_sensors(const char *hostport, char *out, size_t cap)
 				cr = err ? -1 : 0;
 			}
 		}
-		if (cr == 0) {
-			fcntl(fd, F_SETFL, 0);
-			struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-			setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-			char req[256];
-			int n = snprintf(req, sizeof(req),
-				"GET /sensors HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
-			if (write(fd, req, n) == n) {
-				size_t total = 0;
-				ssize_t r;
-				while (total < cap - 1 && (r = read(fd, out + total, cap - 1 - total)) > 0)
-					total += (size_t)r;
-				out[total] = '\0';
-				rc = 0;
-			}
+		if (cr != 0) {
+			close(fd);
+			fd = -1;
+			continue;
 		}
-		close(fd);
+		fcntl(fd, F_SETFL, 0);
 	}
 	freeaddrinfo(res);
+	return fd;
+}
+
+/*
+ * One HTTP/1.0 request to a wireviewd listener. body may be NULL (no
+ * Content-* headers are sent then); extra_headers is NULL or a block of
+ * complete "Name: value\r\n" lines. The response body, headers stripped,
+ * lands in out (NUL-terminated, truncated to cap - 1) and the status code in
+ * *status. Returns 0 when a response arrived, -1 if the host could not be
+ * reached or the reply was not HTTP.
+ */
+static int http_request(const char *hostport, const char *method, const char *path,
+			const char *body, const char *extra_headers, int timeout_ms,
+			char *out, size_t cap, int *status)
+{
+	char host[128], port[16];
+	if (cap < 2 || split_hostport(hostport, host, sizeof(host), port, sizeof(port)) < 0)
+		return -1;
+
+	char req[4096];
+	int n;
+	if (body)
+		n = snprintf(req, sizeof(req),
+			"%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s"
+			"Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+			method, path, host, extra_headers ? extra_headers : "",
+			strlen(body), body);
+	else
+		n = snprintf(req, sizeof(req),
+			"%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s\r\n",
+			method, path, host, extra_headers ? extra_headers : "");
+	if (n < 0 || (size_t)n >= sizeof(req))
+		return -1;
+
+	int fd = http_connect(host, port);
+	if (fd < 0)
+		return -1;
+
+	struct timeval tv = { .tv_sec = timeout_ms / 1000,
+			      .tv_usec = (timeout_ms % 1000) * 1000 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	int rc = -1;
+	if (write_all(fd, req, (size_t)n) == 0) {
+		size_t total = 0;
+		ssize_t r;
+		while (total < cap - 1 && (r = read(fd, out + total, cap - 1 - total)) > 0)
+			total += (size_t)r;
+		out[total] = '\0';
+		if (sscanf(out, "HTTP/%*s %d", status) == 1)
+			rc = 0;
+	}
+	close(fd);
 	if (rc < 0)
 		return -1;
 
-	char *body = strstr(out, "\r\n\r\n");
-	if (body)
-		memmove(out, body + 4, strlen(body + 4) + 1);
+	char *b = strstr(out, "\r\n\r\n");
+	if (b)
+		memmove(out, b + 4, strlen(b + 4) + 1);
+	else
+		out[0] = '\0';
+	return 0;
+}
+
+/* GET /sensors for top; any non-200 reply counts as unreachable. */
+static int http_get_sensors(const char *hostport, char *out, size_t cap)
+{
+	int status = 0;
+	if (http_request(hostport, "GET", "/sensors", NULL, NULL, 2000,
+			 out, cap, &status) < 0 || status != 200)
+		return -1;
 	return 0;
 }
 
@@ -1126,6 +1273,272 @@ static int parse_remote(const char *hostport, const char *body,
 		p = end + 1;
 	}
 	return n;
+}
+
+/* ---------- remote commands (--host) ---------- */
+
+static void b64_encode(const uint8_t *in, size_t len, char *out)
+{
+	static const char T[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	size_t i, o = 0;
+	for (i = 0; i + 2 < len; i += 3) {
+		uint32_t n = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8) | in[i + 2];
+		out[o++] = T[(n >> 18) & 63]; out[o++] = T[(n >> 12) & 63];
+		out[o++] = T[(n >> 6) & 63];  out[o++] = T[n & 63];
+	}
+	if (i < len) {
+		uint32_t n = (uint32_t)in[i] << 16;
+		if (i + 1 < len) n |= (uint32_t)in[i + 1] << 8;
+		out[o++] = T[(n >> 18) & 63];
+		out[o++] = T[(n >> 12) & 63];
+		out[o++] = (i + 1 < len) ? T[(n >> 6) & 63] : '=';
+		out[o++] = '=';
+	}
+	out[o] = '\0';
+}
+
+static int b64val(char c)
+{
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+
+/* Returns the decoded length, or -1 on a bad character or overflow. */
+static int b64_decode(const char *in, uint8_t *out, size_t outcap)
+{
+	size_t outlen = 0;
+	uint32_t acc = 0;
+	int bits = 0;
+	for (const char *p = in; *p; p++) {
+		if (*p == '=')
+			continue;
+		int v = b64val(*p);
+		if (v < 0) return -1;
+		acc = (acc << 6) | (uint32_t)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			if (outlen >= outcap) return -1;
+			out[outlen++] = (uint8_t)(acc >> bits);
+		}
+	}
+	return (int)outlen;
+}
+
+static int random_bytes(uint8_t *buf, size_t n)
+{
+	if (getrandom(buf, n, 0) == (ssize_t)n)
+		return 0;
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	int rc = read_full(fd, buf, n);
+	close(fd);
+	return rc;
+}
+
+/*
+ * The shared secret for signed writes: --secret-file FILE, else
+ * $WIREVIEW_SECRET (never a command-line value, which ps would show). The
+ * file is read like the daemon reads /etc/wireview/config: the first
+ * "secret=" value or bare line wins, '#' lines and other key=value lines are
+ * skipped. So a file holding just the passphrase works, and so does the
+ * daemon's own config on the same machine. Truncated to the daemon's 127.
+ */
+static int load_secret(char *out, size_t cap)
+{
+	out[0] = '\0';
+	if (g_secret_file) {
+		FILE *f = fopen(g_secret_file, "r");
+		if (!f) {
+			fprintf(stderr, "wireviewctl: %s: %s\n", g_secret_file, strerror(errno));
+			return -1;
+		}
+		char line[192];
+		while (!out[0] && fgets(line, sizeof(line), f)) {
+			size_t n = strlen(line);
+			while (n && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+				     line[n - 1] == ' ' || line[n - 1] == '\t'))
+				line[--n] = '\0';
+			char *p = line;
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p == '#' || *p == '\0')
+				continue;
+			char *eq = strchr(p, '=');
+			if (eq) {
+				*eq = '\0';
+				char *val = eq + 1;
+				while (*val == ' ' || *val == '\t') val++;
+				if (strcmp(p, "secret") == 0)
+					snprintf(out, cap, "%s", val);
+			} else {
+				snprintf(out, cap, "%s", p);
+			}
+		}
+		explicit_bzero(line, sizeof(line));
+		fclose(f);
+		if (!out[0]) {
+			fprintf(stderr, "wireviewctl: no secret found in %s\n", g_secret_file);
+			return -1;
+		}
+		return 0;
+	}
+
+	const char *env = getenv("WIREVIEW_SECRET");
+	if (env && env[0]) {
+		snprintf(out, cap, "%s", env);
+		return 0;
+	}
+	fprintf(stderr, "wireviewctl: remote writes are signed: pass --secret-file FILE "
+		"or set WIREVIEW_SECRET\n");
+	return -1;
+}
+
+static void remote_unreachable(void)
+{
+	fprintf(stderr, "wireviewctl: cannot reach wireviewd at %s\n"
+		"(is remote_enabled=1 set in its /etc/wireview/config?)\n", g_host);
+}
+
+/* Non-2xx reply: show the status and the daemon's {"error":...} body. */
+static void remote_fail(int status, char *body)
+{
+	size_t n = strlen(body);
+	while (n && (body[n - 1] == '\n' || body[n - 1] == '\r'))
+		body[--n] = '\0';
+	fprintf(stderr, "wireviewctl: %s: HTTP %d%s%s\n", g_host, status,
+		body[0] ? ": " : "", body);
+}
+
+/*
+ * POST /command with the daemon's auth headers: X-Auth-Ts (unix time),
+ * X-Auth-Nonce (16 random bytes, hex) and X-Auth-Sig, the lowercase hex
+ * HMAC-SHA256 of "ts\nnonce\nbody" under the shared secret. Returns 0 on a
+ * 2xx reply, 1 otherwise (after printing why).
+ */
+static int http_command(const char *json)
+{
+	char secret[128];
+	if (load_secret(secret, sizeof(secret)) < 0)
+		return 1;
+
+	char ts[24], nonce[33], sig[65];
+	uint8_t rnd[16], mac[32];
+	snprintf(ts, sizeof(ts), "%lld", (long long)time(NULL));
+	if (random_bytes(rnd, sizeof(rnd)) < 0) {
+		fprintf(stderr, "wireviewctl: no random source for the nonce\n");
+		explicit_bzero(secret, sizeof(secret));
+		return 1;
+	}
+	hex_encode(rnd, sizeof(rnd), nonce);
+
+	size_t mcap = strlen(ts) + strlen(nonce) + strlen(json) + 3;
+	char *msg = malloc(mcap);
+	if (!msg) {
+		explicit_bzero(secret, sizeof(secret));
+		return 1;
+	}
+	int mlen = snprintf(msg, mcap, "%s\n%s\n%s", ts, nonce, json);
+	hmac_sha256((const uint8_t *)secret, strlen(secret),
+		    (const uint8_t *)msg, (size_t)mlen, mac);
+	hex_encode(mac, sizeof(mac), sig);
+	explicit_bzero(secret, sizeof(secret));
+	free(msg);
+
+	char hdrs[256];
+	snprintf(hdrs, sizeof(hdrs),
+		 "X-Auth-Ts: %s\r\nX-Auth-Nonce: %s\r\nX-Auth-Sig: %s\r\n", ts, nonce, sig);
+
+	char resp[4096];
+	int status = 0;
+	if (http_request(g_host, "POST", "/command", json, hdrs, 5000,
+			 resp, sizeof(resp), &status) < 0) {
+		remote_unreachable();
+		return 1;
+	}
+	if (status < 200 || status > 299) {
+		remote_fail(status, resp);
+		return 1;
+	}
+	return 0;
+}
+
+/* GET /sensors from --host into body; 0 on a 200 reply. */
+static int remote_get_sensors(char *body, size_t cap)
+{
+	int status = 0;
+	if (http_request(g_host, "GET", "/sensors", NULL, NULL, 3000,
+			 body, cap, &status) < 0) {
+		remote_unreachable();
+		return -1;
+	}
+	if (status != 200) {
+		remote_fail(status, body);
+		return -1;
+	}
+	return 0;
+}
+
+/* info / build over HTTP: the /sensors fields fwVer, id and buildString.
+ * The config version is not published there, so info omits it. */
+static int remote_info(int build_only)
+{
+	static char body[16384];
+	struct wv_snap s;
+	if (remote_get_sensors(body, sizeof(body)) < 0)
+		return 1;
+	if (parse_remote(g_host, body, &s, 1) < 1) {
+		fprintf(stderr, "wireviewctl: %s: device not connected\n", g_host);
+		return 1;
+	}
+	if (build_only) {
+		printf("build: %s\n", s.build[0] ? s.build : "(empty)");
+		return 0;
+	}
+	printf("firmware: %s\n", s.fw);
+	printf("uid: ");
+	for (const char *p = s.uid; *p; p++)	/* lowercase, as the local path prints */
+		putchar(*p >= 'A' && *p <= 'F' ? *p - 'A' + 'a' : *p);
+	printf("\n");
+	if (s.build[0])
+		printf("build: %s\n", s.build);
+	return 0;
+}
+
+/* read-config over HTTP: GET /config -> {"deviceId","version","data":b64}. */
+static int remote_read_config(void)
+{
+	char body[2048];
+	int status = 0;
+	if (http_request(g_host, "GET", "/config", NULL, NULL, 5000,
+			 body, sizeof(body), &status) < 0) {
+		remote_unreachable();
+		return 1;
+	}
+	if (status != 200) {
+		remote_fail(status, body);
+		return 1;
+	}
+
+	char b64[1024];
+	uint8_t cfg[512];
+	j_str(body, "data", b64, sizeof(b64));
+	int n = b64_decode(b64, cfg, sizeof(cfg));
+	if (n <= 0 || !j_find(body, "version")) {
+		fprintf(stderr, "wireviewctl: %s: malformed /config reply\n", g_host);
+		return 1;
+	}
+	fprintf(stderr, "config_version: %d, size: %d bytes\n",
+		(int)j_num(body, "version"), n);
+	for (int i = 0; i < n; i++)
+		printf("%02x", cfg[i]);
+	printf("\n");
+	return 0;
 }
 
 /* ---------- sensors output (plain and JSON, from one snapshot) ---------- */
@@ -1274,6 +1687,25 @@ static int cmd_sensors(int argc, char **argv)
 	}
 
 	struct wv_snap s;
+	if (g_host) {
+		/* --json passes the daemon's own document through unchanged. */
+		static char body[16384];
+		if (remote_get_sensors(body, sizeof(body)) < 0)
+			return 1;
+		int n = parse_remote(g_host, body, &s, 1);
+		if (json) {
+			size_t l = strlen(body);
+			printf("%s%s", body, l && body[l - 1] == '\n' ? "" : "\n");
+		}
+		if (n < 1) {
+			fprintf(stderr, "wireviewctl: %s: device not connected\n", g_host);
+			return 1;
+		}
+		if (!json)
+			print_sensors_plain(&s);
+		return 0;
+	}
+
 	if (read_local(&s) < 0) {
 		fprintf(stderr, "wireviewctl: wireview hwmon device not found\n"
 			"Is the wireview_hwmon module loaded?\n");
@@ -1468,7 +1900,17 @@ static int cmd_top(int argc, char **argv)
 static void usage(void)
 {
 	fprintf(stderr,
-		"Usage: wireviewctl <command> [args]\n"
+		"Usage: wireviewctl [--host H[:port] [--secret-file FILE]] <command> [args]\n"
+		"\n"
+		"Global options:\n"
+		"  --host H[:port]   Talk to wireviewd on H over HTTP (default port 9876)\n"
+		"                    instead of the local socket: info, build, sensors and\n"
+		"                    read-config read; screen, nvm, clear-faults and\n"
+		"                    write-config are signed with the shared secret.\n"
+		"                    bootloader and flash are local only.\n"
+		"  --secret-file FILE  Shared secret for signed writes: the passphrase, or a\n"
+		"                    file with a secret= line (like /etc/wireview/config).\n"
+		"                    Without it, $WIREVIEW_SECRET is used.\n"
 		"\n"
 		"Commands (require wireviewd running):\n"
 		"  info              Show device firmware, UID, and build info\n"
@@ -1503,12 +1945,55 @@ static void usage(void)
 
 int main(int argc, char **argv)
 {
+	/* Global options come before the command; shift them off so the
+	 * commands keep seeing their own arguments from argv[2]. */
+	int argi = 1;
+	while (argi < argc) {
+		const char *o = argv[argi];
+		if (strcmp(o, "--host") == 0 || strcmp(o, "--secret-file") == 0) {
+			if (argi + 1 >= argc) {
+				fprintf(stderr, "wireviewctl: %s needs an argument\n", o);
+				return 1;
+			}
+			if (o[2] == 'h')
+				g_host = argv[argi + 1];
+			else
+				g_secret_file = argv[argi + 1];
+			argi += 2;
+		} else if (strncmp(o, "--host=", 7) == 0) {
+			g_host = o + 7;
+			argi++;
+		} else if (strncmp(o, "--secret-file=", 14) == 0) {
+			g_secret_file = o + 14;
+			argi++;
+		} else if (strcmp(o, "--secret") == 0 || strncmp(o, "--secret=", 9) == 0) {
+			fprintf(stderr, "wireviewctl: no --secret option: a secret on the command "
+				"line is visible in ps.\nUse --secret-file FILE or WIREVIEW_SECRET.\n");
+			return 1;
+		} else {
+			break;
+		}
+	}
+	if (g_host && !g_host[0]) {
+		fprintf(stderr, "wireviewctl: --host needs a host name\n");
+		return 1;
+	}
+	argv += argi - 1;
+	argc -= argi - 1;
+
 	if (argc < 2) {
 		usage();
 		return 1;
 	}
 
 	const char *cmd = argv[1];
+
+	if (g_host && (strcmp(cmd, "bootloader") == 0 || strcmp(cmd, "flash") == 0)) {
+		fprintf(stderr, "wireviewctl: %s is local only: wireviewd never exposes the "
+			"bootloader over the network.\nRun it on the machine the device is "
+			"attached to.\n", cmd);
+		return 1;
+	}
 
 	if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "-V") == 0) {
 		printf("wireviewctl %s\n", WIREVIEW_PKG_VERSION);
