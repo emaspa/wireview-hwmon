@@ -680,8 +680,20 @@ static int cmd_flash(const char *path, int yes)
 
 /* ---------- Sensors (sysfs, no daemon needed) ---------- */
 
+/* $WIREVIEW_HWMON_PATH names a hwmon directory to use instead of scanning
+ * /sys/class/hwmon, so the sysfs readers can be tested against a fake tree. */
 static int find_hwmon_path(char *buf, size_t bufsize)
 {
+	const char *env = getenv("WIREVIEW_HWMON_PATH");
+	if (env && env[0]) {
+		char namepath[PATH_MAX];
+		snprintf(namepath, sizeof(namepath), "%s/name", env);
+		if (access(namepath, R_OK) != 0)
+			return -1;
+		snprintf(buf, bufsize, "%s", env);
+		return 0;
+	}
+
 	DIR *dir = opendir("/sys/class/hwmon");
 	if (!dir)
 		return -1;
@@ -719,7 +731,8 @@ static int find_hwmon_path(char *buf, size_t bufsize)
 	return -1;
 }
 
-static int read_sysfs_int(const char *hwmon, const char *attr, long *val)
+/* long long: energy1_input in microjoules overflows a 32-bit long in minutes. */
+static int read_sysfs_int(const char *hwmon, const char *attr, long long *val)
 {
 	char path[PATH_MAX];
 	snprintf(path, sizeof(path), "%s/%s", hwmon, attr);
@@ -728,136 +741,86 @@ static int read_sysfs_int(const char *hwmon, const char *attr, long *val)
 	if (!f)
 		return -1;
 
-	int rc = (fscanf(f, "%ld", val) == 1) ? 0 : -1;
+	int rc = (fscanf(f, "%lld", val) == 1) ? 0 : -1;
 	fclose(f);
 	return rc;
 }
 
-static int cmd_sensors(void)
+#define WV_MAXDEV   32
+#define WV_MAXHOST  32
+#define WV_NALARM   12
+
+/*
+ * One device's readings, in hwmon sysfs units (mV, mA, uW, m°C, uJ). Filled
+ * from local sysfs by read_local() or from a remote GET /sensors by
+ * parse_remote(); "sensors", "sensors --json" and "top" all print from it.
+ * Bit i of a have_* mask marks index i as present.
+ */
+struct wv_snap {
+	char      source[72];   /* "local" or "host[:port]" */
+	char      name[40];
+	char      fw[12];       /* firmware version, "" if unknown */
+	char      uid[28];      /* device UID, uppercase hex, "" if unknown */
+	char      build[72];    /* firmware build string, "" if unknown */
+	int       ok;           /* readings present (local: sysfs data is fresh) */
+	long long in_mv[8];     unsigned have_in;     /* pins 1-6, average, vdd */
+	long long curr_ma[7];   unsigned have_curr;   /* pins 1-6, total */
+	long long power_uw[7];  unsigned have_power;  /* total, pins 1-6 */
+	long long temp_mc[4];   unsigned have_temp;   /* in, out, ext 1, ext 2 */
+	long long energy_uj;    int have_energy;
+	int       fan;          /* duty %, -1 if unavailable */
+	int       psu_cap_w;    /* PSU cap in W, 0 if unknown, -1 if unavailable */
+	unsigned  fault_status, fault_log;
+	int       have_fault_status, have_fault_log;
+	signed char alarm[WV_NALARM];  /* 0/1, -1 if the attribute is absent */
+};
+
+static const char *const in_labels[8] = {
+	"pin1_voltage_mv", "pin2_voltage_mv", "pin3_voltage_mv",
+	"pin4_voltage_mv", "pin5_voltage_mv", "pin6_voltage_mv",
+	"avg_voltage_mv", "vdd_mv"
+};
+static const char *const curr_labels[7] = {
+	"pin1_current_ma", "pin2_current_ma", "pin3_current_ma",
+	"pin4_current_ma", "pin5_current_ma", "pin6_current_ma",
+	"total_current_ma"
+};
+static const char *const power_labels[7] = {
+	"total_power_uw",
+	"pin1_power_uw", "pin2_power_uw", "pin3_power_uw",
+	"pin4_power_uw", "pin5_power_uw", "pin6_power_uw"
+};
+static const char *const temp_labels[4] = {
+	"temp_onboard_in_mc", "temp_onboard_out_mc",
+	"temp_external1_mc", "temp_external2_mc"
+};
+/* hwmon alarm attributes and the alarm_<name> lines they print as. */
+static const struct { const char *attr, *name; } alarm_attrs[WV_NALARM] = {
+	{ "temp1_alarm", "temp_onboard_in" },   { "temp2_alarm", "temp_onboard_out" },
+	{ "temp3_alarm", "temp_external1" },    { "temp4_alarm", "temp_external2" },
+	{ "curr1_alarm", "pin1_current" },      { "curr2_alarm", "pin2_current" },
+	{ "curr3_alarm", "pin3_current" },      { "curr4_alarm", "pin4_current" },
+	{ "curr5_alarm", "pin5_current" },      { "curr6_alarm", "pin6_current" },
+	{ "curr7_alarm", "total_current" },     { "power1_alarm", "total_power" },
+};
+
+static int read_full(int fd, void *buf, size_t n)
 {
-	char hwmon[PATH_MAX];
-	if (find_hwmon_path(hwmon, sizeof(hwmon)) < 0) {
-		fprintf(stderr, "wireviewctl: wireview hwmon device not found\n"
-			"Is the wireview_hwmon module loaded?\n");
-		return 1;
+	size_t off = 0;
+	while (off < n) {
+		ssize_t r = read(fd, (uint8_t *)buf + off, n - off);
+		if (r <= 0)
+			return -1;
+		off += (size_t)r;
 	}
-
-	long val;
-
-	/* Voltages: in0-in5 (pins), in6 (avg), in7 (vdd) */
-	const char *vlabels[] = {
-		"pin1_voltage_mv", "pin2_voltage_mv", "pin3_voltage_mv",
-		"pin4_voltage_mv", "pin5_voltage_mv", "pin6_voltage_mv",
-		"avg_voltage_mv", "vdd_mv"
-	};
-	for (int i = 0; i < 8; i++) {
-		char attr[32];
-		snprintf(attr, sizeof(attr), "in%d_input", i);
-		if (read_sysfs_int(hwmon, attr, &val) == 0)
-			printf("%s: %ld\n", vlabels[i], val);
-	}
-
-	/* Currents: curr1-curr6 (pins), curr7 (total) */
-	const char *clabels[] = {
-		"pin1_current_ma", "pin2_current_ma", "pin3_current_ma",
-		"pin4_current_ma", "pin5_current_ma", "pin6_current_ma",
-		"total_current_ma"
-	};
-	for (int i = 0; i < 7; i++) {
-		char attr[32];
-		snprintf(attr, sizeof(attr), "curr%d_input", i + 1);
-		if (read_sysfs_int(hwmon, attr, &val) == 0)
-			printf("%s: %ld\n", clabels[i], val);
-	}
-
-	/* Power: power1 (total), power2-power7 (pins) */
-	if (read_sysfs_int(hwmon, "power1_input", &val) == 0)
-		printf("total_power_uw: %ld\n", val);
-	const char *plabels[] = {
-		"pin1_power_uw", "pin2_power_uw", "pin3_power_uw",
-		"pin4_power_uw", "pin5_power_uw", "pin6_power_uw"
-	};
-	for (int i = 0; i < 6; i++) {
-		char attr[32];
-		snprintf(attr, sizeof(attr), "power%d_input", i + 2);
-		if (read_sysfs_int(hwmon, attr, &val) == 0)
-			printf("%s: %ld\n", plabels[i], val);
-	}
-
-	/* Temperatures */
-	const char *tlabels[] = {
-		"temp_onboard_in_mc", "temp_onboard_out_mc",
-		"temp_external1_mc", "temp_external2_mc"
-	};
-	for (int i = 0; i < 4; i++) {
-		char attr[32];
-		snprintf(attr, sizeof(attr), "temp%d_input", i + 1);
-		if (read_sysfs_int(hwmon, attr, &val) == 0)
-			printf("%s: %ld\n", tlabels[i], val);
-	}
-
-	/* Fan duty */
-	if (read_sysfs_int(hwmon, "fan1_input", &val) == 0)
-		printf("fan_duty: %ld\n", val);
-
-	/* Raw fault/log/psu from extended sysfs attrs */
-	if (read_sysfs_int(hwmon, "fault_status_raw", &val) == 0)
-		printf("fault_status: %ld\n", val);
-	else if (read_sysfs_int(hwmon, "intrusion0_alarm", &val) == 0)
-		printf("fault_status: %ld\n", val);
-
-	if (read_sysfs_int(hwmon, "fault_log_raw", &val) == 0)
-		printf("fault_log: %ld\n", val);
-	else if (read_sysfs_int(hwmon, "intrusion1_alarm", &val) == 0)
-		printf("fault_log: %ld\n", val);
-
-	if (read_sysfs_int(hwmon, "psu_cap", &val) == 0) {
-		const char *psu_names[] = { "600W", "450W", "300W", "150W" };
-		if (val >= 0 && val <= 3)
-			printf("psu_cap: %s\n", psu_names[val]);
-		else
-			printf("psu_cap: %ld\n", val);
-	}
-
 	return 0;
 }
 
-/* ---------- Usage ---------- */
-
-/* ---------- top: live monitor (local sysfs + remote /sensors) ---------- */
-
-#define WV_MAXDEV   32
-#define WV_MAXHOST  32
-#define TEMP_NA     -999.0
-
-/* UTF-8 glyphs + ANSI (explicit bytes so any compiler is happy) */
-#define ESC   "\033"
-#define BLK   "\xe2\x96\x88"   /* full block  */
-#define SHADE "\xe2\x96\x91"   /* light shade */
-#define TL    "\xe2\x95\xad"   /* round corner top-left */
-#define BL    "\xe2\x95\xb0"   /* round corner bottom-left */
-#define HR    "\xe2\x94\x80"   /* horizontal */
-#define VB    "\xe2\x94\x82"   /* vertical */
-#define DEG   "\xc2\xb0"       /* degree */
-
-struct wv_snap {
-	char     source[72];   /* "local" or "host[:port]" */
-	char     name[40];
-	char     fw[12];
-	int      ok;
-	double   pin_v[6], pin_c[6];
-	double   temp[4];      /* TEMP_NA if absent */
-	int      psu_cap_w;
-	int      fan;          /* duty %, -1 if unavailable */
-	unsigned fault_status, fault_log;
-	double   sum_w, sum_a;
-};
-
-/* Best-effort: ask the daemon (if running) for the local device's fw version.
- * Silent on any failure so it never disturbs the TUI; sysfs has no fw attribute. */
-static void get_local_fw(char *out, size_t n)
+/* Best-effort: ask the daemon (if running) for the local device's firmware
+ * version, UID and build string; sysfs has none of these. Silent on any
+ * failure so it never disturbs the TUI or the JSON output. */
+static void get_local_info(struct wv_snap *s)
 {
-	out[0] = '\0';
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0)
 		return;
@@ -869,16 +832,26 @@ static void get_local_fw(char *out, size_t n)
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
 		uint8_t hdr[3] = { WCMD_GET_DEVICE_INFO, 0, 0 };
 		uint8_t rh[3];
-		if (write(fd, hdr, 3) == 3 && read(fd, rh, 3) == 3 &&
-		    rh[0] == RESP_OK && (rh[1] | (rh[2] << 8)) >= 1) {
-			uint8_t fw;
-			if (read(fd, &fw, 1) == 1)
-				snprintf(out, n, "%u", fw);
+		/* [fw][cfg_ver][uid:12][build string, NUL-terminated] */
+		uint8_t d[2 + 12 + 64 + 1];
+		if (write(fd, hdr, 3) == 3 && read_full(fd, rh, 3) == 0 &&
+		    rh[0] == RESP_OK) {
+			size_t len = (size_t)(rh[1] | (rh[2] << 8));
+			if (len >= 14 && len < sizeof(d) && read_full(fd, d, len) == 0) {
+				d[len] = '\0';
+				snprintf(s->fw, sizeof(s->fw), "%u", d[0]);
+				for (int i = 0; i < 12; i++)
+					snprintf(s->uid + i * 2, 3, "%02X", d[2 + i]);
+				snprintf(s->build, sizeof(s->build), "%s", (const char *)d + 14);
+			}
 		}
 	}
 	close(fd);
 }
 
+/* Read every attribute the module exposes. Newer modules publish pwm1,
+ * power1_cap, energy1_input and *_alarm; older ones only fan1_input and
+ * psu_cap, so each new attribute falls back to its old counterpart. */
 static int read_local(struct wv_snap *s)
 {
 	char hwmon[PATH_MAX];
@@ -889,30 +862,91 @@ static int read_local(struct wv_snap *s)
 	snprintf(s->source, sizeof(s->source), "local");
 	snprintf(s->name, sizeof(s->name), "WireView Pro II");
 
-	long v;
+	long long v;
 	char a[24];
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < 8; i++) {
 		snprintf(a, sizeof(a), "in%d_input", i);
-		s->pin_v[i] = read_sysfs_int(hwmon, a, &v) == 0 ? v / 1000.0 : 0;
-		snprintf(a, sizeof(a), "curr%d_input", i + 1);
-		s->pin_c[i] = read_sysfs_int(hwmon, a, &v) == 0 ? v / 1000.0 : 0;
+		if (read_sysfs_int(hwmon, a, &v) == 0) {
+			s->in_mv[i] = v;
+			s->have_in |= 1u << i;
+		}
 	}
-	s->sum_a = read_sysfs_int(hwmon, "curr7_input", &v) == 0 ? v / 1000.0 : 0;
-	s->sum_w = read_sysfs_int(hwmon, "power1_input", &v) == 0 ? v / 1000000.0 : 0;
+	for (int i = 0; i < 7; i++) {
+		snprintf(a, sizeof(a), "curr%d_input", i + 1);
+		if (read_sysfs_int(hwmon, a, &v) == 0) {
+			s->curr_ma[i] = v;
+			s->have_curr |= 1u << i;
+		}
+		snprintf(a, sizeof(a), "power%d_input", i + 1);
+		if (read_sysfs_int(hwmon, a, &v) == 0) {
+			s->power_uw[i] = v;
+			s->have_power |= 1u << i;
+		}
+	}
 	for (int i = 0; i < 4; i++) {
 		snprintf(a, sizeof(a), "temp%d_input", i + 1);
-		s->temp[i] = read_sysfs_int(hwmon, a, &v) == 0 ? v / 1000.0 : TEMP_NA;
+		if (read_sysfs_int(hwmon, a, &v) == 0) {
+			s->temp_mc[i] = v;
+			s->have_temp |= 1u << i;
+		}
 	}
-	s->fault_status = read_sysfs_int(hwmon, "fault_status_raw", &v) == 0 ? (unsigned)v : 0;
-	s->fault_log    = read_sysfs_int(hwmon, "fault_log_raw", &v) == 0 ? (unsigned)v : 0;
-	int cap = read_sysfs_int(hwmon, "psu_cap", &v) == 0 ? (int)v : -1;
-	static const int capw[] = { 600, 450, 300, 150 };
-	s->psu_cap_w = (cap >= 0 && cap <= 3) ? capw[cap] : 0;
-	s->fan = read_sysfs_int(hwmon, "fan1_input", &v) == 0 ? (int)v : -1;
-	get_local_fw(s->fw, sizeof(s->fw));
-	s->ok = 1;
+
+	/* Fan duty: pwm1 is 0-255; fan1_input (deprecated) is the duty in % */
+	s->fan = -1;
+	if (read_sysfs_int(hwmon, "pwm1", &v) == 0)
+		s->fan = (int)((v * 100 + 127) / 255);
+	else if (read_sysfs_int(hwmon, "fan1_input", &v) == 0)
+		s->fan = (int)v;
+
+	/* PSU cap: power1_cap in uW; psu_cap (deprecated) is the firmware enum */
+	s->psu_cap_w = -1;
+	if (read_sysfs_int(hwmon, "power1_cap", &v) == 0) {
+		s->psu_cap_w = (int)(v / 1000000);
+	} else if (read_sysfs_int(hwmon, "psu_cap", &v) == 0) {
+		static const int capw[] = { 600, 450, 300, 150 };
+		s->psu_cap_w = (v >= 0 && v <= 3) ? capw[v] : 0;
+	}
+
+	if (read_sysfs_int(hwmon, "energy1_input", &v) == 0) {
+		s->energy_uj = v;
+		s->have_energy = 1;
+	}
+
+	/* Raw fault bitmasks; the intrusion alarms only say "some bit is set" */
+	if (read_sysfs_int(hwmon, "fault_status_raw", &v) == 0 ||
+	    read_sysfs_int(hwmon, "intrusion0_alarm", &v) == 0) {
+		s->fault_status = (unsigned)v;
+		s->have_fault_status = 1;
+	}
+	if (read_sysfs_int(hwmon, "fault_log_raw", &v) == 0 ||
+	    read_sysfs_int(hwmon, "intrusion1_alarm", &v) == 0) {
+		s->fault_log = (unsigned)v;
+		s->have_fault_log = 1;
+	}
+
+	for (int i = 0; i < WV_NALARM; i++)
+		s->alarm[i] = read_sysfs_int(hwmon, alarm_attrs[i].attr, &v) == 0 ?
+			      (v != 0) : -1;
+
+	/* The module answers ENODATA once the daemon's data is stale. */
+	s->ok = s->have_in || s->have_curr || s->have_power;
+	get_local_info(s);
 	return 0;
 }
+
+/* ---------- top: live monitor (local sysfs + remote /sensors) ---------- */
+
+/* UTF-8 glyphs + ANSI (explicit bytes so any compiler is happy) */
+#define ESC   "\033"
+#define BLK   "\xe2\x96\x88"   /* full block  */
+#define SHADE "\xe2\x96\x91"   /* light shade */
+#define TL    "\xe2\x95\xad"   /* round corner top-left */
+#define BL    "\xe2\x95\xb0"   /* round corner bottom-left */
+#define HR    "\xe2\x94\x80"   /* horizontal */
+#define VB    "\xe2\x94\x82"   /* vertical */
+#define DEG   "\xc2\xb0"       /* degree */
+
+
 
 /* Blocking-with-timeout HTTP GET; body (headers stripped) left in out. */
 static int http_get_sensors(const char *hostport, char *out, size_t cap)
@@ -995,7 +1029,10 @@ static void j_str(const char *j, const char *key, char *out, size_t n)
 	if (!p || *p != '"') return;
 	p++;
 	size_t i = 0;
-	while (*p && *p != '"' && i < n - 1) out[i++] = *p++;
+	while (*p && *p != '"' && i < n - 1) {
+		if (*p == '\\' && p[1]) p++;	/* undo the \" and \\ escapes */
+		out[i++] = *p++;
+	}
 	out[i] = '\0';
 }
 static void j_arr6(const char *j, const char *key, double out[6])
@@ -1010,6 +1047,12 @@ static void j_arr6(const char *j, const char *key, double out[6])
 		p = end;
 		while (*p == ',' || *p == ' ') p++;
 	}
+}
+
+/* Round a reading to the integer sysfs unit the snapshot stores. */
+static long long to_ll(double x)
+{
+	return (long long)(x >= 0 ? x + 0.5 : x - 0.5);
 }
 
 static int parse_remote(const char *hostport, const char *body,
@@ -1034,29 +1077,218 @@ static int parse_remote(const char *hostport, const char *body,
 		snprintf(s->source, sizeof(s->source), "%s", hostport);
 		j_str(obj, "name", s->name, sizeof(s->name));
 		j_str(obj, "fwVer", s->fw, sizeof(s->fw));
-		j_arr6(obj, "pinVoltage", s->pin_v);
-		j_arr6(obj, "pinCurrent", s->pin_c);
-		s->temp[0] = j_num(obj, "tempInC");
-		s->temp[1] = j_num(obj, "tempOutC");
+		j_str(obj, "id", s->uid, sizeof(s->uid));
+		j_str(obj, "buildString", s->build, sizeof(s->build));
+
+		double pv[6] = {0}, pc[6] = {0};
+		j_arr6(obj, "pinVoltage", pv);
+		j_arr6(obj, "pinCurrent", pc);
+		for (int i = 0; i < 6; i++) {
+			s->in_mv[i] = to_ll(pv[i] * 1000.0);
+			s->curr_ma[i] = to_ll(pc[i] * 1000.0);
+			s->power_uw[i + 1] = to_ll(pv[i] * pc[i] * 1e6);
+		}
+		s->curr_ma[6] = to_ll(j_num(obj, "sumCurrentA") * 1000.0);
+		s->power_uw[0] = to_ll(j_num(obj, "sumPowerW") * 1e6);
+		s->have_in = 0x3F;	/* no average / vdd over the network */
+		s->have_curr = 0x7F;
+		s->have_power = 0x7F;
+
+		s->temp_mc[0] = to_ll(j_num(obj, "tempInC") * 1000.0);
+		s->temp_mc[1] = to_ll(j_num(obj, "tempOutC") * 1000.0);
+		s->have_temp = 0x3;
 		/* Disconnected externals read 0.0 (daemon clamp) or a deeply negative
 		 * sentinel (~-100, app publisher) — treat both as "not present". */
-		double e1 = j_num(obj, "ext1C"), e2 = j_num(obj, "ext2C");
-		s->temp[2] = (e1 == 0.0 || e1 <= -40.0) ? TEMP_NA : e1;
-		s->temp[3] = (e2 == 0.0 || e2 <= -40.0) ? TEMP_NA : e2;
+		double e[2] = { j_num(obj, "ext1C"), j_num(obj, "ext2C") };
+		for (int i = 0; i < 2; i++) {
+			if (e[i] != 0.0 && e[i] > -40.0) {
+				s->temp_mc[2 + i] = to_ll(e[i] * 1000.0);
+				s->have_temp |= 1u << (2 + i);
+			}
+		}
+
 		s->psu_cap_w = (int)j_num(obj, "psuCapW");
 		s->fault_status = (unsigned)j_num(obj, "faultStatus");
 		s->fault_log = (unsigned)j_num(obj, "faultLog");
-		s->sum_a = j_num(obj, "sumCurrentA");
-		s->sum_w = j_num(obj, "sumPowerW");
+		s->have_fault_status = s->have_fault_log = 1;
 		const char *fp = j_find(obj, "fan");
 		s->fan = fp ? (int)strtod(fp, NULL) : -1;
+		if (j_find(obj, "energyJ")) {
+			s->energy_uj = to_ll(j_num(obj, "energyJ") * 1e6);
+			s->have_energy = 1;
+		}
+		for (int i = 0; i < WV_NALARM; i++)
+			s->alarm[i] = -1;	/* /sensors carries no per-channel alarms */
 		if (s->name[0] == '\0') snprintf(s->name, sizeof(s->name), "WireView");
-		s->ok = 1;
+		const char *cp = j_find(obj, "connected");
+		s->ok = !(cp && strncmp(cp, "false", 5) == 0);
 		n++;
 		p = end + 1;
 	}
 	return n;
 }
+
+/* ---------- sensors output (plain and JSON, from one snapshot) ---------- */
+
+static void print_sensors_plain(const struct wv_snap *s)
+{
+	for (int i = 0; i < 8; i++)
+		if (s->have_in & (1u << i))
+			printf("%s: %lld\n", in_labels[i], s->in_mv[i]);
+	for (int i = 0; i < 7; i++)
+		if (s->have_curr & (1u << i))
+			printf("%s: %lld\n", curr_labels[i], s->curr_ma[i]);
+	for (int i = 0; i < 7; i++)
+		if (s->have_power & (1u << i))
+			printf("%s: %lld\n", power_labels[i], s->power_uw[i]);
+	for (int i = 0; i < 4; i++)
+		if (s->have_temp & (1u << i))
+			printf("%s: %lld\n", temp_labels[i], s->temp_mc[i]);
+	if (s->fan >= 0)
+		printf("fan_duty: %d\n", s->fan);
+	if (s->have_fault_status)
+		printf("fault_status: %u\n", s->fault_status);
+	if (s->have_fault_log)
+		printf("fault_log: %u\n", s->fault_log);
+	if (s->psu_cap_w > 0)
+		printf("psu_cap: %dW\n", s->psu_cap_w);
+	else if (s->psu_cap_w == 0)
+		printf("psu_cap: unknown\n");
+	if (s->have_energy)
+		printf("energy_uj: %lld\n", s->energy_uj);
+	for (int i = 0; i < WV_NALARM; i++)
+		if (s->alarm[i] >= 0)
+			printf("alarm_%s: %d\n", alarm_attrs[i].name, s->alarm[i]);
+}
+
+/*
+ * Escape a string for a JSON string literal, exactly as wireviewd does:
+ * '"' and '\\' are backslash-escaped, control characters become \u00XX and
+ * bytes >= 0x80 become '?'. Always NUL-terminates, never splits an escape.
+ */
+static void json_escape(const char *in, char *out, size_t cap)
+{
+	size_t o = 0;
+
+	if (cap == 0)
+		return;
+	for (; *in; in++) {
+		unsigned char c = (unsigned char)*in;
+		char esc[8];
+		size_t n;
+
+		if (c == '"' || c == '\\') {
+			esc[0] = '\\';
+			esc[1] = (char)c;
+			n = 2;
+		} else if (c < 0x20) {
+			snprintf(esc, sizeof(esc), "\\u%04x", c);
+			n = 6;
+		} else if (c >= 0x80) {
+			esc[0] = '?';
+			n = 1;
+		} else {
+			esc[0] = (char)c;
+			n = 1;
+		}
+		if (o + n >= cap)
+			break;
+		memcpy(out + o, esc, n);
+		o += n;
+	}
+	out[o] = '\0';
+}
+
+/*
+ * Same schema as wireviewd's GET /sensors, with the values computed the same
+ * way (sums from the pins, absent temperatures as 0.0), plus "energyJ" when
+ * the module has energy1_input. s == NULL (no hwmon device) gives an empty
+ * device list, like the daemon with no device. id, fwVer and buildString come
+ * from the daemon socket and are "" when it cannot be reached; "connected"
+ * is false when the module has no fresh readings.
+ */
+static void print_sensors_json(const struct wv_snap *s)
+{
+	char host[64] = "wireview";
+	gethostname(host, sizeof(host) - 1);
+	host[sizeof(host) - 1] = '\0';
+	char host_js[sizeof(host) * 6];
+	json_escape(host, host_js, sizeof(host_js));
+
+	printf("{\"host\":\"%s\",\"appVersion\":\"wireviewctl\",\"devices\":[", host_js);
+	if (s) {
+		char ts[32];
+		time_t now = time(NULL);
+		struct tm tmv;
+		gmtime_r(&now, &tmv);
+		strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+
+		char name_js[sizeof(s->name) * 6], uid_js[sizeof(s->uid) * 6];
+		char fw_js[sizeof(s->fw) * 6], build_js[sizeof(s->build) * 6];
+		json_escape(s->name, name_js, sizeof(name_js));
+		json_escape(s->uid, uid_js, sizeof(uid_js));
+		json_escape(s->fw, fw_js, sizeof(fw_js));
+		json_escape(s->build, build_js, sizeof(build_js));
+
+		double pv[6], pc[6], sum_p = 0, sum_c = 0, t[4];
+		for (int i = 0; i < 6; i++) {
+			pv[i] = s->in_mv[i] / 1000.0;
+			pc[i] = s->curr_ma[i] / 1000.0;
+			sum_p += pv[i] * pc[i];
+			sum_c += pc[i];
+		}
+		for (int i = 0; i < 4; i++)
+			t[i] = (s->have_temp & (1u << i)) ? s->temp_mc[i] / 1000.0 : 0.0;
+
+		printf("{\"id\":\"%s\",\"name\":\"%s\",\"connected\":%s,"
+		       "\"hwRev\":\"\",\"fwVer\":\"%s\",\"buildString\":\"%s\",\"timestamp\":\"%s\","
+		       "\"pinVoltage\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
+		       "\"pinCurrent\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
+		       "\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
+		       "\"psuCapW\":%d,\"fan\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
+		       "\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f",
+		       uid_js, name_js, s->ok ? "true" : "false",
+		       fw_js, build_js, ts,
+		       pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
+		       pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
+		       t[0], t[1], t[2], t[3],
+		       s->psu_cap_w > 0 ? s->psu_cap_w : 0, s->fan > 0 ? s->fan : 0,
+		       s->fault_status, s->fault_log, sum_c, sum_p);
+		if (s->have_energy)
+			printf(",\"energyJ\":%.3f", s->energy_uj / 1e6);
+		printf("}");
+	}
+	printf("]}\n");
+}
+
+static int cmd_sensors(int argc, char **argv)
+{
+	int json = 0;
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--json") == 0) {
+			json = 1;
+		} else {
+			fprintf(stderr, "wireviewctl: sensors: unknown option '%s'\n", argv[i]);
+			return 1;
+		}
+	}
+
+	struct wv_snap s;
+	if (read_local(&s) < 0) {
+		fprintf(stderr, "wireviewctl: wireview hwmon device not found\n"
+			"Is the wireview_hwmon module loaded?\n");
+		if (json)
+			print_sensors_json(NULL);
+		return 1;
+	}
+	if (json)
+		print_sensors_json(&s);
+	else
+		print_sensors_plain(&s);
+	return 0;
+}
+
+/* ---------- top drawing ---------- */
 
 static const char *bar_color(double frac)
 {
@@ -1085,38 +1317,48 @@ static void draw_panel(const struct wv_snap *s)
 
 	printf(ESC "[96m" TL HR " " ESC "[1m%s" ESC "[0;96m " HR " %s", s->source, s->name);
 	if (s->fw[0]) printf(" " HR " fw%s", s->fw);
-	if (s->psu_cap_w) printf(" " HR " cap %dW", s->psu_cap_w);
+	if (s->psu_cap_w > 0) printf(" " HR " cap %dW", s->psu_cap_w);
 	printf(ESC "[0m\n");
+
+	double pin_v[6], pin_c[6];
+	for (int p = 0; p < 6; p++) {
+		pin_v[p] = s->in_mv[p] / 1000.0;
+		pin_c[p] = s->curr_ma[p] / 1000.0;
+	}
+	double sum_w = s->power_uw[0] / 1e6, sum_a = s->curr_ma[6] / 1000.0;
 
 	double cap = s->psu_cap_w > 0 ? s->psu_cap_w : 300.0;
 	printf(ESC "[96m" VB ESC "[0m Power   ");
-	print_bar(s->sum_w / cap, 28);
-	printf("  %7.1f W\n", s->sum_w);
+	print_bar(sum_w / cap, 28);
+	printf("  %7.1f W", sum_w);
+	if (s->have_energy)
+		printf("  %10.3f Wh", s->energy_uj / 3.6e9);
+	printf("\n");
 	printf(ESC "[96m" VB ESC "[0m Current ");
-	print_bar(s->sum_a / (cap / 12.0), 28);
-	printf("  %7.2f A\n", s->sum_a);
+	print_bar(sum_a / (cap / 12.0), 28);
+	printf("  %7.2f A\n", sum_a);
 
 	/* per-pin breakdown, one metric per row so each is easy to scan/compare */
 	printf(ESC "[96m" VB ESC "[0;90m Pin   ");
 	for (int p = 0; p < 6; p++) printf("%8d", p + 1);
 	printf(ESC "[0m\n");
 	printf(ESC "[96m" VB ESC "[0m Volts ");
-	for (int p = 0; p < 6; p++) printf("%8.2f", s->pin_v[p]);
+	for (int p = 0; p < 6; p++) printf("%8.2f", pin_v[p]);
 	printf("\n");
 	printf(ESC "[96m" VB ESC "[0m Amps  ");
-	for (int p = 0; p < 6; p++) printf("%8.2f", s->pin_c[p]);
+	for (int p = 0; p < 6; p++) printf("%8.2f", pin_c[p]);
 	printf("\n");
 	printf(ESC "[96m" VB ESC "[0m Watts ");
-	for (int p = 0; p < 6; p++) printf("%8.1f", s->pin_v[p] * s->pin_c[p]);
+	for (int p = 0; p < 6; p++) printf("%8.1f", pin_v[p] * pin_c[p]);
 	printf("\n");
 
 	printf(ESC "[96m" VB ESC "[0m Temp   ");
 	static const char *tn[] = { "In", "Out", "E1", "E2" };
 	for (int t = 0; t < 4; t++) {
-		if (s->temp[t] <= TEMP_NA + 1)
+		if (!(s->have_temp & (1u << t)))
 			printf("%s -- ", tn[t]);
 		else
-			printf("%s %.1f" DEG " ", tn[t], s->temp[t]);
+			printf("%s %.1f" DEG " ", tn[t], s->temp_mc[t] / 1000.0);
 	}
 	if (s->fan >= 0) printf("  Fan %d%%", s->fan);
 	else printf("  Fan --");
@@ -1245,7 +1487,8 @@ static void usage(void)
 		"                    " DEFAULT_FIRMWARE_PATH "\n"
 		"\n"
 		"Commands (require wireview_hwmon module):\n"
-		"  sensors           Show all sensor readings from hwmon sysfs\n"
+		"  sensors [--json]  Show all sensor readings from hwmon sysfs; --json prints\n"
+		"                    the same schema as the daemon's GET /sensors\n"
 		"\n"
 		"Monitor:\n"
 		"  top [--host H[:port][,H2...]]... [--interval MS]\n"
@@ -1338,7 +1581,7 @@ int main(int argc, char **argv)
 	if (strcmp(cmd, "bootloader") == 0)
 		return cmd_bootloader();
 	if (strcmp(cmd, "sensors") == 0)
-		return cmd_sensors();
+		return cmd_sensors(argc, argv);
 	if (strcmp(cmd, "top") == 0)
 		return cmd_top(argc, argv);
 	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
