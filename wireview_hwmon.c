@@ -22,8 +22,12 @@
 #include <linux/version.h>
 
 #define WIREVIEW_MAGIC   0x57565032  /* "WVP2" */
-#define WIREVIEW_VERSION 2
+#define WIREVIEW_VERSION 3          /* v3 appends energy_uj */
+#define WIREVIEW_VERSION_V2 2       /* still accepted, without energy */
 #define WIREVIEW_STALE_MS 5000
+
+/* energy_uj of a v2 frame; any negative value means "not available" */
+#define WIREVIEW_ENERGY_NA S64_MIN
 
 /* Package version, injected by the build (-DWIREVIEW_PKG_VERSION="x.y.z"). */
 #ifndef WIREVIEW_PKG_VERSION
@@ -46,9 +50,15 @@ struct wireview_hwmon_data {
 	__u16 fault_status;        /* active fault bitmask */
 	__u16 fault_log;           /* historical fault bitmask */
 	__u16 _pad;
+	/* v3 only: energy (uJ), monotonic since daemon start */
+	__s64 energy_uj;
 } __packed;
 
-static_assert(sizeof(struct wireview_hwmon_data) == 148, "struct size mismatch");
+/* A v2 frame is the v3 struct without the trailing energy_uj. */
+#define WIREVIEW_DATA_V2_SIZE offsetof(struct wireview_hwmon_data, energy_uj)
+
+static_assert(WIREVIEW_DATA_V2_SIZE == 148, "v2 struct size mismatch");
+static_assert(sizeof(struct wireview_hwmon_data) == 156, "v3 struct size mismatch");
 
 struct wireview_priv {
 	struct mutex lock;
@@ -83,16 +93,20 @@ static ssize_t wireview_misc_write(struct file *filp, const char __user *buf,
 						  struct wireview_priv, misc);
 	struct wireview_hwmon_data tmp;
 
-	if (count != sizeof(tmp))
+	if (count != WIREVIEW_DATA_V2_SIZE && count != sizeof(tmp))
 		return -EINVAL;
 
-	if (copy_from_user(&tmp, buf, sizeof(tmp)))
+	if (copy_from_user(&tmp, buf, count))
 		return -EFAULT;
 
 	if (tmp.magic != WIREVIEW_MAGIC)
 		return -EINVAL;
 
-	if (tmp.version != WIREVIEW_VERSION)
+	/* The version must match the size actually written. */
+	if (tmp.version == WIREVIEW_VERSION_V2 &&
+	    count == WIREVIEW_DATA_V2_SIZE)
+		tmp.energy_uj = WIREVIEW_ENERGY_NA;
+	else if (tmp.version != WIREVIEW_VERSION || count != sizeof(tmp))
 		return -EINVAL;
 
 	mutex_lock(&priv->lock);
@@ -118,6 +132,7 @@ static const struct file_operations wireview_misc_fops = {
  *            power1_cap = PSU capability, power1_alarm = over-power
  * Temps:     temp1-temp4 = Onboard In, Onboard Out, External 1, External 2;
  *            tempN_alarm on all
+ * Energy:    energy1 = Total (from v3 frames only)
  * Fan:       pwm1 = fan duty 0-255;
  *            fan1_input = fan duty 0-100 (deprecated, use pwm1)
  * Intrusion: intrusion0_alarm = any active fault,
@@ -174,6 +189,10 @@ static const char * const power_labels[] = {
 
 static const char * const temp_labels[] = {
 	"Onboard In", "Onboard Out", "External 1", "External 2"
+};
+
+static const char * const energy_labels[] = {
+	"Total"
 };
 
 /* ---- extra sysfs attributes ---- */
@@ -280,6 +299,10 @@ static umode_t wireview_is_visible(const void *drvdata,
 		if (attr == hwmon_fan_input)
 			return 0444;
 		break;
+	case hwmon_energy:
+		if (attr == hwmon_energy_input || attr == hwmon_energy_label)
+			return 0444;
+		break;
 	case hwmon_pwm:
 		if (attr == hwmon_pwm_input)
 			return 0444;
@@ -368,6 +391,13 @@ static int wireview_read(struct device *dev, enum hwmon_sensor_types type,
 		else
 			*val = priv->data.temp_mc[channel];
 		break;
+	case hwmon_energy:
+		/* long is 32 bits on 32-bit kernels: saturate, don't wrap */
+		if (priv->data.energy_uj < 0)
+			ret = -ENODATA;
+		else
+			*val = min_t(s64, priv->data.energy_uj, LONG_MAX);
+		break;
 	case hwmon_fan:
 		/*
 		 * Deprecated, use pwm1: fan duty 0-100 reported as "RPM" so
@@ -413,6 +443,9 @@ static int wireview_read_string(struct device *dev,
 	case hwmon_temp:
 		*str = temp_labels[channel];
 		break;
+	case hwmon_energy:
+		*str = energy_labels[channel];
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -457,6 +490,8 @@ static const struct hwmon_channel_info * const wireview_info[] = {
 		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_ALARM,   /* temp2: Onboard Out */
 		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_ALARM,   /* temp3: External 1 */
 		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_ALARM),  /* temp4: External 2 */
+	HWMON_CHANNEL_INFO(energy,
+		HWMON_E_INPUT | HWMON_E_LABEL),  /* energy1: Total */
 	HWMON_CHANNEL_INFO(fan,
 		HWMON_F_INPUT),                  /* fan1: duty %, deprecated */
 	HWMON_CHANNEL_INFO(pwm,
