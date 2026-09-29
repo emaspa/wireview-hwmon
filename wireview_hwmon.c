@@ -58,8 +58,6 @@ struct wireview_priv {
 	struct miscdevice misc;
 };
 
-static struct wireview_priv *wireview_global;
-
 /*
  * True if a frame has arrived and is recent enough to report, so readers
  * stop serving the last frame once the daemon/device goes away.
@@ -80,11 +78,10 @@ static bool wireview_data_fresh(struct wireview_priv *priv)
 static ssize_t wireview_misc_write(struct file *filp, const char __user *buf,
 				   size_t count, loff_t *ppos)
 {
-	struct wireview_priv *priv = wireview_global;
+	/* misc_open() stores our struct miscdevice in private_data. */
+	struct wireview_priv *priv = container_of(filp->private_data,
+						  struct wireview_priv, misc);
 	struct wireview_hwmon_data tmp;
-
-	if (!priv)
-		return -ENODEV;
 
 	if (count != sizeof(tmp))
 		return -EINVAL;
@@ -397,6 +394,12 @@ static int wireview_probe(struct platform_device *pdev)
 	mutex_init(&priv->lock);
 	platform_set_drvdata(pdev, priv);
 
+	/*
+	 * hwmon first: until misc_register() nothing can write a frame, and
+	 * the hwmon callbacks only need the lock and data_valid (false), both
+	 * set up above. The misc device goes last because a write can arrive
+	 * the moment it is registered.
+	 */
 	hwmon_dev = devm_hwmon_device_register_with_info(&pdev->dev,
 							 "wireview",
 							 priv,
@@ -412,8 +415,6 @@ static int wireview_probe(struct platform_device *pdev)
 	ret = misc_register(&priv->misc);
 	if (ret)
 		return ret;
-
-	wireview_global = priv;
 
 	dev_info(&pdev->dev, "WireView hwmon driver loaded\n");
 	return 0;
@@ -432,7 +433,6 @@ static void wireview_remove(struct platform_device *pdev)
 {
 	struct wireview_priv *priv = platform_get_drvdata(pdev);
 
-	wireview_global = NULL;
 	misc_deregister(&priv->misc);
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	return 0;
@@ -442,6 +442,13 @@ static void wireview_remove(struct platform_device *pdev)
 static struct platform_driver wireview_driver = {
 	.driver = {
 		.name = "wireview_hwmon",
+		/*
+		 * An open /dev/wireview-hwmon holds a pointer into priv and pins
+		 * the module, but not the binding: a sysfs unbind would free
+		 * priv under the daemon's open file. Only module unload may
+		 * remove the device.
+		 */
+		.suppress_bind_attrs = true,
 	},
 	.probe = wireview_probe,
 	.remove = wireview_remove,
