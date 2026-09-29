@@ -6,11 +6,66 @@ After=local-fs.target
 Type=simple
 # The hwmon module is a self-registering platform driver with no modalias, so
 # nothing autoloads it. Pull it in before the daemon starts; ignored if the
-# module isn't installed.
-ExecStartPre=-/sbin/modprobe wireview_hwmon
+# module isn't installed. The "+" prefix runs modprobe outside the sandbox
+# below (ProtectKernelModules= and the empty capability set would block it).
+ExecStartPre=-+/sbin/modprobe wireview_hwmon
 ExecStart=/usr/local/bin/wireviewd
 Restart=on-failure
 RestartSec=5
+
+# --- Sandboxing ---
+# wireviewd runs as root but needs no capabilities: every file and device
+# node it touches is root-owned. (A port= below 1024 in /etc/wireview/config
+# would need CAP_NET_BIND_SERVICE; the default 9876 does not.) It needs write
+# access to only three places:
+#  - /run: the command socket is /run/wireviewd.sock (a fixed path shared with
+#    the GUI app). The daemon unlinks and re-binds it on every reconnect, so
+#    the whole directory has to be writable, not just the socket file.
+#  - /var/log/wireview: the daily audit log, set up by LogsDirectory=.
+#  - two device nodes, set up by DevicePolicy=closed plus DeviceAllow=:
+#    char-ttyACM is the CDC-ACM serial class (major 166) that the WireView
+#    enumerates as. char-misc (major 10) covers /dev/wireview-hwmon, a misc
+#    device with a dynamic minor. A path entry would be resolved when the
+#    unit starts, before ExecStartPre= has loaded the module, and would go
+#    stale if the module is reloaded, so it is not used. The daemon only
+#    writes to that node, so misc devices get "w" and not "rw". The kernel
+#    checks the device list on access() as well as open(), so a blocked node
+#    shows up as "/dev/wireview-hwmon not available" in the journal.
+# /etc/wireview (config and HMAC secret) stays read-only.
+ProtectSystem=strict
+ReadWritePaths=/run
+LogsDirectory=wireview
+LogsDirectoryMode=0750
+ConfigurationDirectory=wireview
+ConfigurationDirectoryMode=0700
+ProtectHome=yes
+PrivateUsers=yes
+PrivateTmp=yes
+UMask=0077
+DevicePolicy=closed
+DeviceAllow=char-ttyACM rw
+DeviceAllow=char-misc w
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
