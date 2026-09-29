@@ -1,17 +1,56 @@
 /*
- * Unit tests for wireviewd's pure helpers.
+ * Unit tests for wireviewd's helpers: JSON/base64/HTTP parsing, HMAC, the
+ * hwmon record (v3 with energy, v2 fallback), energy integration, the
+ * GET /sensors and /metrics bodies, the config file and the listener.
  *
  * wireviewd.c is one file of static functions, so it is compiled into this
  * test directly with its main() renamed out of the way.
  *
  * SPDX-License-Identifier: GPL-2.0
  */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <unistd.h>
+
+/* write() of exactly this many bytes fails with EINVAL, as a pre-v3
+ * wireview_hwmon module rejects a v3 record; -1 = never. Every other
+ * write goes through. */
+static long g_write_einval_len = -1;
+
+static ssize_t test_write(int fd, const void *buf, size_t n)
+{
+	if ((long)n == g_write_einval_len) {
+		errno = EINVAL;
+		return -1;
+	}
+	return write(fd, buf, n);
+}
+
+/* load_config() reads CONFIG_PATH; make it a variable the test points at
+ * its own temp files (the Makefile default is under /nonexistent). */
+static char test_config_path[256] = "/nonexistent/wireview-config";
+#undef CONFIG_PATH
+#define CONFIG_PATH test_config_path
+
+#define write test_write
 #define main wireviewd_main
 #include "../wireviewd.c"
 #undef main
+#undef write
 
 #include <stddef.h>
 #include "check.h"
+
+/* Run stmt with stdout sent to /dev/null (the daemon's status lines). */
+#define QUIET_OUT(stmt) do {						\
+	fflush(stdout);							\
+	int saved_o_ = dup(1);						\
+	int null_o_ = open("/dev/null", O_WRONLY);			\
+	if (null_o_ >= 0) { dup2(null_o_, 1); close(null_o_); }		\
+	stmt;								\
+	fflush(stdout);							\
+	if (saved_o_ >= 0) { dup2(saved_o_, 1); close(saved_o_); }	\
+} while (0)
 
 /* ---- json_escape ---- */
 
@@ -352,8 +391,23 @@ static void test_frame(void)
 
 static void test_write_hwmon(void)
 {
-	/* The kernel module accepts v2 (148 bytes) and may grow to v3 (156). */
-	CHECK(sizeof(struct hwmon_data) == 148 || sizeof(struct hwmon_data) == 156);
+	/* v3 record: the v2 layout (148 bytes) plus int64 energy_uj. */
+	CHECK_EQ_INT(sizeof(struct hwmon_data), 156);
+	CHECK_EQ_INT(WIREVIEW_VERSION, 3);
+	CHECK_EQ_INT(HWMON_V2_SIZE, 148);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, voltage_mv), 8);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, current_ma), 32);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, total_power_uw), 56);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, temp_mc), 64);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, pin_power_uw), 80);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, total_current_ma), 128);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, vdd_mv), 136);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, fan_duty), 140);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, fault_log), 144);
+	CHECK_EQ_INT(offsetof(struct hwmon_data, energy_uj), 148);
+
+	g_hwmon_v2 = 0;
+	g_energy_uj = 0x0102030405060708LL;
 
 	struct sensor_struct ss;
 	memset(&ss, 0, sizeof(ss));
@@ -387,7 +441,17 @@ static void test_write_hwmon(void)
 	/* Second frame: the extremes of the temperature range. */
 	ss.ts[0] = 2000;
 	ss.ts[1] = INT16_MIN;
+	g_energy_uj = INT64_MAX;
 	CHECK_EQ_INT(write_hwmon(fd, &ss), 0);
+
+	/* One write() per frame, the whole 156-byte record; energy_uj is
+	 * little-endian at offset 148. */
+	uint8_t rec[156];
+	CHECK_EQ_INT(pread(fd, rec, sizeof(rec), 0), 156);
+	static const uint8_t energy_le[8] = { 8, 7, 6, 5, 4, 3, 2, 1 };
+	CHECK_EQ_MEM(rec + 148, energy_le, 8);
+	CHECK_EQ_INT(rec[4], 3);	/* version, little-endian u32 */
+	CHECK(rec[5] == 0 && rec[6] == 0 && rec[7] == 0);
 
 	struct hwmon_data hd[2];
 	CHECK_EQ_INT(lseek(fd, 0, SEEK_END), 2 * (off_t)sizeof(struct hwmon_data));
@@ -423,6 +487,10 @@ static void test_write_hwmon(void)
 	CHECK_EQ_INT(hd[0].psu_cap, 2);
 	CHECK_EQ_INT(hd[0].fault_status, 0x0102);
 	CHECK_EQ_INT(hd[0].fault_log, 0x8001);
+	CHECK_EQ_INT(hd[0]._pad, 0);
+	CHECK_EQ_INT(hd[0].energy_uj, 0x0102030405060708LL);
+	CHECK_EQ_INT(hd[1].version, 3);
+	CHECK_EQ_INT(hd[1].energy_uj, INT64_MAX);
 
 	/* A full-scale reading must not overflow the 64-bit sums. */
 	for (int i = 0; i < 6; i++) {
@@ -433,13 +501,515 @@ static void test_write_hwmon(void)
 	CHECK_EQ_INT(write_hwmon(fd, &ss), 0);
 	close(fd);
 
-	/* A short write is an error. */
+	/* A short write is an error, and not a reason to fall back to v2. */
 	fd = open("/dev/full", O_WRONLY);
 	if (fd >= 0) {
 		CHECK_EQ_INT(write_hwmon(fd, &ss), -1);
+		CHECK_EQ_INT(g_hwmon_v2, 0);
 		close(fd);
 	}
+
+	/* A pre-v3 module rejects the 156-byte record with EINVAL: the same
+	 * frame goes out as a 148-byte v2 record at once, and so do the
+	 * following ones without trying v3 again. */
+	char path2[] = "/tmp/wireview-test-hwmon-XXXXXX";
+	fd = mkstemp(path2);
+	CHECK(fd >= 0);
+	if (fd < 0)
+		return;
+	unlink(path2);
+	ss.pins[0].voltage = 12000;
+	ss.pins[0].current = 8000;
+	g_energy_uj = 42;
+	g_write_einval_len = (long)sizeof(struct hwmon_data);
+	QUIET_OUT(CHECK_EQ_INT(write_hwmon(fd, &ss), 0));
+	CHECK_EQ_INT(g_hwmon_v2, 1);
+	g_write_einval_len = -1;
+	CHECK_EQ_INT(write_hwmon(fd, &ss), 0);	/* v3 would fit now; stays v2 */
+	CHECK_EQ_INT(lseek(fd, 0, SEEK_END), 2 * 148);
+
+	uint8_t v2[2][148];
+	CHECK_EQ_INT(pread(fd, v2, sizeof(v2), 0), (ssize_t)sizeof(v2));
+	for (int k = 0; k < 2; k++) {
+		struct hwmon_data h;
+		memset(&h, 0xEE, sizeof(h));
+		memcpy(&h, v2[k], 148);
+		CHECK_EQ_INT(h.magic, WIREVIEW_MAGIC);
+		CHECK_EQ_INT(h.version, 2);
+		CHECK_EQ_INT(h.voltage_mv[0], 12000);
+		CHECK_EQ_INT(h.current_ma[0], 8000);
+		CHECK_EQ_INT(h.vdd_mv, 3300);
+		CHECK_EQ_INT(h.fan_duty, 42);
+	}
+	/* A v2-only module that rejects the v2 record too: an error. */
+	g_write_einval_len = 148;
+	CHECK_EQ_INT(write_hwmon(fd, &ss), -1);
+	g_write_einval_len = -1;
+	close(fd);
+	g_hwmon_v2 = 0;
+	g_energy_uj = 0;
 }
+
+/* ---- energy integration ---- */
+
+static void energy_reset(void)
+{
+	g_energy_uj = 0;
+	g_energy_frac = 0;
+	g_energy_ts_valid = 0;
+}
+
+static void test_energy(void)
+{
+	energy_reset();
+	/* 1 W for 1.5 s = 1.5 J. */
+	energy_add(1000000, 1500000000LL);
+	CHECK_EQ_INT(g_energy_uj, 1500000);
+
+	/* Sub-microjoule steps carry over exactly: 3 uW * 0.4 s = 1.2 uJ. */
+	energy_reset();
+	energy_add(3, 400000000LL);
+	CHECK_EQ_INT(g_energy_uj, 1);
+	energy_add(3, 400000000LL);
+	CHECK_EQ_INT(g_energy_uj, 2);
+	energy_add(3, 400000000LL);
+	CHECK_EQ_INT(g_energy_uj, 3);	/* 3.6 */
+	energy_add(3, 400000000LL);
+	CHECK_EQ_INT(g_energy_uj, 4);	/* 4.8 */
+	energy_add(1, 200000000LL);
+	CHECK_EQ_INT(g_energy_uj, 5);	/* 5.0: the remainders add up */
+	CHECK_EQ_INT(g_energy_frac, 0);
+
+	/* Both factors past 1e9: 2.5 kW for 2.5 s = 6250 J. */
+	energy_reset();
+	energy_add(2500000000LL, 2500000000LL);
+	CHECK_EQ_INT(g_energy_uj, 6250000000LL);
+
+	/* Zero, negative power and non-positive time add nothing. */
+	energy_reset();
+	energy_add(0, 1000000000LL);
+	energy_add(-5000000, 1000000000LL);
+	energy_add(1000000, 0);
+	energy_add(1000000, -1);
+	CHECK_EQ_INT(g_energy_uj, 0);
+
+	/* Saturates at INT64_MAX instead of wrapping. */
+	g_energy_uj = INT64_MAX - 10;
+	energy_add(1000000, 1000000000LL);
+	CHECK_EQ_INT(g_energy_uj, INT64_MAX);
+	energy_add(1000000, 1000000000LL);
+	CHECK_EQ_INT(g_energy_uj, INT64_MAX);
+	energy_reset();
+	energy_add(INT64_MAX, 3000000000LL);
+	CHECK_EQ_INT(g_energy_uj, INT64_MAX);
+
+	/* energy_accumulate: the first frame only starts the clock; a frame
+	 * within max_gap integrates its power over the elapsed time; one
+	 * after a longer gap only restarts the clock. */
+	struct sensor_struct ss;
+	memset(&ss, 0, sizeof(ss));
+	for (int i = 0; i < 6; i++) {
+		ss.pins[i].voltage = 12000;
+		ss.pins[i].current = 8000;	/* 6 x 96 W = 576 W */
+	}
+	CHECK_EQ_INT(frame_power_uw(&ss), 576000000LL);
+	energy_reset();
+	energy_accumulate(&ss, 5000);
+	CHECK_EQ_INT(g_energy_uj, 0);
+	CHECK(g_energy_ts_valid);
+	g_energy_ts.tv_sec -= 1;		/* pretend 1 s passed */
+	energy_accumulate(&ss, 5000);
+	/* 576 J, plus the few microseconds the test itself took. */
+	CHECK(g_energy_uj >= 576000000LL && g_energy_uj < 577000000LL);
+	int64_t before = g_energy_uj;
+	g_energy_ts.tv_sec -= 6;		/* a 6 s gap */
+	energy_accumulate(&ss, 5000);
+	CHECK_EQ_INT(g_energy_uj, before);
+	energy_reset();
+}
+
+/* ---- GET /sensors body ---- */
+
+static void test_sensors_json(void)
+{
+	static char out[4096];
+	int n;
+
+	/* No frame yet: an empty device list. */
+	g_have_last = 0;
+	dev_info.valid = 0;
+	n = build_sensors_json(out, sizeof(out));
+	CHECK(n > 0 && (size_t)n < sizeof(out));
+	CHECK(strstr(out, "\"appVersion\":\"wireviewd\",\"devices\":[]}") != NULL);
+
+	memset(&g_last, 0, sizeof(g_last));
+	for (int i = 0; i < 6; i++) {
+		g_last.pins[i].voltage = 12000;
+		g_last.pins[i].current = 8000;
+	}
+	g_last.ts[0] = 355;
+	g_last.ts[1] = -400;
+	g_last.ts[2] = 2001;
+	g_last.ts[3] = -401;
+	g_last.fan_duty = 42;
+	g_last.hpwr_cap = 1;
+	g_last.fault_status = 3;
+	g_last.fault_log = 256;
+	memset(&dev_info, 0, sizeof(dev_info));
+	dev_info.fw_version = 7;
+	for (int i = 0; i < 12; i++)
+		dev_info.uid[i] = (uint8_t)(0xA1 + i);
+	snprintf(dev_info.build_string, sizeof(dev_info.build_string), "say \"hi\"");
+	dev_info.valid = 1;
+	g_have_last = 1;
+	g_energy_uj = 12345678901LL;
+
+	n = build_sensors_json(out, sizeof(out));
+	CHECK(n > 0 && (size_t)n < sizeof(out));
+	CHECK(strstr(out, "\"id\":\"A1A2A3A4A5A6A7A8A9AAABAC\"") != NULL);
+	CHECK(strstr(out, "\"fwVer\":\"7\",\"buildString\":\"say \\\"hi\\\"\"") != NULL);
+	CHECK(strstr(out, "\"tempInC\":35.5,\"tempOutC\":-40.0,\"ext1C\":0.0,\"ext2C\":0.0") != NULL);
+	CHECK(strstr(out, "\"psuCapW\":450,\"fan\":42,\"faultStatus\":3,\"faultLog\":256") != NULL);
+	CHECK(strstr(out, "\"sumCurrentA\":48.000,\"sumPowerW\":576.000") != NULL);
+	/* Energy in joules, the last key. */
+	CHECK(strstr(out, "\"energyJ\":12345.679}]}") != NULL);
+
+	g_have_last = 0;
+	dev_info.valid = 0;
+	g_energy_uj = 0;
+}
+
+/* ---- GET /metrics ---- */
+
+static void test_prom_escape(void)
+{
+	char out[64];
+
+	prom_escape("plain-1.0 build", out, sizeof(out));
+	CHECK_EQ_STR(out, "plain-1.0 build");
+	/* Backslash, quote and newline are escaped; other control bytes and
+	 * non-ASCII become '?'. */
+	prom_escape("a\\b\"c\nd\te\r\x01\x7f\xc3\xa9", out, sizeof(out));
+	CHECK_EQ_STR(out, "a\\\\b\\\"c\\nd?e??\x7f??");
+	prom_escape("", out, sizeof(out));
+	CHECK_EQ_STR(out, "");
+
+	memset(out, 'Z', 4);
+	prom_escape("abc", out, 0);
+	CHECK(out[0] == 'Z');
+
+	/* Truncation never splits an escape: "ab\"" needs 5 bytes. */
+	prom_escape("ab\"", out, 4);
+	CHECK_EQ_STR(out, "ab");
+	prom_escape("ab\"", out, 5);
+	CHECK_EQ_STR(out, "ab\\\"");
+	prom_escape("\n\n", out, 4);
+	CHECK_EQ_STR(out, "\\n");
+	prom_escape("xyz", out, 1);
+	CHECK_EQ_STR(out, "");
+}
+
+static void test_metrics(void)
+{
+	static char body[16384];
+	struct outbuf ob;
+
+	/* Never seen a device: an unlabelled wireview_up 0 and nothing else. */
+	g_dev_uid[0] = '\0';
+	g_serial_fd = -1;
+	g_have_last = 0;
+	dev_info.valid = 0;
+	ob = (struct outbuf){ .p = body, .cap = sizeof(body) };
+	CHECK_EQ_INT(build_metrics(&ob), 0);
+	CHECK_EQ_STR(body, "# HELP wireview_up 1 if the device is connected and reporting, else 0.\n"
+		     "# TYPE wireview_up gauge\nwireview_up 0\n");
+
+	/* Device gone after one was seen: labelled with its UID. */
+	snprintf(g_dev_uid, sizeof(g_dev_uid), "A1A2A3A4A5A6A7A8A9AAABAC");
+	ob = (struct outbuf){ .p = body, .cap = sizeof(body) };
+	CHECK_EQ_INT(build_metrics(&ob), 0);
+	CHECK(strstr(body, "\nwireview_up{device=\"A1A2A3A4A5A6A7A8A9AAABAC\"} 0\n") != NULL);
+	CHECK(strstr(body, "wireview_pin") == NULL);
+
+	/* Connected. */
+	memset(&g_last, 0, sizeof(g_last));
+	for (int i = 0; i < 6; i++) {
+		g_last.pins[i].voltage = 12000;
+		g_last.pins[i].current = 8000;
+	}
+	g_last.pins[5].voltage = -5;
+	g_last.ts[0] = 355;
+	g_last.ts[1] = 2001;	/* disconnected: omitted */
+	g_last.ts[2] = -400;
+	g_last.ts[3] = -401;	/* disconnected: omitted */
+	g_last.vdd = 3300;
+	g_last.fan_duty = 42;
+	g_last.hpwr_cap = 2;
+	g_last.total_current = 48000;
+	g_last.avg_voltage = 12001;
+	g_last.fault_status = 0x21;	/* chip_over_temp, current_imbalance */
+	g_last.fault_log = 0x8001;
+	memset(&dev_info, 0, sizeof(dev_info));
+	dev_info.fw_version = 7;
+	snprintf(dev_info.build_string, sizeof(dev_info.build_string),
+		 "b\"1\\2\n3\xff");
+	dev_info.valid = 1;
+	g_have_last = 1;
+	g_serial_fd = 1000;	/* only compared with -1 here */
+	g_energy_uj = 1234567891LL;
+
+	ob = (struct outbuf){ .p = body, .cap = sizeof(body) };
+	CHECK_EQ_INT(build_metrics(&ob), 0);
+	CHECK_EQ_INT(strlen(body), ob.len);
+	const char *d = "{device=\"A1A2A3A4A5A6A7A8A9AAABAC\"";
+	char want[256];
+#define HAS(...) do {							\
+		snprintf(want, sizeof(want), __VA_ARGS__);		\
+		CHECK(strstr(body, want) != NULL);			\
+		if (!strstr(body, want))				\
+			fprintf(stderr, "  missing: %s", want);		\
+	} while (0)
+	HAS("\nwireview_up%s} 1\n", d);
+	HAS("\nwireview_pin_voltage_volts%s,pin=\"1\"} 12.000\n", d);
+	HAS("\nwireview_pin_voltage_volts%s,pin=\"6\"} -0.005\n", d);
+	HAS("\nwireview_pin_current_amps%s,pin=\"6\"} 8.000\n", d);
+	HAS("\nwireview_pin_power_watts%s,pin=\"1\"} 96.000\n", d);
+	HAS("\nwireview_pin_power_watts%s,pin=\"6\"} -0.040\n", d);
+	HAS("\nwireview_power_watts%s} 479.960\n", d);
+	HAS("\nwireview_current_amps%s} 48.000\n", d);
+	HAS("\nwireview_voltage_average_volts%s} 12.001\n", d);
+	HAS("\nwireview_vdd_volts%s} 3.300\n", d);
+	HAS("\nwireview_temperature_celsius%s,sensor=\"onboard_in\"} 35.5\n", d);
+	HAS("\nwireview_temperature_celsius%s,sensor=\"external_1\"} -40.0\n", d);
+	CHECK(strstr(body, "sensor=\"onboard_out\"") == NULL);
+	CHECK(strstr(body, "sensor=\"external_2\"") == NULL);
+	HAS("\nwireview_fan_duty_ratio%s} 0.42\n", d);
+	HAS("\nwireview_psu_cap_watts%s} 300\n", d);
+	HAS("\nwireview_fault_status%s} 33\n", d);
+	HAS("\nwireview_fault_log%s} 32769\n", d);
+	HAS("\nwireview_fault_active%s,fault=\"chip_over_temp\"} 1\n", d);
+	HAS("\nwireview_fault_active%s,fault=\"over_current\"} 0\n", d);
+	HAS("\nwireview_fault_active%s,fault=\"current_imbalance\"} 1\n", d);
+	HAS("# TYPE wireview_energy_joules_total counter\n"
+	    "wireview_energy_joules_total%s} 1234.567891\n", d);
+	/* The build string is escaped as a label value. */
+	HAS("\nwireview_firmware_info%s,version=\"7\",build=\"b\\\"1\\\\2\\n3?\"} 1\n", d);
+#undef HAS
+	/* Every sample line belongs to a family declared just before it. */
+	CHECK(strncmp(body, "# HELP wireview_up ", 19) == 0);
+	CHECK(body[strlen(body) - 1] == '\n');
+
+	/* A body that does not fit is refused, not torn. */
+	static char small[512];
+	ob = (struct outbuf){ .p = small, .cap = sizeof(small) };
+	CHECK_EQ_INT(build_metrics(&ob), -1);
+	CHECK(ob.overflow);
+	CHECK(ob.len < sizeof(small));
+
+	g_serial_fd = -1;
+	g_have_last = 0;
+	dev_info.valid = 0;
+	g_dev_uid[0] = '\0';
+	g_energy_uj = 0;
+}
+
+/* ---- config file and the listener address ---- */
+
+static void write_config(const char *text)
+{
+	FILE *f = fopen(test_config_path, "w");
+	if (!f) {
+		perror(test_config_path);
+		return;
+	}
+	fputs(text, f);
+	fclose(f);
+}
+
+/* load_config() only resets the listener flag and the secret; the rest
+ * keep their compiled-in defaults unless set, so reset them per case. */
+static void config_defaults(void)
+{
+	g_http_enabled = 0;
+	g_http_port = HTTP_PORT;
+	g_bind_addr[0] = '\0';
+	g_log_retain_days = 14;
+	g_secret[0] = '\0';
+}
+
+static void test_load_config(void)
+{
+	char dir[] = "/tmp/wireview-test-config-XXXXXX";
+	if (!mkdtemp(dir)) {
+		perror("mkdtemp");
+		CHECK(0);
+		return;
+	}
+	snprintf(test_config_path, sizeof(test_config_path), "%s/config", dir);
+	unsetenv("WIREVIEW_SECRET");
+	unsetenv("WIREVIEW_LISTEN");
+
+	/* No file: listener off, no secret, defaults. */
+	config_defaults();
+	load_config();
+	CHECK_EQ_INT(g_http_enabled, 0);
+	CHECK_EQ_STR(g_secret, "");
+	CHECK_EQ_INT(g_http_port, 9876);
+	CHECK_EQ_STR(g_bind_addr, "");
+
+	/* The sample's defaults, then every key set. */
+	write_config("# comment\n\nremote_enabled=0\nport=9876\n#bind=\n#secret=\nlog_days=14\n");
+	config_defaults();
+	load_config();
+	CHECK_EQ_INT(g_http_enabled, 0);
+	CHECK_EQ_STR(g_secret, "");
+	CHECK_EQ_STR(g_bind_addr, "");
+
+	write_config("remote_enabled=1\r\n"
+		     "  port=19876  \n"
+		     "bind=127.0.0.1\n"
+		     "secret= s3cret pass \t\n"
+		     "log_days=3\n");
+	config_defaults();
+	load_config();
+	CHECK_EQ_INT(g_http_enabled, 1);
+	CHECK_EQ_INT(g_http_port, 19876);
+	CHECK_EQ_STR(g_bind_addr, "127.0.0.1");
+	CHECK_EQ_STR(g_secret, "s3cret pass");	/* inner space kept */
+	CHECK_EQ_INT(g_log_retain_days, 3);
+
+	/* Truthy spellings, an IPv6 bind, out-of-range ports ignored, the
+	 * first secret wins, a bare line is a secret only if none is set. */
+	static const struct { const char *v; int on; } truthy_cases[] = {
+		{ "1", 1 }, { "true", 1 }, { "Yes", 1 }, { "y", 1 },
+		{ "0", 0 }, { "false", 0 }, { "no", 0 }, { "", 0 }, { "on", 0 },
+	};
+	for (size_t i = 0; i < sizeof(truthy_cases) / sizeof(truthy_cases[0]); i++) {
+		char text[64];
+		snprintf(text, sizeof(text), "remote_enabled=%s\n", truthy_cases[i].v);
+		write_config(text);
+		config_defaults();
+		load_config();
+		CHECK_EQ_INT(g_http_enabled, truthy_cases[i].on);
+	}
+
+	write_config("bind=::1\nport=0\nport=70000\nport=abc\nsecret=first\nsecret=second\nbare\n");
+	config_defaults();
+	load_config();
+	CHECK_EQ_STR(g_bind_addr, "::1");
+	CHECK_EQ_INT(g_http_port, 9876);
+	CHECK_EQ_STR(g_secret, "first");
+
+	write_config("legacy-passphrase\nremote_enabled=1\n");
+	config_defaults();
+	load_config();
+	CHECK_EQ_STR(g_secret, "legacy-passphrase");
+	CHECK_EQ_INT(g_http_enabled, 1);
+
+	/* A later bind= replaces an earlier one; an empty one means all. */
+	write_config("bind=10.0.0.1\nbind=\n");
+	config_defaults();
+	load_config();
+	CHECK_EQ_STR(g_bind_addr, "");
+
+	/* The environment wins over the file. */
+	write_config("remote_enabled=1\nsecret=file\n");
+	setenv("WIREVIEW_SECRET", "env", 1);
+	setenv("WIREVIEW_LISTEN", "0", 1);
+	config_defaults();
+	load_config();
+	CHECK_EQ_STR(g_secret, "env");
+	CHECK_EQ_INT(g_http_enabled, 0);
+	setenv("WIREVIEW_SECRET", "", 1);	/* empty: the file's */
+	setenv("WIREVIEW_LISTEN", "1", 1);
+	write_config("secret=file\n");
+	config_defaults();
+	load_config();
+	CHECK_EQ_STR(g_secret, "file");
+	CHECK_EQ_INT(g_http_enabled, 1);
+	unsetenv("WIREVIEW_SECRET");
+	unsetenv("WIREVIEW_LISTEN");
+
+	unlink(test_config_path);
+	rmdir(dir);
+	snprintf(test_config_path, sizeof(test_config_path), "/nonexistent/wireview-config");
+	config_defaults();
+}
+
+static void test_setup_http(void)
+{
+	char desc[256];
+	struct sockaddr_storage sa;
+	socklen_t len;
+	int fd;
+
+	config_defaults();
+	g_http_port = 0;	/* ephemeral: never collides with a live daemon */
+
+	/* bind=127.0.0.1: IPv4 loopback only. */
+	snprintf(g_bind_addr, sizeof(g_bind_addr), "127.0.0.1");
+	fd = setup_http(desc, sizeof(desc));
+	CHECK(fd >= 0);
+	CHECK_EQ_STR(desc, "127.0.0.1:0");
+	if (fd >= 0) {
+		len = sizeof(sa);
+		CHECK_EQ_INT(getsockname(fd, (struct sockaddr *)&sa, &len), 0);
+		CHECK_EQ_INT(sa.ss_family, AF_INET);
+		CHECK_EQ_INT(ntohl(((struct sockaddr_in *)&sa)->sin_addr.s_addr),
+			     INADDR_LOOPBACK);
+		CHECK(fcntl(fd, F_GETFL) & O_NONBLOCK);
+		CHECK(fcntl(fd, F_GETFD) & FD_CLOEXEC);
+		close(fd);
+	}
+
+	/* bind=::1: IPv6 loopback (skipped on hosts without IPv6). */
+	snprintf(g_bind_addr, sizeof(g_bind_addr), "::1");
+	fd = setup_http(desc, sizeof(desc));
+	CHECK_EQ_STR(desc, "[::1]:0");
+	if (fd >= 0) {
+		len = sizeof(sa);
+		CHECK_EQ_INT(getsockname(fd, (struct sockaddr *)&sa, &len), 0);
+		CHECK_EQ_INT(sa.ss_family, AF_INET6);
+		CHECK(IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *)&sa)->sin6_addr));
+		close(fd);
+	} else {
+		CHECK(errno == EADDRNOTAVAIL || errno == EAFNOSUPPORT);
+	}
+
+	/* Not a numeric address: refused, never widened to all addresses. */
+	static const char *const bad[] = { "localhost", "0.0.0.0.0", "1.2.3.4:80", "[::1]" };
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		snprintf(g_bind_addr, sizeof(g_bind_addr), "%s", bad[i]);
+		errno = 0;
+		QUIET(fd = setup_http(desc, sizeof(desc)));
+		CHECK_EQ_INT(fd, -1);
+		CHECK_EQ_INT(errno, EINVAL);
+		if (fd >= 0)
+			close(fd);
+	}
+
+	/* Unset: every address, dual-stack [::] (or 0.0.0.0 without IPv6). */
+	g_bind_addr[0] = '\0';
+	fd = setup_http(desc, sizeof(desc));
+	CHECK(fd >= 0);
+	CHECK(strcmp(desc, "[::]:0") == 0 || strcmp(desc, "0.0.0.0:0") == 0);
+	if (fd >= 0) {
+		len = sizeof(sa);
+		CHECK_EQ_INT(getsockname(fd, (struct sockaddr *)&sa, &len), 0);
+		if (sa.ss_family == AF_INET6) {
+			int v6only = -1;
+			socklen_t ol = sizeof(v6only);
+			CHECK_EQ_INT(getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+						&v6only, &ol), 0);
+			CHECK_EQ_INT(v6only, 0);
+			CHECK(IN6_IS_ADDR_UNSPECIFIED(&((struct sockaddr_in6 *)&sa)->sin6_addr));
+		}
+		close(fd);
+	}
+	config_defaults();
+}
+
+
 
 int main(void)
 {
@@ -450,5 +1020,11 @@ int main(void)
 	test_hmac();
 	test_frame();
 	test_write_hwmon();
+	test_energy();
+	test_sensors_json();
+	test_prom_escape();
+	test_metrics();
+	test_load_config();
+	test_setup_http();
 	return check_summary("test_wireviewd");
 }

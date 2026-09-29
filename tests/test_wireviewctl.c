@@ -1,6 +1,8 @@
 /*
- * Unit tests for wireviewctl's parsers: the Intel HEX firmware loader, the
- * clear-faults mask parser and the remote /sensors JSON reader.
+ * Unit tests for wireviewctl: the Intel HEX firmware loader, the
+ * clear-faults mask parser, the remote /sensors JSON reader, the sysfs
+ * reader (against a fake hwmon directory via $WIREVIEW_HWMON_PATH) and
+ * the "sensors" / "sensors --json" output.
  *
  * wireviewctl.c is one file of static functions, so it is compiled into
  * this test directly with its main() renamed out of the way.
@@ -11,8 +13,13 @@
 #include "../wireviewctl.c"
 #undef main
 
+#include <ctype.h>
 #include <sys/stat.h>
 #include "check.h"
+
+#ifndef WV_SRCDIR
+#define WV_SRCDIR ".."
+#endif
 
 static char g_tmpdir[] = "/tmp/wireview-test-ctl-XXXXXX";
 
@@ -298,31 +305,90 @@ static void test_parse_remote(void)
 	int n = parse_remote("rig:9876", body, s, 4);
 	CHECK_EQ_INT(n, 2);
 
+	/* Strings, and readings converted to sysfs units (mV, mA, uW, m°C). */
 	CHECK_EQ_STR(s[0].source, "rig:9876");
 	CHECK_EQ_STR(s[0].name, "WireView Pro II");
 	CHECK_EQ_STR(s[0].fw, "7");
+	CHECK_EQ_STR(s[0].uid, "0102030405060708090A0B0C");
+	CHECK_EQ_STR(s[0].build, "FAKE build");
 	CHECK(s[0].ok == 1);
-	CHECK(s[0].pin_v[0] == 12.0 && s[0].pin_v[5] == 12.03);
-	CHECK(s[0].pin_c[1] == 8.1 && s[0].pin_c[4] == 0.0);
-	CHECK(s[0].temp[0] == 35.5 && s[0].temp[1] == 40.0);
-	CHECK(s[0].temp[2] == TEMP_NA && s[0].temp[3] == TEMP_NA);
+	static const long long mv0[6] = { 12000, 12050, 11990, 12010, 12020, 12030 };
+	static const long long ma0[6] = { 8000, 8100, 7900, 8050, 0, 8200 };
+	/* Per-pin power is V * A, rounded to the nearest uW. */
+	static const long long uw0[6] = {
+		96000000, 97605000, 94721000, 96680500, 0, 98646000
+	};
+	for (int i = 0; i < 6; i++) {
+		CHECK_EQ_INT(s[0].in_mv[i], mv0[i]);
+		CHECK_EQ_INT(s[0].curr_ma[i], ma0[i]);
+		CHECK_EQ_INT(s[0].power_uw[i + 1], uw0[i]);
+	}
+	CHECK_EQ_INT(s[0].curr_ma[6], 40250);		/* sumCurrentA */
+	CHECK_EQ_INT(s[0].power_uw[0], 483100000);	/* sumPowerW */
+	/* No average / vdd over the network; every current and power. */
+	CHECK_EQ_INT(s[0].have_in, 0x3F);
+	CHECK_EQ_INT(s[0].have_curr, 0x7F);
+	CHECK_EQ_INT(s[0].have_power, 0x7F);
+	/* Disconnected externals (0.0 from wireviewd) are absent. */
+	CHECK_EQ_INT(s[0].temp_mc[0], 35500);
+	CHECK_EQ_INT(s[0].temp_mc[1], 40000);
+	CHECK_EQ_INT(s[0].have_temp, 0x3);
 	CHECK_EQ_INT(s[0].psu_cap_w, 600);
 	CHECK_EQ_INT(s[0].fan, 42);
 	CHECK_EQ_INT(s[0].fault_status, 3);
 	CHECK_EQ_INT(s[0].fault_log, 256);
-	CHECK(s[0].sum_a == 40.25 && s[0].sum_w == 483.1);
+	CHECK(s[0].have_fault_status && s[0].have_fault_log);
+	CHECK_EQ_INT(s[0].have_energy, 0);		/* no energyJ key */
+	CHECK_EQ_INT(s[0].energy_uj, 0);
+	for (int i = 0; i < WV_NALARM; i++)
+		CHECK_EQ_INT(s[0].alarm[i], -1);	/* /sensors has none */
 
 	CHECK_EQ_STR(s[1].source, "rig:9876");
 	CHECK_EQ_STR(s[1].name, "WireView");	/* default when absent */
 	CHECK_EQ_STR(s[1].fw, "9");
-	CHECK(s[1].pin_v[0] == 1.0 && s[1].pin_v[5] == 6.0);
-	CHECK(s[1].temp[2] == TEMP_NA);		/* app sentinel */
-	CHECK(s[1].temp[3] == 25.5);
+	CHECK_EQ_STR(s[1].uid, "AA");
+	CHECK_EQ_STR(s[1].build, "");
+	CHECK(s[1].ok == 1);			/* no "connected" key */
+	CHECK_EQ_INT(s[1].in_mv[0], 1000);
+	CHECK_EQ_INT(s[1].in_mv[5], 6000);
+	CHECK_EQ_INT(s[1].curr_ma[3], 500);
+	CHECK_EQ_INT(s[1].power_uw[6], 3000000);	/* 6 V * 0.5 A */
+	/* ext1 is the app's -100 sentinel (absent), ext2 is present. */
+	CHECK_EQ_INT(s[1].have_temp, 0xB);
+	CHECK_EQ_INT(s[1].temp_mc[3], 25500);
 	CHECK_EQ_INT(s[1].fan, -1);		/* no fan key */
 	CHECK_EQ_INT(s[1].psu_cap_w, 300);
 	/* Values from the first object do not leak into the second. */
 	CHECK_EQ_INT(s[1].fault_status, 0);
-	CHECK(s[1].sum_w == 10.5);
+	CHECK_EQ_INT(s[1].power_uw[0], 10500000);
+	CHECK_EQ_INT(s[1].have_energy, 0);
+
+	/* A newer wireviewd adds energyJ; a disconnected device, negative
+	 * external temperatures and escaped strings. */
+	static const char body3[] =
+		"{\"host\":\"h\",\"appVersion\":\"wireviewd\",\"devices\":["
+		"{\"id\":\"BB\",\"name\":\"say \\\"hi\\\" C:\\\\x\",\"connected\":false,"
+		"\"fwVer\":\"8\",\"buildString\":\"\","
+		"\"pinVoltage\":[12.000,0,0,0,0,0],\"pinCurrent\":[-0.001,0,0,0,0,0],"
+		"\"tempInC\":-5.5,\"tempOutC\":0.0,\"ext1C\":-39.9,\"ext2C\":-100.0,"
+		"\"psuCapW\":0,\"fan\":0,\"faultStatus\":65535,\"faultLog\":1,"
+		"\"sumCurrentA\":0.0,\"sumPowerW\":0.0,\"energyJ\":12345.678}]}";
+	memset(s, 0xAB, sizeof(s));
+	CHECK_EQ_INT(parse_remote("h:1", body3, s, 4), 1);
+	CHECK_EQ_STR(s[0].name, "say \"hi\" C:\\x");
+	CHECK(s[0].ok == 0);
+	CHECK_EQ_INT(s[0].have_energy, 1);
+	CHECK_EQ_INT(s[0].energy_uj, 12345678000LL);	/* past 32 bits */
+	CHECK_EQ_INT(s[0].curr_ma[0], -1);		/* rounds away from 0 */
+	CHECK_EQ_INT(s[0].power_uw[1], -12000);
+	/* Onboard sensors are always present, even at 0.0. */
+	CHECK_EQ_INT(s[0].temp_mc[0], -5500);
+	CHECK_EQ_INT(s[0].temp_mc[1], 0);
+	CHECK_EQ_INT(s[0].temp_mc[2], -39900);
+	CHECK_EQ_INT(s[0].have_temp, 0x7);
+	CHECK_EQ_INT(s[0].psu_cap_w, 0);
+	CHECK_EQ_INT(s[0].fan, 0);
+	CHECK_EQ_INT(s[0].fault_status, 0xFFFF);
 
 	/* max caps the number of devices written. */
 	memset(s, 0, sizeof(s));
@@ -344,6 +410,374 @@ static void test_parse_remote(void)
 	CHECK_EQ_INT(parse_remote("h", cut, s, 4), 1);
 }
 
+/* ---- a fake hwmon sysfs directory for read_local() ---- */
+
+static char g_hwmon[PATH_MAX];
+
+static void sysfs_set(const char *attr, const char *val)
+{
+	char path[PATH_MAX];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/%s", g_hwmon, attr);
+	f = fopen(path, "w");
+	if (!f) {
+		perror(path);
+		return;
+	}
+	fprintf(f, "%s\n", val);
+	fclose(f);
+}
+
+static void sysfs_del(const char *attr)
+{
+	char path[PATH_MAX];
+
+	snprintf(path, sizeof(path), "%s/%s", g_hwmon, attr);
+	unlink(path);
+}
+
+/* A module with every attribute: pins 12.0-12.5 V, 8.0-8.5 A. */
+static void sysfs_populate(void)
+{
+	char a[32], v[32];
+
+	sysfs_set("name", "wireview");
+	for (int i = 0; i < 6; i++) {
+		snprintf(a, sizeof(a), "in%d_input", i);
+		snprintf(v, sizeof(v), "%d", 12000 + 100 * i);
+		sysfs_set(a, v);
+		snprintf(a, sizeof(a), "curr%d_input", i + 1);
+		snprintf(v, sizeof(v), "%d", 8000 + 100 * i);
+		sysfs_set(a, v);
+		snprintf(a, sizeof(a), "power%d_input", i + 2);
+		snprintf(v, sizeof(v), "%lld",
+			 (long long)(12000 + 100 * i) * (8000 + 100 * i));
+		sysfs_set(a, v);
+	}
+	sysfs_set("in6_input", "12250");	/* average */
+	sysfs_set("in7_input", "3300");		/* vdd */
+	sysfs_set("curr7_input", "49500");
+	sysfs_set("power1_input", "595000000");
+	sysfs_set("temp1_input", "35500");
+	sysfs_set("temp2_input", "-40000");
+	sysfs_set("temp4_input", "25000");	/* temp3 disconnected */
+	sysfs_set("pwm1", "107");
+	sysfs_set("fan1_input", "99");		/* deprecated, ignored */
+	sysfs_set("power1_cap", "450000000");
+	sysfs_set("psu_cap", "3");		/* deprecated, ignored */
+	sysfs_set("energy1_input", "123456789012");
+	sysfs_set("fault_status_raw", "513");
+	sysfs_set("fault_log_raw", "65535");
+	sysfs_set("intrusion0_alarm", "1");
+	sysfs_set("intrusion1_alarm", "1");
+	for (int i = 0; i < WV_NALARM; i++)
+		sysfs_set(alarm_attrs[i].attr, "0");
+	sysfs_set("temp1_alarm", "1");
+	sysfs_set("power1_alarm", "1");
+}
+
+static void test_read_local(void)
+{
+	struct wv_snap s;
+
+	snprintf(g_hwmon, sizeof(g_hwmon), "%s/hwmon7", g_tmpdir);
+	if (mkdir(g_hwmon, 0700) != 0) {
+		perror(g_hwmon);
+		CHECK(0);
+		return;
+	}
+	setenv("WIREVIEW_HWMON_PATH", g_hwmon, 1);
+
+	/* No "name" file: not a hwmon device, and no fallback to the real
+	 * /sys/class/hwmon scan. */
+	CHECK_EQ_INT(read_local(&s), -1);
+
+	sysfs_populate();
+	memset(&s, 0xAB, sizeof(s));
+	CHECK_EQ_INT(read_local(&s), 0);
+	CHECK_EQ_STR(s.source, "local");
+	CHECK_EQ_STR(s.name, "WireView Pro II");
+	/* The daemon socket does not exist here: no firmware info. */
+	CHECK_EQ_STR(s.fw, "");
+	CHECK_EQ_STR(s.uid, "");
+	CHECK(s.ok == 1);
+	CHECK_EQ_INT(s.have_in, 0xFF);
+	CHECK_EQ_INT(s.have_curr, 0x7F);
+	CHECK_EQ_INT(s.have_power, 0x7F);
+	CHECK_EQ_INT(s.in_mv[0], 12000);
+	CHECK_EQ_INT(s.in_mv[5], 12500);
+	CHECK_EQ_INT(s.in_mv[6], 12250);
+	CHECK_EQ_INT(s.in_mv[7], 3300);
+	CHECK_EQ_INT(s.curr_ma[5], 8500);
+	CHECK_EQ_INT(s.curr_ma[6], 49500);
+	CHECK_EQ_INT(s.power_uw[0], 595000000);	/* power1 = total */
+	CHECK_EQ_INT(s.power_uw[1], 96000000);	/* power2 = pin 1 */
+	CHECK_EQ_INT(s.have_temp, 0xB);
+	CHECK_EQ_INT(s.temp_mc[0], 35500);
+	CHECK_EQ_INT(s.temp_mc[1], -40000);
+	CHECK_EQ_INT(s.temp_mc[3], 25000);
+	/* pwm1 wins over fan1_input: 107/255 is 42 %. */
+	CHECK_EQ_INT(s.fan, 42);
+	/* power1_cap (uW) wins over psu_cap (enum 3 = 150 W). */
+	CHECK_EQ_INT(s.psu_cap_w, 450);
+	/* energy1_input is microjoules and does not fit in 32 bits. */
+	CHECK_EQ_INT(s.have_energy, 1);
+	CHECK_EQ_INT(s.energy_uj, 123456789012LL);
+	/* The raw fault masks win over the intrusion alarms. */
+	CHECK(s.have_fault_status && s.have_fault_log);
+	CHECK_EQ_INT(s.fault_status, 513);
+	CHECK_EQ_INT(s.fault_log, 65535);
+	for (int i = 0; i < WV_NALARM; i++)
+		CHECK_EQ_INT(s.alarm[i], (i == 0 || i == WV_NALARM - 1) ? 1 : 0);
+
+	/* pwm1 -> percent, rounded to nearest. */
+	static const struct { const char *pwm; int pct; } pwm[] = {
+		{ "0", 0 }, { "1", 0 }, { "2", 1 }, { "128", 50 },
+		{ "191", 75 }, { "254", 100 }, { "255", 100 },
+	};
+	for (size_t i = 0; i < sizeof(pwm) / sizeof(pwm[0]); i++) {
+		sysfs_set("pwm1", pwm[i].pwm);
+		CHECK_EQ_INT(read_local(&s), 0);
+		CHECK_EQ_INT(s.fan, pwm[i].pct);
+	}
+
+	/* power1_cap is truncated to whole watts; 0 is "unknown". */
+	sysfs_set("power1_cap", "599999999");
+	read_local(&s);
+	CHECK_EQ_INT(s.psu_cap_w, 599);
+	sysfs_set("power1_cap", "0");
+	read_local(&s);
+	CHECK_EQ_INT(s.psu_cap_w, 0);
+
+	/* An older module: fan1_input and the psu_cap enum, no energy, no
+	 * raw fault masks, no per-channel alarms. */
+	sysfs_del("pwm1");
+	sysfs_del("power1_cap");
+	sysfs_del("energy1_input");
+	sysfs_del("fault_status_raw");
+	sysfs_del("fault_log_raw");
+	for (int i = 0; i < WV_NALARM; i++)
+		sysfs_del(alarm_attrs[i].attr);
+	memset(&s, 0xAB, sizeof(s));
+	CHECK_EQ_INT(read_local(&s), 0);
+	CHECK_EQ_INT(s.fan, 99);
+	CHECK_EQ_INT(s.psu_cap_w, 150);
+	CHECK_EQ_INT(s.have_energy, 0);
+	CHECK_EQ_INT(s.energy_uj, 0);
+	CHECK(s.have_fault_status && s.have_fault_log);
+	CHECK_EQ_INT(s.fault_status, 1);	/* intrusion0_alarm */
+	CHECK_EQ_INT(s.fault_log, 1);		/* intrusion1_alarm */
+	for (int i = 0; i < WV_NALARM; i++)
+		CHECK_EQ_INT(s.alarm[i], -1);
+
+	static const struct { const char *cap; int w; } caps[] = {
+		{ "0", 600 }, { "1", 450 }, { "2", 300 }, { "3", 150 },
+		{ "4", 0 }, { "-1", 0 },
+	};
+	for (size_t i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
+		sysfs_set("psu_cap", caps[i].cap);
+		read_local(&s);
+		CHECK_EQ_INT(s.psu_cap_w, caps[i].w);
+	}
+
+	/* Neither generation of an attribute: unavailable. */
+	sysfs_del("fan1_input");
+	sysfs_del("psu_cap");
+	sysfs_del("intrusion0_alarm");
+	sysfs_del("intrusion1_alarm");
+	read_local(&s);
+	CHECK_EQ_INT(s.fan, -1);
+	CHECK_EQ_INT(s.psu_cap_w, -1);
+	CHECK(!s.have_fault_status && !s.have_fault_log);
+
+	/* Stale data (the module returns ENODATA; here: no reading files)
+	 * still finds the device but marks the snapshot not ok. */
+	char a[32];
+	for (int i = 0; i < 8; i++) {
+		snprintf(a, sizeof(a), "in%d_input", i);
+		sysfs_del(a);
+	}
+	for (int i = 1; i <= 7; i++) {
+		snprintf(a, sizeof(a), "curr%d_input", i);
+		sysfs_del(a);
+		snprintf(a, sizeof(a), "power%d_input", i);
+		sysfs_del(a);
+	}
+	CHECK_EQ_INT(read_local(&s), 0);
+	CHECK(s.ok == 0);
+	CHECK(!s.have_in && !s.have_curr && !s.have_power);
+}
+
+/* ---- sensors / sensors --json output ---- */
+
+/* Run stmt with stdout captured into buf (NUL-terminated). */
+#define CAPTURE(buf, stmt) do {						\
+	char cpath_[PATH_MAX];						\
+	snprintf(cpath_, sizeof(cpath_), "%s/stdout", g_tmpdir);	\
+	fflush(stdout);							\
+	int saved_out_ = dup(1);					\
+	int cfd_ = open(cpath_, O_WRONLY | O_CREAT | O_TRUNC, 0600);	\
+	if (cfd_ >= 0) { dup2(cfd_, 1); close(cfd_); }			\
+	stmt;								\
+	fflush(stdout);							\
+	if (saved_out_ >= 0) { dup2(saved_out_, 1); close(saved_out_); } \
+	FILE *cf_ = fopen(cpath_, "r");					\
+	size_t cn_ = cf_ ? fread((buf), 1, sizeof(buf) - 1, cf_) : 0;	\
+	(buf)[cn_] = '\0';						\
+	if (cf_) fclose(cf_);						\
+} while (0)
+
+/* Collect the object keys of a flat JSON document, in order, as
+ * "key1,key2,...": every string directly followed by ':' is a key. */
+static void json_keys(const char *j, char *out, size_t cap)
+{
+	size_t o = 0;
+
+	out[0] = '\0';
+	while ((j = strchr(j, '"')) != NULL) {
+		const char *end = strchr(j + 1, '"');
+		if (!end)
+			break;
+		if (end[1] == ':') {
+			o += (size_t)snprintf(out + o, cap - o, "%s%.*s",
+					      o ? "," : "", (int)(end - j - 1), j + 1);
+			if (o >= cap)
+				break;
+		}
+		j = end + 1;
+	}
+}
+
+/* The keys of wireviewd's GET /sensors, read from build_sensors_json() in
+ * wireviewd.c: every \"key\": in the function, first occurrence only (the
+ * no-device reply repeats host/appVersion/devices). As of this writing:
+ * host,appVersion,devices,id,name,connected,hwRev,fwVer,buildString,
+ * timestamp,pinVoltage,pinCurrent,tempInC,tempOutC,ext1C,ext2C,psuCapW,fan,
+ * faultStatus,faultLog,sumCurrentA,sumPowerW,energyJ. */
+static int daemon_sensors_keys(char *out, size_t cap)
+{
+	static char src[256 * 1024];
+	FILE *f = fopen(WV_SRCDIR "/wireviewd.c", "r");
+	if (!f)
+		return -1;
+	size_t n = fread(src, 1, sizeof(src) - 1, f);
+	fclose(f);
+	src[n] = '\0';
+
+	const char *p = strstr(src, "static int build_sensors_json(");
+	const char *end = p ? strstr(p, "\n}\n") : NULL;
+	if (!end)
+		return -1;
+	size_t o = 0;
+	out[0] = '\0';
+	while ((p = strstr(p, "\\\"")) != NULL && p < end) {
+		const char *k = p + 2;
+		const char *q = strstr(k, "\\\"");
+		if (!q || q > end)
+			break;
+		size_t len = (size_t)(q - k);
+		int is_key = q[2] == ':' && len > 0 && len < 32;
+		for (size_t i = 0; is_key && i < len; i++)
+			if (!isalnum((unsigned char)k[i]))
+				is_key = 0;
+		if (is_key) {
+			char key[40];
+			snprintf(key, sizeof(key), "%.*s", (int)len, k);
+			/* skip repeats: match whole entries only */
+			char pad[4096], needle[48];
+			snprintf(pad, sizeof(pad), ",%s,", out);
+			snprintf(needle, sizeof(needle), ",%s,", key);
+			if (!strstr(pad, needle))
+				o += (size_t)snprintf(out + o, cap - o, "%s%s",
+						      o ? "," : "", key);
+			p = q + 2;
+		} else {
+			p = k;
+		}
+	}
+	return o ? 0 : -1;
+}
+
+static void test_sensors_output(void)
+{
+	static char out[16384];
+	char keys[2048], want[2048];
+	char *argv_json[] = { "wireviewctl", "sensors", "--json", NULL };
+	char *argv_plain[] = { "wireviewctl", "sensors", NULL };
+	char *argv_bad[] = { "wireviewctl", "sensors", "--xml", NULL };
+	int rc = -1;
+
+	/* The fake tree from test_read_local(), restored to a full module. */
+	sysfs_populate();
+	setenv("WIREVIEW_HWMON_PATH", g_hwmon, 1);
+
+	CAPTURE(out, rc = cmd_sensors(2, argv_plain));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "pin1_voltage_mv: 12000\n") != NULL);
+	CHECK(strstr(out, "vdd_mv: 3300\n") != NULL);
+	CHECK(strstr(out, "total_current_ma: 49500\n") != NULL);
+	CHECK(strstr(out, "total_power_uw: 595000000\n") != NULL);
+	CHECK(strstr(out, "temp_onboard_out_mc: -40000\n") != NULL);
+	CHECK(strstr(out, "temp_external1_mc") == NULL);
+	CHECK(strstr(out, "fan_duty: 42\n") != NULL);
+	CHECK(strstr(out, "psu_cap: 450W\n") != NULL);
+	CHECK(strstr(out, "energy_uj: 123456789012\n") != NULL);
+	CHECK(strstr(out, "fault_status: 513\n") != NULL);
+	CHECK(strstr(out, "alarm_temp_onboard_in: 1\n") != NULL);
+	CHECK(strstr(out, "alarm_total_power: 1\n") != NULL);
+	CHECK(strstr(out, "alarm_pin1_current: 0\n") != NULL);
+
+	CAPTURE(out, rc = cmd_sensors(3, argv_json));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strncmp(out, "{\"host\":\"", 9) == 0);
+	CHECK(strstr(out, "\"appVersion\":\"wireviewctl\"") != NULL);
+	CHECK(strstr(out, "\"connected\":true") != NULL);
+	CHECK(strstr(out, "\"pinVoltage\":[12.000,12.100,12.200,12.300,12.400,12.500]") != NULL);
+	CHECK(strstr(out, "\"pinCurrent\":[8.000,8.100,8.200,8.300,8.400,8.500]") != NULL);
+	/* An absent temperature is 0.0, as the daemon sends it. */
+	CHECK(strstr(out, "\"tempInC\":35.5,\"tempOutC\":-40.0,\"ext1C\":0.0,\"ext2C\":25.0") != NULL);
+	CHECK(strstr(out, "\"psuCapW\":450,\"fan\":42,\"faultStatus\":513,\"faultLog\":65535") != NULL);
+	/* Sums from the pins: 49.5 A and the sum of (12 + 0.1i) * (8 + 0.1i). */
+	CHECK(strstr(out, "\"sumCurrentA\":49.500,\"sumPowerW\":606.550") != NULL);
+	CHECK(strstr(out, "\"energyJ\":123456.789}") != NULL);
+	CHECK(strcmp(out + strlen(out) - 3, "]}\n") == 0);
+
+	/* Same keys, same order as wireviewd's GET /sensors. The extracted
+	 * list is sanity-checked at both ends so a broken extractor cannot
+	 * pass by returning next to nothing. */
+	json_keys(out, keys, sizeof(keys));
+	want[0] = '\0';
+	CHECK_EQ_INT(daemon_sensors_keys(want, sizeof(want)), 0);
+	CHECK(strncmp(want, "host,appVersion,devices,id,name,connected,", 42) == 0);
+	CHECK(strlen(want) > 8 && strcmp(want + strlen(want) - 8, ",energyJ") == 0);
+	CHECK_EQ_STR(keys, want);
+
+	/* A module without energy1_input: energyJ is left out. */
+	sysfs_del("energy1_input");
+	CAPTURE(out, rc = cmd_sensors(3, argv_json));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "energyJ") == NULL);
+	CHECK(strstr(out, "\"sumPowerW\":606.550}]}") != NULL);
+	CAPTURE(out, rc = cmd_sensors(2, argv_plain));
+	CHECK(strstr(out, "energy_uj") == NULL);
+
+	/* No wireview hwmon device: an empty device list, exit 1. */
+	sysfs_del("name");
+	QUIET(CAPTURE(out, rc = cmd_sensors(3, argv_json)));
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(out, "\"appVersion\":\"wireviewctl\",\"devices\":[]}\n") != NULL);
+	QUIET(CAPTURE(out, rc = cmd_sensors(2, argv_plain)));
+	CHECK_EQ_INT(rc, 1);
+	CHECK_EQ_STR(out, "");
+
+	/* Unknown option. */
+	QUIET(CAPTURE(out, rc = cmd_sensors(3, argv_bad)));
+	CHECK_EQ_INT(rc, 1);
+
+	unsetenv("WIREVIEW_HWMON_PATH");
+}
+
 int main(void)
 {
 	if (!mkdtemp(g_tmpdir)) {
@@ -356,6 +790,8 @@ int main(void)
 	test_load_firmware_errors();
 	test_parse_fault_mask();
 	test_parse_remote();
+	test_read_local();
+	test_sensors_output();
 
 	char cmd[PATH_MAX + 16];
 	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);

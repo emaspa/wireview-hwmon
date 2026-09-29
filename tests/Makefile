@@ -36,8 +36,10 @@ unit: $(UNIT)
 test_wireviewd: test_wireviewd.c check.h $(TOP)/wireviewd.c $(TOP)/sha256.c $(TOP)/sha256.h
 	$(CC) $(TEST_CFLAGS) $(SAN_FLAGS) $(TEST_DEFS) -I$(TOP) -o $@ test_wireviewd.c $(TOP)/sha256.c
 
-test_wireviewctl: test_wireviewctl.c check.h $(TOP)/wireviewctl.c
-	$(CC) $(TEST_CFLAGS) $(SAN_FLAGS) $(TEST_DEFS) -I$(TOP) -o $@ test_wireviewctl.c
+# WV_SRCDIR: where the test reads wireviewd.c to compare "sensors --json"
+# keys with the daemon's GET /sensors.
+test_wireviewctl: test_wireviewctl.c check.h $(TOP)/wireviewctl.c $(TOP)/wireviewd.c $(TOP)/sha256.c $(TOP)/sha256.h
+	$(CC) $(TEST_CFLAGS) $(SAN_FLAGS) $(TEST_DEFS) -DWV_SRCDIR=\"$(abspath $(TOP))\" -I$(TOP) -o $@ test_wireviewctl.c $(TOP)/sha256.c
 
 e2e:
 	@if [ -n "$(WIREVIEW_SKIP_E2E)" ]; then \
