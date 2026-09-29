@@ -370,7 +370,7 @@ static void test_parse_remote(void)
 		"{\"id\":\"BB\",\"name\":\"say \\\"hi\\\" C:\\\\x\",\"connected\":false,"
 		"\"fwVer\":\"8\",\"buildString\":\"\","
 		"\"pinVoltage\":[12.000,0,0,0,0,0],\"pinCurrent\":[-0.001,0,0,0,0,0],"
-		"\"tempInC\":-5.5,\"tempOutC\":0.0,\"ext1C\":-39.9,\"ext2C\":-100.0,"
+		"\"tempInC\":-5.5,\"tempOutC\":0.0,\"ext1C\":-40.0,\"ext2C\":-100.0,"
 		"\"psuCapW\":0,\"fan\":0,\"faultStatus\":65535,\"faultLog\":1,"
 		"\"sumCurrentA\":0.0,\"sumPowerW\":0.0,\"energyJ\":12345.678}]}";
 	memset(s, 0xAB, sizeof(s));
@@ -384,7 +384,7 @@ static void test_parse_remote(void)
 	/* Onboard sensors are always present, even at 0.0. */
 	CHECK_EQ_INT(s[0].temp_mc[0], -5500);
 	CHECK_EQ_INT(s[0].temp_mc[1], 0);
-	CHECK_EQ_INT(s[0].temp_mc[2], -39900);
+	CHECK_EQ_INT(s[0].temp_mc[2], -40000);	/* -40.0 is a valid reading */
 	CHECK_EQ_INT(s[0].have_temp, 0x7);
 	CHECK_EQ_INT(s[0].psu_cap_w, 0);
 	CHECK_EQ_INT(s[0].fan, 0);

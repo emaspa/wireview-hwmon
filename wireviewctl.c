@@ -1245,10 +1245,11 @@ static int parse_remote(const char *hostport, const char *body,
 		s->temp_mc[1] = to_ll(j_num(obj, "tempOutC") * 1000.0);
 		s->have_temp = 0x3;
 		/* Disconnected externals read 0.0 (daemon clamp) or a deeply negative
-		 * sentinel (~-100, app publisher) — treat both as "not present". */
+		 * sentinel (~-100, app publisher) — treat both as "not present".
+		 * -40.0 is the lowest reading the daemon publishes, so keep it. */
 		double e[2] = { j_num(obj, "ext1C"), j_num(obj, "ext2C") };
 		for (int i = 0; i < 2; i++) {
-			if (e[i] != 0.0 && e[i] > -40.0) {
+			if (e[i] != 0.0 && e[i] >= -40.0) {
 				s->temp_mc[2 + i] = to_ll(e[i] * 1000.0);
 				s->have_temp |= 1u << (2 + i);
 			}
