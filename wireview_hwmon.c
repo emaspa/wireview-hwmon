@@ -112,11 +112,50 @@ static const struct file_operations wireview_misc_fops = {
 /* ---- hwmon labels ---- */
 
 /*
- * Voltages: in0-in5 = Pin 1-6, in6 = Average, in7 = Vdd
- * Currents: curr1-curr6 = Pin 1-6, curr7 = Total
- * Power:    power1 = Total, power2-power7 = Pin 1-6
- * Temps:    temp1-temp4 = Onboard In, Onboard Out, External 1, External 2
+ * Voltages:  in0-in5 = Pin 1-6, in6 = Average, in7 = Vdd
+ * Currents:  curr1-curr6 = Pin 1-6, curr7 = Total; currN_alarm on all
+ * Power:     power1 = Total, power2-power7 = Pin 1-6;
+ *            power1_cap = PSU capability, power1_alarm = over-power
+ * Temps:     temp1-temp4 = Onboard In, Onboard Out, External 1, External 2;
+ *            tempN_alarm on all
+ * Fan:       pwm1 = fan duty 0-255;
+ *            fan1_input = fan duty 0-100 (deprecated, use pwm1)
+ * Intrusion: intrusion0_alarm = any active fault,
+ *            intrusion1_alarm = any logged fault
+ * Extra:     fault_status_raw, fault_log_raw = raw fault bitmasks;
+ *            psu_cap = raw PSU capability enum (deprecated, use power1_cap)
  */
+
+/*
+ * fault_status bits, numbered like the GUI's FAULT enum (bit index = enum
+ * value), and the alarm attributes each one raises:
+ *
+ *   bit  fault                    meaning                  alarms
+ *   0    FAULT_OTP_TCHIP          chip over-temperature    temp1, temp2
+ *   1    FAULT_OTP_TS             sensor over-temperature  temp3, temp4
+ *   2    FAULT_OCP                over-current (total)     curr7
+ *   3    FAULT_WIRE_OCP           per-wire over-current    curr1-curr6
+ *   4    FAULT_OPP                over-power               power1
+ *   5    FAULT_CURRENT_IMBALANCE  current imbalance        curr1-curr7
+ *
+ * The device does not say which wire tripped FAULT_WIRE_OCP, so all six
+ * per-pin alarms report it. Alarms follow fault_status (active faults);
+ * the fault log is only exposed through intrusion1 and fault_log_raw.
+ */
+#define WIREVIEW_FAULT_OTP_TCHIP		BIT(0)
+#define WIREVIEW_FAULT_OTP_TS			BIT(1)
+#define WIREVIEW_FAULT_OCP			BIT(2)
+#define WIREVIEW_FAULT_WIRE_OCP			BIT(3)
+#define WIREVIEW_FAULT_OPP			BIT(4)
+#define WIREVIEW_FAULT_CURRENT_IMBALANCE	BIT(5)
+
+/* power1_cap in microwatts, indexed by the device's psu_cap enum */
+static const long psu_cap_uw[] = {
+	600000000,	/* 0: 600 W */
+	450000000,	/* 1: 450 W */
+	300000000,	/* 2: 300 W */
+	150000000,	/* 3: 150 W */
+};
 
 static const char * const voltage_labels[] = {
 	"Pin 1", "Pin 2", "Pin 3", "Pin 4", "Pin 5", "Pin 6",
@@ -190,6 +229,7 @@ static DEVICE_ATTR_RO(intrusion1_label);
 static SENSOR_DEVICE_ATTR_RO(fault_status_raw, wireview_raw,
 			     WIREVIEW_RAW_FAULT_STATUS);
 static SENSOR_DEVICE_ATTR_RO(fault_log_raw, wireview_raw, WIREVIEW_RAW_FAULT_LOG);
+/* Deprecated: raw enum, superseded by power1_cap. Drop after one release. */
 static SENSOR_DEVICE_ATTR_RO(psu_cap, wireview_raw, WIREVIEW_RAW_PSU_CAP);
 
 static struct attribute *wireview_extra_attrs[] = {
@@ -222,19 +262,26 @@ static umode_t wireview_is_visible(const void *drvdata,
 			return 0444;
 		break;
 	case hwmon_curr:
-		if (attr == hwmon_curr_input || attr == hwmon_curr_label)
+		if (attr == hwmon_curr_input || attr == hwmon_curr_label ||
+		    attr == hwmon_curr_alarm)
 			return 0444;
 		break;
 	case hwmon_power:
-		if (attr == hwmon_power_input || attr == hwmon_power_label)
+		if (attr == hwmon_power_input || attr == hwmon_power_label ||
+		    attr == hwmon_power_cap || attr == hwmon_power_alarm)
 			return 0444;
 		break;
 	case hwmon_temp:
-		if (attr == hwmon_temp_input || attr == hwmon_temp_label)
+		if (attr == hwmon_temp_input || attr == hwmon_temp_label ||
+		    attr == hwmon_temp_alarm)
 			return 0444;
 		break;
 	case hwmon_fan:
 		if (attr == hwmon_fan_input)
+			return 0444;
+		break;
+	case hwmon_pwm:
+		if (attr == hwmon_pwm_input)
 			return 0444;
 		break;
 	case hwmon_intrusion:
@@ -247,16 +294,45 @@ static umode_t wireview_is_visible(const void *drvdata,
 	return 0;
 }
 
+/* The fault_status bits that raise the alarm of this channel. */
+static u16 wireview_alarm_mask(enum hwmon_sensor_types type, int channel)
+{
+	switch (type) {
+	case hwmon_temp:
+		/* temp1/temp2 onboard, temp3/temp4 external sensors */
+		return channel < 2 ? WIREVIEW_FAULT_OTP_TCHIP :
+				     WIREVIEW_FAULT_OTP_TS;
+	case hwmon_curr:
+		/* curr1-curr6 per pin, curr7 total */
+		return (channel < 6 ? WIREVIEW_FAULT_WIRE_OCP :
+				      WIREVIEW_FAULT_OCP) |
+		       WIREVIEW_FAULT_CURRENT_IMBALANCE;
+	case hwmon_power:
+		return WIREVIEW_FAULT_OPP;	/* power1 only */
+	default:
+		return 0;
+	}
+}
+
 static int wireview_read(struct device *dev, enum hwmon_sensor_types type,
 			 u32 attr, int channel, long *val)
 {
 	struct wireview_priv *priv = dev_get_drvdata(dev);
+	int ret = 0;
 
 	mutex_lock(&priv->lock);
 
 	if (!wireview_data_fresh(priv)) {
 		mutex_unlock(&priv->lock);
 		return -ENODATA;
+	}
+
+	if ((type == hwmon_temp && attr == hwmon_temp_alarm) ||
+	    (type == hwmon_curr && attr == hwmon_curr_alarm) ||
+	    (type == hwmon_power && attr == hwmon_power_alarm)) {
+		*val = !!(priv->data.fault_status &
+			  wireview_alarm_mask(type, channel));
+		goto out;
 	}
 
 	switch (type) {
@@ -275,21 +351,34 @@ static int wireview_read(struct device *dev, enum hwmon_sensor_types type,
 			*val = priv->data.total_current_ma;
 		break;
 	case hwmon_power:
-		if (channel == 0)
+		if (attr == hwmon_power_cap) {
+			if (priv->data.psu_cap < ARRAY_SIZE(psu_cap_uw))
+				*val = psu_cap_uw[priv->data.psu_cap];
+			else
+				ret = -ENODATA;
+		} else if (channel == 0) {
 			*val = priv->data.total_power_uw;
-		else /* channels 1-6 = power2-power7 */
+		} else { /* channels 1-6 = power2-power7 */
 			*val = priv->data.pin_power_uw[channel - 1];
+		}
 		break;
 	case hwmon_temp:
-		if (priv->data.temp_mc[channel] == S32_MIN) {
-			mutex_unlock(&priv->lock);
-			return -ENODATA;
-		}
-		*val = priv->data.temp_mc[channel];
+		if (priv->data.temp_mc[channel] == S32_MIN)
+			ret = -ENODATA;
+		else
+			*val = priv->data.temp_mc[channel];
 		break;
 	case hwmon_fan:
-		/* Report fan duty as "RPM" scaled 0-100 for visibility */
+		/*
+		 * Deprecated, use pwm1: fan duty 0-100 reported as "RPM" so
+		 * it shows up in sensors. Drop after one release.
+		 */
 		*val = priv->data.fan_duty;
+		break;
+	case hwmon_pwm:
+		*val = DIV_ROUND_CLOSEST(min_t(unsigned int,
+					       priv->data.fan_duty, 100) * 255,
+					 100);
 		break;
 	case hwmon_intrusion:
 		if (channel == 0)
@@ -298,12 +387,13 @@ static int wireview_read(struct device *dev, enum hwmon_sensor_types type,
 			*val = priv->data.fault_log != 0 ? 1 : 0;
 		break;
 	default:
-		mutex_unlock(&priv->lock);
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		break;
 	}
 
+out:
 	mutex_unlock(&priv->lock);
-	return 0;
+	return ret;
 }
 
 static int wireview_read_string(struct device *dev,
@@ -346,15 +436,16 @@ static const struct hwmon_channel_info * const wireview_info[] = {
 		HWMON_I_INPUT | HWMON_I_LABEL,   /* in6: Average */
 		HWMON_I_INPUT | HWMON_I_LABEL),  /* in7: Vdd */
 	HWMON_CHANNEL_INFO(curr,
-		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr1: Pin 1 */
-		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr2: Pin 2 */
-		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr3: Pin 3 */
-		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr4: Pin 4 */
-		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr5: Pin 5 */
-		HWMON_C_INPUT | HWMON_C_LABEL,   /* curr6: Pin 6 */
-		HWMON_C_INPUT | HWMON_C_LABEL),  /* curr7: Total */
+		HWMON_C_INPUT | HWMON_C_LABEL | HWMON_C_ALARM,   /* curr1: Pin 1 */
+		HWMON_C_INPUT | HWMON_C_LABEL | HWMON_C_ALARM,   /* curr2: Pin 2 */
+		HWMON_C_INPUT | HWMON_C_LABEL | HWMON_C_ALARM,   /* curr3: Pin 3 */
+		HWMON_C_INPUT | HWMON_C_LABEL | HWMON_C_ALARM,   /* curr4: Pin 4 */
+		HWMON_C_INPUT | HWMON_C_LABEL | HWMON_C_ALARM,   /* curr5: Pin 5 */
+		HWMON_C_INPUT | HWMON_C_LABEL | HWMON_C_ALARM,   /* curr6: Pin 6 */
+		HWMON_C_INPUT | HWMON_C_LABEL | HWMON_C_ALARM),  /* curr7: Total */
 	HWMON_CHANNEL_INFO(power,
-		HWMON_P_INPUT | HWMON_P_LABEL,   /* power1: Total */
+		HWMON_P_INPUT | HWMON_P_LABEL |
+		HWMON_P_CAP | HWMON_P_ALARM,     /* power1: Total */
 		HWMON_P_INPUT | HWMON_P_LABEL,   /* power2: Pin 1 */
 		HWMON_P_INPUT | HWMON_P_LABEL,   /* power3: Pin 2 */
 		HWMON_P_INPUT | HWMON_P_LABEL,   /* power4: Pin 3 */
@@ -362,12 +453,14 @@ static const struct hwmon_channel_info * const wireview_info[] = {
 		HWMON_P_INPUT | HWMON_P_LABEL,   /* power6: Pin 5 */
 		HWMON_P_INPUT | HWMON_P_LABEL),  /* power7: Pin 6 */
 	HWMON_CHANNEL_INFO(temp,
-		HWMON_T_INPUT | HWMON_T_LABEL,   /* temp1: Onboard In */
-		HWMON_T_INPUT | HWMON_T_LABEL,   /* temp2: Onboard Out */
-		HWMON_T_INPUT | HWMON_T_LABEL,   /* temp3: External 1 */
-		HWMON_T_INPUT | HWMON_T_LABEL),  /* temp4: External 2 */
+		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_ALARM,   /* temp1: Onboard In */
+		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_ALARM,   /* temp2: Onboard Out */
+		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_ALARM,   /* temp3: External 1 */
+		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_ALARM),  /* temp4: External 2 */
 	HWMON_CHANNEL_INFO(fan,
-		HWMON_F_INPUT),                  /* fan1: duty % */
+		HWMON_F_INPUT),                  /* fan1: duty %, deprecated */
+	HWMON_CHANNEL_INFO(pwm,
+		HWMON_PWM_INPUT),                /* pwm1: duty 0-255 */
 	HWMON_CHANNEL_INFO(intrusion,
 		HWMON_INTRUSION_ALARM,           /* intrusion0: fault status */
 		HWMON_INTRUSION_ALARM),          /* intrusion1: fault log */
