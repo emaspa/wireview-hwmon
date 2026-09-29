@@ -44,8 +44,13 @@
 
 #define WIREVIEW_VID "0483"
 #define WIREVIEW_PID "5740"
+/* Overridable (-D) only so test builds can run beside the live daemon. */
+#ifndef HWMON_DEV
 #define HWMON_DEV    "/dev/wireview-hwmon"
+#endif
+#ifndef SOCK_PATH
 #define SOCK_PATH    "/run/wireviewd.sock"
+#endif
 #define HTTP_PORT    9876
 
 /* Members of this group (and root) may send privileged socket commands. */
@@ -969,7 +974,9 @@ static int setup_http(void)
 }
 
 /* ---- Daily-rotating audit log ---- */
+#ifndef LOG_DIR
 #define LOG_DIR "/var/log/wireview"
+#endif
 
 static FILE *g_logf;
 static char  g_log_day[11];   /* YYYY-MM-DD of the currently open file */
