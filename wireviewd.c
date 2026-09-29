@@ -1615,6 +1615,69 @@ static void http_handle(int http_fd)
 	close(cfd);
 }
 
+/* Try to bring the device up: locate and open the serial port and the
+ * hwmon node, then read the device info. Returns 0 with *serial_fd and
+ * *hwmon_fd open, or the number of ms to wait before the next attempt.
+ * Never sleeps, so the caller's poll loop keeps serving the command
+ * socket and the HTTP listener while the device is absent. */
+static long device_connect(const char *user_dev_path, char *dev_path,
+			   size_t dev_path_len, int *serial_fd, int *hwmon_fd)
+{
+	int sfd, hfd;
+
+	/* Use the -d path every time; otherwise auto-detect. Clearing
+	 * dev_path below only forgets an auto-detected path. */
+	if (user_dev_path[0] != '\0') {
+		snprintf(dev_path, dev_path_len, "%s", user_dev_path);
+	} else if (dev_path[0] == '\0') {
+		if (find_device(dev_path, dev_path_len) < 0) {
+			fprintf(stderr, "wireviewd: device not found, retrying in 5s\n");
+			dev_path[0] = '\0';
+			return 5000;
+		}
+	}
+
+	/* Check hwmon module is loaded */
+	if (access(HWMON_DEV, W_OK) < 0) {
+		fprintf(stderr, "wireviewd: %s not available (load wireview_hwmon module)\n",
+			HWMON_DEV);
+		return 5000;
+	}
+
+	printf("wireviewd: using %s\n", dev_path);
+
+	sfd = open_serial(dev_path);
+	if (sfd < 0) {
+		fprintf(stderr, "wireviewd: failed to open %s: %s\n",
+			dev_path, strerror(errno));
+		dev_path[0] = '\0';
+		return 5000;
+	}
+
+	hfd = open(HWMON_DEV, O_WRONLY);
+	if (hfd < 0) {
+		fprintf(stderr, "wireviewd: failed to open %s: %s\n",
+			HWMON_DEV, strerror(errno));
+		close(sfd);
+		return 5000;
+	}
+
+	tcflush(sfd, TCIFLUSH);
+
+	/* Query device info */
+	if (query_device_info(sfd) < 0) {
+		fprintf(stderr, "wireviewd: device info query failed\n");
+		close(hfd);
+		close(sfd);
+		dev_path[0] = '\0';
+		return 2000;
+	}
+
+	*serial_fd = sfd;
+	*hwmon_fd = hfd;
+	return 0;
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s [-i interval_ms] [-d /dev/ttyACMx] [-V]\n", prog);
@@ -1683,271 +1746,178 @@ int main(int argc, char **argv)
 
 	printf("wireviewd %s: starting\n", WIREVIEW_PKG_VERSION);
 
+	/* The command socket lives for the whole run: a device disconnect
+	 * no longer drops it, so clients (the GUI's long-lived connection
+	 * in particular) stay connected and get RESP_NOT_CONNECTED until
+	 * the device is back. */
+	int sock_fd = setup_socket();
+	if (sock_fd < 0)
+		fprintf(stderr, "wireviewd: warning: could not create socket\n");
+
+	struct client clients[MAX_CLIENTS];
+	int num_clients = 0;
+	int serial_fd = -1;
+	int hwmon_fd = -1;
+
+	/* Fault bits seen in the previous frame (debounce state),
+	 * reset on every (re)connect. */
+	uint16_t prev_status = 0, prev_log = 0;
+
+	/* next_poll is the next sensor read while connected, next_reconnect
+	 * the next connection attempt while not. First attempt: now. */
+	struct timespec next_poll, next_reconnect;
+
+	memset(clients, 0, sizeof(clients));
+	clock_gettime(CLOCK_MONOTONIC, &next_reconnect);
+	next_poll = next_reconnect;
+
+	/* Single event loop with poll(), device present or not */
 	while (running) {
-		int serial_fd = -1;
-		int hwmon_fd = -1;
-		int sock_fd = -1;
-		struct client clients[MAX_CLIENTS];
-		int num_clients = 0;
+		if (serial_fd < 0 && ms_until(&next_reconnect) <= 0) {
+			long retry = device_connect(user_dev_path, dev_path,
+						    sizeof(dev_path),
+						    &serial_fd, &hwmon_fd);
+			if (retry > 0) {
+				deadline_in(&next_reconnect, retry);
+			} else {
+				/* Device is ready; allow HTTP command relay. */
+				g_serial_fd = serial_fd;
+				prev_status = 0;
+				prev_log = 0;
+				printf("wireviewd: polling every %d ms\n", interval_ms);
+				clock_gettime(CLOCK_MONOTONIC, &next_poll);
+			}
+			if (!running)
+				break;
+		}
 
-		/* Fault bits seen in the previous frame (debounce state),
-		 * reset on every (re)connect. */
-		uint16_t prev_status = 0, prev_log = 0;
+		struct pollfd pfds[2 + MAX_CLIENTS];
+		int nfds = 0;
 
-		memset(clients, 0, sizeof(clients));
+		/* Listening socket */
+		int sock_pfd_idx = -1;
+		if (sock_fd >= 0) {
+			sock_pfd_idx = nfds;
+			pfds[nfds].fd = sock_fd;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
 
-		/* Use the -d path every time; otherwise auto-detect. Clearing
-		 * dev_path below only forgets an auto-detected path. */
-		if (user_dev_path[0] != '\0') {
-			snprintf(dev_path, sizeof(dev_path), "%s", user_dev_path);
-		} else if (dev_path[0] == '\0') {
-			if (find_device(dev_path, sizeof(dev_path)) < 0) {
-				fprintf(stderr, "wireviewd: device not found, retrying in 5s\n");
-				sleep(5);
-				dev_path[0] = '\0';
+		/* HTTP /sensors listener */
+		int http_pfd_idx = -1;
+		if (http_fd >= 0) {
+			http_pfd_idx = nfds;
+			pfds[nfds].fd = http_fd;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
+
+		/* Client sockets */
+		int client_pfd_start = nfds;
+		for (int i = 0; i < num_clients; i++) {
+			pfds[nfds].fd = clients[i].fd;
+			pfds[nfds].events = POLLIN;
+			nfds++;
+		}
+
+		/* Time until the next sensor poll, or the next connection
+		 * attempt while the device is absent ... */
+		long wait_ms = ms_until(serial_fd >= 0 ? &next_poll
+						       : &next_reconnect);
+		/* ... or until the earliest partial request expires */
+		for (int i = 0; i < num_clients; i++) {
+			if (clients[i].have > 0) {
+				long left = ms_until(&clients[i].req_deadline);
+				if (left < wait_ms)
+					wait_ms = left;
+			}
+		}
+		if (wait_ms < 0) wait_ms = 0;
+
+		int ret = poll(pfds, nfds, (int)wait_ms);
+		if (ret < 0) {
+			/* revents are not valid after a failed poll(). EINTR
+			 * is a signal (SIGTERM ends the loop via running);
+			 * anything else is unexpected, so do not spin on it. */
+			if (errno != EINTR) {
+				fprintf(stderr, "wireviewd: poll: %s\n", strerror(errno));
+				usleep(100000);
+			}
+			continue;
+		}
+
+		/* Accept new clients */
+		if (sock_pfd_idx >= 0 && (pfds[sock_pfd_idx].revents & POLLIN)) {
+			int new_fd = accept4(sock_fd, NULL, NULL,
+					     SOCK_NONBLOCK | SOCK_CLOEXEC);
+			if (new_fd >= 0) {
+				if (num_clients < MAX_CLIENTS) {
+					client_init(&clients[num_clients++],
+						    new_fd);
+				} else {
+					send_response(new_fd, RESP_ERROR,
+						      NULL, 0);
+					close(new_fd);
+				}
+			}
+		}
+
+		/* Serve an HTTP /sensors request */
+		if (http_pfd_idx >= 0 &&
+		    (pfds[http_pfd_idx].revents & POLLIN))
+			http_handle(http_fd);
+
+		/* Handle client requests (serial_fd is -1 while the device
+		 * is absent, and requests get RESP_NOT_CONNECTED). Walk
+		 * backwards: removing client i swaps the last client into
+		 * slot i, and that one has already been handled (or was
+		 * accepted this round and has no pfd), so slot i is never
+		 * re-read against the removed client's revents. */
+		for (int i = num_clients - 1; i >= 0; i--) {
+			int idx = client_pfd_start + i;
+			if (idx >= nfds || !pfds[idx].revents)
+				continue;
+			int drop = 0;
+			if (pfds[idx].revents & POLLIN)
+				drop = client_read(&clients[i],
+						   serial_fd) < 0;
+			if (drop || (pfds[idx].revents &
+				     (POLLHUP | POLLERR))) {
+				close(clients[i].fd);
+				clients[i] = clients[--num_clients];
+				clients[num_clients].fd = -1;
+			}
+		}
+
+		/* Drop clients sitting on an incomplete request */
+		for (int i = 0; i < num_clients; ) {
+			if (clients[i].have > 0 &&
+			    ms_until(&clients[i].req_deadline) <= 0) {
+				wlog("WARN", "socket client uid %ld: request incomplete after %d ms (%zu bytes), disconnecting",
+				     client_uid(&clients[i]),
+				     CLIENT_REQ_TIMEOUT_MS,
+				     clients[i].have);
+				close(clients[i].fd);
+				clients[i] = clients[--num_clients];
+				clients[num_clients].fd = -1;
 				continue;
 			}
+			i++;
 		}
 
-		/* Check hwmon module is loaded */
-		if (access(HWMON_DEV, W_OK) < 0) {
-			fprintf(stderr, "wireviewd: %s not available (load wireview_hwmon module)\n",
-				HWMON_DEV);
-			sleep(5);
+		if (serial_fd < 0)
 			continue;
-		}
 
-		printf("wireviewd: using %s\n", dev_path);
+		/* Sensor poll */
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		if (now.tv_sec > next_poll.tv_sec ||
+		    (now.tv_sec == next_poll.tv_sec &&
+		     now.tv_nsec >= next_poll.tv_nsec)) {
 
-		serial_fd = open_serial(dev_path);
-		if (serial_fd < 0) {
-			fprintf(stderr, "wireviewd: failed to open %s: %s\n",
-				dev_path, strerror(errno));
-			dev_path[0] = '\0';
-			sleep(5);
-			continue;
-		}
-
-		hwmon_fd = open(HWMON_DEV, O_WRONLY);
-		if (hwmon_fd < 0) {
-			fprintf(stderr, "wireviewd: failed to open %s: %s\n",
-				HWMON_DEV, strerror(errno));
-			close(serial_fd);
-			sleep(5);
-			continue;
-		}
-
-		tcflush(serial_fd, TCIFLUSH);
-
-		/* Query device info */
-		if (query_device_info(serial_fd) < 0) {
-			fprintf(stderr, "wireviewd: device info query failed\n");
-			close(hwmon_fd);
-			close(serial_fd);
-			dev_path[0] = '\0';
-			sleep(2);
-			continue;
-		}
-
-		/* Device is ready; allow HTTP command relay. */
-		g_serial_fd = serial_fd;
-
-		/* Set up command socket */
-		sock_fd = setup_socket();
-		if (sock_fd < 0)
-			fprintf(stderr, "wireviewd: warning: could not create socket\n");
-
-		printf("wireviewd: polling every %d ms\n", interval_ms);
-
-		/* Event loop with poll() */
-		struct timespec next_poll;
-		clock_gettime(CLOCK_MONOTONIC, &next_poll);
-
-		while (running) {
-			struct pollfd pfds[2 + MAX_CLIENTS];
-			int nfds = 0;
-
-			/* Listening socket */
-			if (sock_fd >= 0) {
-				pfds[nfds].fd = sock_fd;
-				pfds[nfds].events = POLLIN;
-				nfds++;
-			}
-
-			/* HTTP /sensors listener */
-			int http_pfd_idx = -1;
-			if (http_fd >= 0) {
-				http_pfd_idx = nfds;
-				pfds[nfds].fd = http_fd;
-				pfds[nfds].events = POLLIN;
-				nfds++;
-			}
-
-			/* Client sockets */
-			int client_pfd_start = nfds;
-			for (int i = 0; i < num_clients; i++) {
-				pfds[nfds].fd = clients[i].fd;
-				pfds[nfds].events = POLLIN;
-				nfds++;
-			}
-
-			/* Time until next sensor poll */
-			struct timespec now;
-			clock_gettime(CLOCK_MONOTONIC, &now);
-			long wait_ms = (next_poll.tv_sec - now.tv_sec) * 1000 +
-				       (next_poll.tv_nsec - now.tv_nsec) / 1000000;
-			/* ... or until the earliest partial request expires */
-			for (int i = 0; i < num_clients; i++) {
-				if (clients[i].have > 0) {
-					long left = ms_until(&clients[i].req_deadline);
-					if (left < wait_ms)
-						wait_ms = left;
-				}
-			}
-			if (wait_ms < 0) wait_ms = 0;
-
-			int ret = poll(pfds, nfds, (int)wait_ms);
-			if (ret < 0 && errno != EINTR)
-				break;
-
-			/* Accept new clients */
-			if (sock_fd >= 0 && nfds > 0 && (pfds[0].revents & POLLIN)) {
-				int new_fd = accept4(sock_fd, NULL, NULL,
-						     SOCK_NONBLOCK | SOCK_CLOEXEC);
-				if (new_fd >= 0) {
-					if (num_clients < MAX_CLIENTS) {
-						client_init(&clients[num_clients++],
-							    new_fd);
-					} else {
-						send_response(new_fd, RESP_ERROR,
-							      NULL, 0);
-						close(new_fd);
-					}
-				}
-			}
-
-			/* Serve an HTTP /sensors request */
-			if (http_pfd_idx >= 0 &&
-			    (pfds[http_pfd_idx].revents & POLLIN))
-				http_handle(http_fd);
-
-			/* Handle client requests. Walk backwards: removing
-			 * client i swaps the last client into slot i, and that
-			 * one has already been handled (or was accepted this
-			 * round and has no pfd), so slot i is never re-read
-			 * against the removed client's revents. */
-			for (int i = num_clients - 1; i >= 0; i--) {
-				int idx = client_pfd_start + i;
-				if (idx >= nfds || !pfds[idx].revents)
-					continue;
-				int drop = 0;
-				if (pfds[idx].revents & POLLIN)
-					drop = client_read(&clients[i],
-							   serial_fd) < 0;
-				if (drop || (pfds[idx].revents &
-					     (POLLHUP | POLLERR))) {
-					close(clients[i].fd);
-					clients[i] = clients[--num_clients];
-					clients[num_clients].fd = -1;
-				}
-			}
-
-			/* Drop clients sitting on an incomplete request */
-			for (int i = 0; i < num_clients; ) {
-				if (clients[i].have > 0 &&
-				    ms_until(&clients[i].req_deadline) <= 0) {
-					wlog("WARN", "socket client uid %ld: request incomplete after %d ms (%zu bytes), disconnecting",
-					     client_uid(&clients[i]),
-					     CLIENT_REQ_TIMEOUT_MS,
-					     clients[i].have);
-					close(clients[i].fd);
-					clients[i] = clients[--num_clients];
-					clients[num_clients].fd = -1;
-					continue;
-				}
-				i++;
-			}
-
-			/* Sensor poll */
-			clock_gettime(CLOCK_MONOTONIC, &now);
-			if (now.tv_sec > next_poll.tv_sec ||
-			    (now.tv_sec == next_poll.tv_sec &&
-			     now.tv_nsec >= next_poll.tv_nsec)) {
-
-				static int was_suspended;
-				if (serial_suspended()) {
-					was_suspended = 1;
-					next_poll.tv_sec = now.tv_sec;
-					next_poll.tv_nsec = now.tv_nsec +
-							    (long)interval_ms * 1000000;
-					if (next_poll.tv_nsec >= 1000000000L) {
-						next_poll.tv_sec +=
-							next_poll.tv_nsec / 1000000000L;
-						next_poll.tv_nsec %= 1000000000L;
-					}
-					continue;
-				}
-				if (was_suspended) {
-					/* Drop whatever the GUI's traffic left in the
-					 * line discipline before reading frames. */
-					tcflush(serial_fd, TCIFLUSH);
-					was_suspended = 0;
-				}
-
-				struct sensor_struct ss;
-				if (read_sensors(serial_fd, &ss) < 0) {
-					fprintf(stderr,
-						"wireviewd: read failed, reconnecting\n");
-					break;
-				}
-
-				/* The serial protocol has no framing/CRC, so a
-				 * desynced read corrupts arbitrary fields for one
-				 * poll (a real corrupt frame in the field carried
-				 * fan=105, pad1=122, status=0x0607). Two layers:
-				 *
-				 * 1. Discard frames failing sanity checks - real
-				 *    frames always have zero padding and a fan duty
-				 *    <= 100. The next poll's tcflush realigns the
-				 *    stream.
-				 * 2. Debounce fault bits - real faults persist (the
-				 *    device latches them in fault_log until
-				 *    cleared), so publish a bit only if it was set
-				 *    in both the previous and the current frame.
-				 *    fault_status and fault_log are debounced
-				 *    independently and per bit, so a bit already
-				 *    latched in the log cannot let a corrupt
-				 *    status word (or vice versa) through. */
-				if (ss.fan_duty > 100 || ss._pad1 || ss._pad2) {
-					wlog("WARN",
-					     "discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u status=0x%04x log=0x%04x)",
-					     ss.fan_duty, ss._pad1, ss._pad2,
-					     ss.fault_status, ss.fault_log);
-				} else {
-					uint16_t raw_status = ss.fault_status;
-					uint16_t raw_log = ss.fault_log;
-					uint16_t new_status = raw_status & ~prev_status;
-					uint16_t new_log = raw_log & ~prev_log;
-
-					if (new_status || new_log)
-						wlog("WARN",
-						     "suppressed unconfirmed fault bits: status=0x%04x log=0x%04x",
-						     new_status, new_log);
-					ss.fault_status = raw_status & prev_status;
-					ss.fault_log = raw_log & prev_log;
-					prev_status = raw_status;
-					prev_log = raw_log;
-
-					if (write_hwmon(hwmon_fd, &ss) < 0) {
-						fprintf(stderr,
-							"wireviewd: hwmon write failed\n");
-						break;
-					}
-
-					memcpy(&g_last, &ss, sizeof(g_last));
-					g_have_last = 1;
-				}
-
+			static int was_suspended;
+			if (serial_suspended()) {
+				was_suspended = 1;
 				next_poll.tv_sec = now.tv_sec;
 				next_poll.tv_nsec = now.tv_nsec +
 						    (long)interval_ms * 1000000;
@@ -1956,23 +1926,108 @@ int main(int argc, char **argv)
 						next_poll.tv_nsec / 1000000000L;
 					next_poll.tv_nsec %= 1000000000L;
 				}
+				continue;
+			}
+			if (was_suspended) {
+				/* Drop whatever the GUI's traffic left in the
+				 * line discipline before reading frames. */
+				tcflush(serial_fd, TCIFLUSH);
+				was_suspended = 0;
+			}
+
+			struct sensor_struct ss;
+			if (read_sensors(serial_fd, &ss) < 0) {
+				fprintf(stderr,
+					"wireviewd: read failed, reconnecting\n");
+				goto disconnect;
+			}
+
+			/* The serial protocol has no framing/CRC, so a
+			 * desynced read corrupts arbitrary fields for one
+			 * poll (a real corrupt frame in the field carried
+			 * fan=105, pad1=122, status=0x0607). Two layers:
+			 *
+			 * 1. Discard frames failing sanity checks - real
+			 *    frames always have zero padding and a fan duty
+			 *    <= 100. The next poll's tcflush realigns the
+			 *    stream.
+			 * 2. Debounce fault bits - real faults persist (the
+			 *    device latches them in fault_log until
+			 *    cleared), so publish a bit only if it was set
+			 *    in both the previous and the current frame.
+			 *    fault_status and fault_log are debounced
+			 *    independently and per bit, so a bit already
+			 *    latched in the log cannot let a corrupt
+			 *    status word (or vice versa) through. */
+			if (ss.fan_duty > 100 || ss._pad1 || ss._pad2) {
+				wlog("WARN",
+				     "discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u status=0x%04x log=0x%04x)",
+				     ss.fan_duty, ss._pad1, ss._pad2,
+				     ss.fault_status, ss.fault_log);
+			} else {
+				uint16_t raw_status = ss.fault_status;
+				uint16_t raw_log = ss.fault_log;
+				uint16_t new_status = raw_status & ~prev_status;
+				uint16_t new_log = raw_log & ~prev_log;
+
+				if (new_status || new_log)
+					wlog("WARN",
+					     "suppressed unconfirmed fault bits: status=0x%04x log=0x%04x",
+					     new_status, new_log);
+				ss.fault_status = raw_status & prev_status;
+				ss.fault_log = raw_log & prev_log;
+				prev_status = raw_status;
+				prev_log = raw_log;
+
+				if (write_hwmon(hwmon_fd, &ss) < 0) {
+					fprintf(stderr,
+						"wireviewd: hwmon write failed\n");
+					goto disconnect;
+				}
+
+				memcpy(&g_last, &ss, sizeof(g_last));
+				g_have_last = 1;
+			}
+
+			next_poll.tv_sec = now.tv_sec;
+			next_poll.tv_nsec = now.tv_nsec +
+					    (long)interval_ms * 1000000;
+			if (next_poll.tv_nsec >= 1000000000L) {
+				next_poll.tv_sec +=
+					next_poll.tv_nsec / 1000000000L;
+				next_poll.tv_nsec %= 1000000000L;
 			}
 		}
+		continue;
 
-		/* Cleanup */
-		for (int i = 0; i < num_clients; i++) {
-			if (clients[i].fd >= 0) close(clients[i].fd);
-		}
-		cleanup_socket(sock_fd);
-
+disconnect:
+		/* Device gone: close it, keep the command socket and its
+		 * clients, and retry from the poll loop in 2 s. */
 		g_serial_fd = -1;
 		close(hwmon_fd);
 		close(serial_fd);
+		hwmon_fd = -1;
+		serial_fd = -1;
 		dev_path[0] = '\0';
 		g_have_last = 0;
+		dev_info.valid = 0;
+		/* A serial handover belonged to the old connection; do not
+		 * let it hold off polling on the next one. */
+		g_suspend_until.tv_sec = 0;
+		g_suspend_until.tv_nsec = 0;
+		deadline_in(&next_reconnect, 2000);
+	}
 
-		if (running)
-			sleep(2);
+	/* Cleanup */
+	for (int i = 0; i < num_clients; i++) {
+		if (clients[i].fd >= 0) close(clients[i].fd);
+	}
+	cleanup_socket(sock_fd);
+
+	if (serial_fd >= 0) {
+		g_serial_fd = -1;
+		close(hwmon_fd);
+		close(serial_fd);
 	}
 
 	if (http_fd >= 0)
