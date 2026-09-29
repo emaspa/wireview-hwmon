@@ -504,9 +504,15 @@ addresses as `[addr]:port`). That daemon needs its
 [LAN listener](#lan-monitoring-remote-access) enabled.
 
 - `info`, `build`, `sensors [--json]` and `read-config` read `GET /sensors` and
-  `GET /config`, which need no secret. Remote `info` has no config version,
-  remote `sensors` has no average/Vdd voltage or alarm lines, and
-  `sensors --json` passes the daemon's document through unchanged.
+  `GET /config`, which need no secret. `sensors --json` passes the daemon's
+  document through unchanged.
+- `GET /sensors` has fewer fields than the local sysfs. It has no average or
+  Vdd voltage and no per-channel alarms, so remote `sensors` prints no
+  `avg_voltage_mv`, `vdd_mv` or `alarm_*` lines, and remote `info` has no
+  `config_version` line. Any other field the document lacks is left out too
+  (`top` shows it as `--`), never printed as `0`: `psu_cap: unknown` means the
+  device reported `psuCapW: 0`. When the document says `"connected": false`,
+  `sensors` prints a note on stderr that the readings may be stale.
 - `screen`, `nvm`, `clear-faults` and `write-config` go out as a signed
   `POST /command`. The secret comes from `--secret-file FILE` (the passphrase
   alone, or a file with a `secret=` line, such as `/etc/wireview/config`) or

@@ -821,6 +821,89 @@ static void test_parse_remote_tricky(void)
 	CHECK_EQ_INT(s[0].temp_mc[0], 1500);
 }
 
+/* What /sensors does not carry is left out of "sensors" and shown as "--"
+ * by top, never printed as a 0 reading. */
+static void test_remote_absent_fields(void)
+{
+	static char out[8192];
+	struct wv_snap s;
+
+	/* The daemon's full document: pins, sums, temperatures, fan, cap,
+	 * faults and energy, but never average/Vdd voltage or alarms. */
+	static const char full[] =
+		"{\"host\":\"rig\",\"appVersion\":\"wireviewd\",\"devices\":[{"
+		"\"id\":\"0102\",\"name\":\"WireView Pro II\",\"connected\":true,"
+		"\"hwRev\":\"\",\"fwVer\":\"7\",\"buildString\":\"b\",\"timestamp\":\"t\","
+		"\"pinVoltage\":[12.000,12.050,11.990,12.010,12.020,12.030],"
+		"\"pinCurrent\":[8.000,8.100,7.900,8.050,0.000,8.200],"
+		"\"tempInC\":35.5,\"tempOutC\":0.0,\"ext1C\":0.0,\"ext2C\":-100.0,"
+		"\"psuCapW\":0,\"fan\":42,\"faultStatus\":0,\"faultLog\":0,"
+		"\"sumCurrentA\":40.250,\"sumPowerW\":483.100,\"energyJ\":1.0}]}";
+	CHECK_EQ_INT(parse_remote("rig", full, &s, 1), 1);
+	CHECK_EQ_INT(s.have_in, 0x3F);
+	CHECK_EQ_INT(s.have_curr, 0x7F);
+	CHECK_EQ_INT(s.have_power, 0x7F);
+	CAPTURE(out, print_sensors_plain(&s));
+	CHECK(strstr(out, "pin6_voltage_mv: 12030\n") != NULL);
+	CHECK(strstr(out, "avg_voltage_mv") == NULL);
+	CHECK(strstr(out, "vdd_mv") == NULL);
+	CHECK(strstr(out, "alarm_") == NULL);
+	CHECK(strstr(out, "temp_onboard_out_mc: 0\n") != NULL);	/* 0.0 onboard is a reading */
+	CHECK(strstr(out, "temp_external") == NULL);
+	CHECK(strstr(out, "psu_cap: unknown\n") != NULL);	/* 0 = device says unknown */
+	CHECK(strstr(out, "fault_status: 0\n") != NULL);
+	CHECK(strstr(out, "energy_uj: 1000000\n") != NULL);
+
+	/* A document with none of the readings (another publisher, or a
+	 * future schema): no reading lines at all, not a column of zeros. */
+	static const char bare[] = "{\"devices\":[{\"id\":\"AA\",\"fwVer\":\"9\"}]}";
+	memset(&s, 0xAB, sizeof(s));
+	CHECK_EQ_INT(parse_remote("h", bare, &s, 1), 1);
+	CHECK(!s.have_in && !s.have_curr && !s.have_power && !s.have_temp);
+	CHECK(!s.have_fault_status && !s.have_fault_log && !s.have_energy);
+	CHECK_EQ_INT(s.fan, -1);
+	CHECK_EQ_INT(s.psu_cap_w, -1);
+	CAPTURE(out, print_sensors_plain(&s));
+	CHECK_EQ_STR(out, "");
+	CAPTURE(out, draw_panel(&s));
+	CHECK(strstr(out, "-- W") != NULL);
+	CHECK(strstr(out, "-- A") != NULL);
+	CHECK(strstr(out, "Faults --") != NULL);
+	CHECK(strstr(out, "Faults none") == NULL);
+	CHECK(strstr(out, "0.00") == NULL);
+	CHECK(strstr(out, "Fan --") != NULL);
+	CHECK(strstr(out, "cap ") == NULL);
+
+	/* Partial arrays, one sum, one fault mask and null values: each
+	 * reading on its own. */
+	static const char part[] =
+		"{\"devices\":[{\"pinVoltage\":[12.0,12.1,12.2],\"pinCurrent\":[1,2],"
+		"\"sumPowerW\":10.0,\"sumCurrentA\":null,\"faultLog\":5,\"faultStatus\":\"x\","
+		"\"tempInC\":null,\"tempOutC\":30.0,\"psuCapW\":600}]}";
+	CHECK_EQ_INT(parse_remote("h", part, &s, 1), 1);
+	CHECK_EQ_INT(s.have_in, 0x7);
+	CHECK_EQ_INT(s.have_curr, 0x3);
+	CHECK_EQ_INT(s.have_power, 0x7);	/* total, pins 1-2 */
+	CHECK_EQ_INT(s.have_temp, 0x2);
+	CHECK(!s.have_fault_status && s.have_fault_log);
+	CAPTURE(out, print_sensors_plain(&s));
+	CHECK(strstr(out, "pin3_voltage_mv: 12200\n") != NULL);
+	CHECK(strstr(out, "pin4_voltage_mv") == NULL);
+	CHECK(strstr(out, "pin3_current_ma") == NULL);
+	CHECK(strstr(out, "total_current_ma") == NULL);
+	CHECK(strstr(out, "total_power_uw: 10000000\n") != NULL);
+	CHECK(strstr(out, "pin2_power_uw: 24200000\n") != NULL);
+	CHECK(strstr(out, "pin3_power_uw") == NULL);
+	CHECK(strstr(out, "temp_onboard_in_mc") == NULL);
+	CHECK(strstr(out, "temp_onboard_out_mc: 30000\n") != NULL);
+	CHECK(strstr(out, "fault_status") == NULL);
+	CHECK(strstr(out, "fault_log: 5\n") != NULL);
+	CHECK(strstr(out, "psu_cap: 600W\n") != NULL);
+	CAPTURE(out, draw_panel(&s));
+	CHECK(strstr(out, "Faults --/0x5") != NULL);
+	CHECK(strstr(out, "-- A") != NULL);
+}
+
 /* ---- a fake hwmon sysfs directory for read_local() ---- */
 
 static char g_hwmon[PATH_MAX];
@@ -1187,6 +1270,7 @@ int main(void)
 	test_parse_fault_mask();
 	test_parse_remote();
 	test_parse_remote_tricky();
+	test_remote_absent_fields();
 	test_read_local();
 	test_sensors_output();
 

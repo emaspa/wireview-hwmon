@@ -1433,13 +1433,6 @@ static int js_num(const char *obj, const char *key, double *out)
 	return js_number_at(js_member(obj, key), out);
 }
 
-/* Member key of obj as a number, 0 when absent or not a number. */
-static double js_num0(const char *obj, const char *key)
-{
-	double d = 0;
-	return js_num(obj, key, &d) ? d : 0;
-}
-
 /* Member key of obj as a string, unescaped into out (always terminated,
  * truncated to n - 1). \uXXXX other than ASCII becomes '?', as wireviewd
  * writes non-ASCII bytes. Returns 1 if the member is a string. */
@@ -1525,39 +1518,58 @@ static void parse_device(const char *hostport, const char *obj, struct wv_snap *
 	js_str(obj, "id", s->uid, sizeof(s->uid));
 	js_str(obj, "buildString", s->build, sizeof(s->build));
 
-	double pv[6] = {0}, pc[6] = {0};
-	js_arr6(obj, "pinVoltage", pv);
-	js_arr6(obj, "pinCurrent", pc);
+	/*
+	 * A reading is marked present only when its key is there with a
+	 * number, so "sensors" leaves out what the document lacks instead of
+	 * printing it as 0. /sensors never has the average or Vdd voltage.
+	 */
+	double pv[6] = {0}, pc[6] = {0}, d;
+	int nv = js_arr6(obj, "pinVoltage", pv);
+	int nc = js_arr6(obj, "pinCurrent", pc);
 	for (int i = 0; i < 6; i++) {
 		s->in_mv[i] = to_ll(pv[i] * 1000.0);
 		s->curr_ma[i] = to_ll(pc[i] * 1000.0);
 		s->power_uw[i + 1] = to_ll(pv[i] * pc[i] * 1e6);
+		if (i < nv)
+			s->have_in |= 1u << i;
+		if (i < nc)
+			s->have_curr |= 1u << i;
+		if (i < nv && i < nc)
+			s->have_power |= 1u << (i + 1);
 	}
-	s->curr_ma[6] = to_ll(js_num0(obj, "sumCurrentA") * 1000.0);
-	s->power_uw[0] = to_ll(js_num0(obj, "sumPowerW") * 1e6);
-	s->have_in = 0x3F;	/* no average / vdd over the network */
-	s->have_curr = 0x7F;
-	s->have_power = 0x7F;
-
-	s->temp_mc[0] = to_ll(js_num0(obj, "tempInC") * 1000.0);
-	s->temp_mc[1] = to_ll(js_num0(obj, "tempOutC") * 1000.0);
-	s->have_temp = 0x3;
-	/* Disconnected externals read 0.0 (daemon clamp) or a deeply negative
-	 * sentinel (~-100, app publisher) — treat both as "not present".
-	 * -40.0 is the lowest reading the daemon publishes, so keep it. */
-	double e[2] = { js_num0(obj, "ext1C"), js_num0(obj, "ext2C") };
-	for (int i = 0; i < 2; i++) {
-		if (e[i] != 0.0 && e[i] >= -40.0) {
-			s->temp_mc[2 + i] = to_ll(e[i] * 1000.0);
-			s->have_temp |= 1u << (2 + i);
-		}
+	if (js_num(obj, "sumCurrentA", &d)) {
+		s->curr_ma[6] = to_ll(d * 1000.0);
+		s->have_curr |= 1u << 6;
+	}
+	if (js_num(obj, "sumPowerW", &d)) {
+		s->power_uw[0] = to_ll(d * 1e6);
+		s->have_power |= 1u;
 	}
 
-	s->psu_cap_w = (int)js_num0(obj, "psuCapW");
-	s->fault_status = (unsigned)js_num0(obj, "faultStatus");
-	s->fault_log = (unsigned)js_num0(obj, "faultLog");
-	s->have_fault_status = s->have_fault_log = 1;
-	double d;
+	/* Onboard sensors count as present at 0.0. Disconnected externals
+	 * read 0.0 (daemon clamp) or a deeply negative sentinel (~-100, app
+	 * publisher) — treat both as "not present". -40.0 is the lowest
+	 * reading the daemon publishes, so keep it. */
+	static const char *const tkeys[4] = { "tempInC", "tempOutC", "ext1C", "ext2C" };
+	for (int i = 0; i < 4; i++) {
+		if (!js_num(obj, tkeys[i], &d))
+			continue;
+		if (i >= 2 && (d == 0.0 || d < -40.0))
+			continue;
+		s->temp_mc[i] = to_ll(d * 1000.0);
+		s->have_temp |= 1u << i;
+	}
+
+	/* psuCapW 0 is the device saying "unknown"; no key is -1. */
+	s->psu_cap_w = js_num(obj, "psuCapW", &d) ? (int)d : -1;
+	if (js_num(obj, "faultStatus", &d)) {
+		s->fault_status = (unsigned)d;
+		s->have_fault_status = 1;
+	}
+	if (js_num(obj, "faultLog", &d)) {
+		s->fault_log = (unsigned)d;
+		s->have_fault_log = 1;
+	}
 	s->fan = js_num(obj, "fan", &d) ? (int)d : -1;
 	if (js_num(obj, "energyJ", &d)) {
 		s->energy_uj = to_ll(d * 1e6);
@@ -1821,11 +1833,15 @@ static int remote_info(int build_only)
 		printf("build: %s\n", s.build[0] ? s.build : "(empty)");
 		return 0;
 	}
-	printf("firmware: %s\n", s.fw);
-	printf("uid: ");
-	for (const char *p = s.uid; *p; p++)	/* lowercase, as the local path prints */
-		putchar(*p >= 'A' && *p <= 'F' ? *p - 'A' + 'a' : *p);
-	printf("\n");
+	/* A field the document lacks gets no line rather than an empty one. */
+	if (s.fw[0])
+		printf("firmware: %s\n", s.fw);
+	if (s.uid[0]) {
+		printf("uid: ");
+		for (const char *p = s.uid; *p; p++)	/* lowercase, as the local path prints */
+			putchar(*p >= 'A' && *p <= 'F' ? *p - 'A' + 'a' : *p);
+		printf("\n");
+	}
 	if (s.build[0])
 		printf("build: %s\n", s.build);
 	return 0;
@@ -2022,8 +2038,12 @@ static int cmd_sensors(int argc, char **argv)
 			fprintf(stderr, "wireviewctl: %s: device not connected\n", g_host);
 			return 1;
 		}
-		if (!json)
+		if (!json) {
+			if (!s.ok)
+				fprintf(stderr, "wireviewctl: %s: the device reports connected=false; "
+					"these readings may be stale\n", g_host);
 			print_sensors_plain(&s);
+		}
 		return 0;
 	}
 
@@ -2080,29 +2100,43 @@ static void draw_panel(const struct wv_snap *s)
 	}
 	double sum_w = s->power_uw[0] / 1e6, sum_a = s->curr_ma[6] / 1000.0;
 
+	/* A reading the source did not provide (a remote document without
+	 * the key) shows as "--", never as 0. */
 	double cap = s->psu_cap_w > 0 ? s->psu_cap_w : 300.0;
 	printf(ESC "[96m" VB ESC "[0m Power   ");
-	print_bar(sum_w / cap, 28);
-	printf("  %7.1f W", sum_w);
+	print_bar((s->have_power & 1u) ? sum_w / cap : 0, 28);
+	if (s->have_power & 1u)
+		printf("  %7.1f W", sum_w);
+	else
+		printf("       -- W");
 	if (s->have_energy)
 		printf("  %10.3f Wh", s->energy_uj / 3.6e9);
 	printf("\n");
 	printf(ESC "[96m" VB ESC "[0m Current ");
-	print_bar(sum_a / (cap / 12.0), 28);
-	printf("  %7.2f A\n", sum_a);
+	print_bar((s->have_curr & 0x40u) ? sum_a / (cap / 12.0) : 0, 28);
+	if (s->have_curr & 0x40u)
+		printf("  %7.2f A\n", sum_a);
+	else
+		printf("       -- A\n");
 
 	/* per-pin breakdown, one metric per row so each is easy to scan/compare */
 	printf(ESC "[96m" VB ESC "[0;90m Pin   ");
 	for (int p = 0; p < 6; p++) printf("%8d", p + 1);
 	printf(ESC "[0m\n");
 	printf(ESC "[96m" VB ESC "[0m Volts ");
-	for (int p = 0; p < 6; p++) printf("%8.2f", pin_v[p]);
+	for (int p = 0; p < 6; p++)
+		if (s->have_in & (1u << p)) printf("%8.2f", pin_v[p]);
+		else printf("%8s", "--");
 	printf("\n");
 	printf(ESC "[96m" VB ESC "[0m Amps  ");
-	for (int p = 0; p < 6; p++) printf("%8.2f", pin_c[p]);
+	for (int p = 0; p < 6; p++)
+		if (s->have_curr & (1u << p)) printf("%8.2f", pin_c[p]);
+		else printf("%8s", "--");
 	printf("\n");
 	printf(ESC "[96m" VB ESC "[0m Watts ");
-	for (int p = 0; p < 6; p++) printf("%8.1f", pin_v[p] * pin_c[p]);
+	for (int p = 0; p < 6; p++)
+		if ((s->have_in & s->have_curr) & (1u << p)) printf("%8.1f", pin_v[p] * pin_c[p]);
+		else printf("%8s", "--");
 	printf("\n");
 
 	printf(ESC "[96m" VB ESC "[0m Temp   ");
@@ -2115,9 +2149,14 @@ static void draw_panel(const struct wv_snap *s)
 	}
 	if (s->fan >= 0) printf("  Fan %d%%", s->fan);
 	else printf("  Fan --");
-	if (s->fault_status || s->fault_log)
-		printf("  " ESC "[91mFaults 0x%X/0x%X" ESC "[0m", s->fault_status, s->fault_log);
-	else
+	if (!s->have_fault_status && !s->have_fault_log)
+		printf("  Faults --");
+	else if (s->fault_status || s->fault_log) {
+		char st[12] = "--", lg[12] = "--";
+		if (s->have_fault_status) snprintf(st, sizeof(st), "0x%X", s->fault_status);
+		if (s->have_fault_log) snprintf(lg, sizeof(lg), "0x%X", s->fault_log);
+		printf("  " ESC "[91mFaults %s/%s" ESC "[0m", st, lg);
+	} else
 		printf("  " ESC "[92mFaults none" ESC "[0m");
 	printf("\n" ESC "[96m" BL HR ESC "[0m\n\n");
 }
