@@ -15,6 +15,13 @@ As a library:
     dev.wait_for(lambda: dev.writes_of(CMD_SCREEN_CHANGE))
     dev.stop()
 
+To simulate unplugging, start it with a stable link path (a new pty gets a
+new /dev/pts number) and run "wireviewd -d <link>":
+
+    dev.start(link="/tmp/x/ttyWV")
+    dev.unplug()                  # pty closed, link removed
+    dev.replug()                  # fresh pty behind the same link
+
 Standalone, for manual testing ("wireviewd -d <path printed>"):
 
     python3 tests/fake_device.py [--fw 7] [--build "FAKE 1.0"]
@@ -103,22 +110,61 @@ class FakeWireView:
         self._stop = threading.Event()
         self._thread = None
         self.master = self.slave = -1
-        self.path = None
+        self.path = None            # the link if given, else the pty
+        self.link = None
+        self.plugs = 0              # ptys opened so far
 
     # -- control -------------------------------------------------------
 
-    def start(self):
-        self.master, self.slave = pty.openpty()
-        tty.setraw(self.master)
-        self.path = os.ttyname(self.slave)
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+    def start(self, link=None):
+        """Open the pty and serve it. With link, a symlink at that path
+        points at the pty and self.path is the link."""
+        self.link = link
+        self._open()
         return self.path
 
     def stop(self):
+        self._close()
+        if self.link and os.path.islink(self.link):
+            os.unlink(self.link)
+
+    def unplug(self):
+        """Close the pty (the daemon's reads fail as on a USB unplug) and
+        remove the link, so reopening it fails until replug()."""
+        self._close()
+        if self.link and os.path.islink(self.link):
+            os.unlink(self.link)
+
+    def replug(self):
+        """Serve a new pty behind the same link."""
+        self._open()
+        return self.path
+
+    def _open(self):
+        self.master, self.slave = pty.openpty()
+        tty.setraw(self.master)
+        tty_path = os.ttyname(self.slave)
+        if self.link:
+            tmp = self.link + ".new"
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+            os.symlink(tty_path, tmp)
+            os.replace(tmp, self.link)
+            self.path = self.link
+        else:
+            self.path = tty_path
+        self.plugs += 1
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run,
+                                        args=(self._stop, self.master),
+                                        daemon=True)
+        self._thread.start()
+
+    def _close(self):
         self._stop.set()
         if self._thread:
             self._thread.join(2)
+            self._thread = None
         for fd in (self.master, self.slave):
             if fd >= 0:
                 os.close(fd)
@@ -169,7 +215,7 @@ class FakeWireView:
             return self.sensors
         return None
 
-    def _handle(self, chunk):
+    def _handle(self, master, chunk):
         """Handle one read() worth of bytes. Write commands with a variable
         length (WRITE_CONFIG) take the rest of the chunk, like the USB
         packet the real device receives."""
@@ -178,7 +224,7 @@ class FakeWireView:
             cmd = chunk[i]
             reply = self._reply(cmd)
             if reply is not None:
-                os.write(self.master, reply)
+                os.write(master, reply)
                 i += 1
                 continue
             if cmd == CMD_WRITE_CONFIG:
@@ -198,17 +244,20 @@ class FakeWireView:
                 self.writes.append((cmd, data))
             i += n
 
-    def _run(self):
-        while not self._stop.is_set():
-            r, _, _ = select.select([self.master], [], [], 0.1)
+    def _run(self, stop, master):
+        while not stop.is_set():
+            r, _, _ = select.select([master], [], [], 0.1)
             if not r:
                 continue
             try:
-                chunk = os.read(self.master, 4096)
+                chunk = os.read(master, 4096)
             except OSError:
                 return
             if chunk:
-                self._handle(chunk)
+                try:
+                    self._handle(master, chunk)
+                except OSError:
+                    return
 
 
 def main():
