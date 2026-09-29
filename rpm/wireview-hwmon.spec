@@ -51,7 +51,7 @@ BuildArch:      noarch
 # The image moved here from the main package after 1.6.0. Conflicts (not
 # Obsoletes, which would replace the main package) makes an old main
 # package upgrade in the same transaction instead of clashing on the file.
-Conflicts:      %{name} < 1.6.1
+Conflicts:      %{name} < 1.7.0
 
 %description firmware
 Official firmware image for the Thermal Grizzly WireView Pro II GPU power

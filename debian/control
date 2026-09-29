@@ -35,8 +35,8 @@ Architecture: all
 Depends: ${misc:Depends}
 # The image moved here from wireview-hwmon in the first release after
 # 1.6.0; every 1.6.0~<series> build still ships it itself.
-Breaks: wireview-hwmon (<< 1.6.1~)
-Replaces: wireview-hwmon (<< 1.6.1~)
+Breaks: wireview-hwmon (<< 1.7.0~)
+Replaces: wireview-hwmon (<< 1.7.0~)
 Description: WireView Pro II device firmware image (proprietary)
  Official firmware image for the Thermal Grizzly WireView Pro II GPU
  power monitor, redistributed unmodified from Thermal Grizzly's WireView2

@@ -10,7 +10,7 @@ Fedora packaging, served via COPR. One spec produces three packages:
 - **`wireview-hwmon-firmware`** (noarch, `LicenseRef-Proprietary`) - Thermal
   Grizzly's device firmware image for `wireviewctl flash`, kept out of the GPL
   packages (see `../firmware/README.md`). The main package recommends it, so
-  dnf installs it by default. It conflicts with `wireview-hwmon < 1.6.1`,
+  dnf installs it by default. It conflicts with `wireview-hwmon < 1.7.0`,
   which still owned the file, so an upgrade replaces both in one transaction.
 
 COPR/mock only need to *package* the module source - the actual module build
