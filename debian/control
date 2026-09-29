@@ -20,7 +20,7 @@ Description: WireView Pro II hwmon kernel module (DKMS)
 Package: wireview-hwmon
 Architecture: any
 Depends: adduser, ${shlibs:Depends}, ${misc:Depends}
-Recommends: wireview-hwmon-dkms, dfu-util
+Recommends: wireview-hwmon-dkms, wireview-hwmon-firmware, dfu-util
 Description: WireView Pro II daemon and CLI tool
  Userspace daemon and CLI tool for the Thermal Grizzly WireView Pro II
  GPU power monitor. The daemon reads the device over USB serial and
@@ -28,3 +28,23 @@ Description: WireView Pro II daemon and CLI tool
  .
  Includes wireviewd (daemon), wireviewctl (CLI tool), systemd service,
  and udev rules.
+
+Package: wireview-hwmon-firmware
+Section: multiverse/misc
+Architecture: all
+Depends: ${misc:Depends}
+# The image moved here from wireview-hwmon in the first release after
+# 1.6.0; every 1.6.0~<series> build still ships it itself.
+Breaks: wireview-hwmon (<< 1.6.1~)
+Replaces: wireview-hwmon (<< 1.6.1~)
+Description: WireView Pro II device firmware image (proprietary)
+ Official firmware image for the Thermal Grizzly WireView Pro II GPU
+ power monitor, redistributed unmodified from Thermal Grizzly's WireView2
+ Windows release. "wireviewctl flash" writes it to the device over USB
+ DFU when no other image is given. It runs on the device, never on the
+ host.
+ .
+ The image is proprietary Thermal Grizzly software, not covered by the
+ GPL, and comes without a license text; see the copyright file. Without
+ this package, "wireviewctl flash FILE" still flashes an image you
+ supply.

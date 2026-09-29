@@ -2,10 +2,28 @@
 
 `TG-WV-PRO2-FW.hex` is the official Thermal Grizzly WireView Pro II firmware
 (currently v05, build TG-WV-PRO2-FW_20260706_1047), taken unmodified from the
-upstream WireView2 1.0.7 Windows release. It is installed to
-`/usr/share/wireview/TG-WV-PRO2-FW.hex` by `make install` and by all distro
-packages (deb/rpm/AUR), and is what `wireviewctl flash` uses when no file
-argument is given.
+upstream WireView2 1.0.7 Windows release. It is what `wireviewctl flash` uses
+when no file argument is given. It runs on the device, never on the host.
+
+## License
+
+The image is proprietary Thermal Grizzly software. It is not covered by this
+repository's GPL, and no license text accompanies it: it may be redistributed
+only as Thermal Grizzly permits, and this project grants no further
+permission.
+
+To keep it separable from the free code, the distro packages ship it on its
+own:
+
+| Packaging | Package | License field |
+|-----------|---------|---------------|
+| deb (PPA, GitHub releases) | `wireview-hwmon-firmware`, recommended by `wireview-hwmon` | `other` in `debian/copyright` |
+| rpm (COPR, GitHub releases) | `wireview-hwmon-firmware`, recommended by `wireview-hwmon` | `LicenseRef-Proprietary` |
+| AUR | `wireview-hwmon-firmware`, an optional dependency of `wireview-hwmon` | `LicenseRef-Proprietary` |
+
+Each installs it as `/usr/share/wireview/TG-WV-PRO2-FW.hex`, and so does
+`make install`. The daemon, CLI and kernel module work without it;
+`wireviewctl flash FILE` flashes an image you supply.
 
 ## Release checklist: keep the two copies in sync
 

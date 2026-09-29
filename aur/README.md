@@ -1,6 +1,6 @@
 # AUR packaging
 
-A split AUR package (one `pkgbase`, two installable packages) for Arch and
+A split AUR package (one `pkgbase`, three installable packages) for Arch and
 Arch-based distros (CachyOS, EndeavourOS):
 
 - **`wireview-hwmon`** - the `wireviewd` daemon, `wireviewctl` CLI, systemd unit
@@ -8,6 +8,14 @@ Arch-based distros (CachyOS, EndeavourOS):
 - **`wireview-hwmon-dkms`** - the kernel module, built on the user's machine via
   DKMS. Arch's `dkms` pacman hooks build/install it automatically on install and
   rebuild it on kernel upgrades, so no custom `.install` is needed.
+- **`wireview-hwmon-firmware`** (`any`, `LicenseRef-Proprietary`) - Thermal
+  Grizzly's proprietary device firmware image for `wireviewctl flash`, an
+  optional dependency of `wireview-hwmon`. `firmware/README.md` goes to
+  `/usr/share/licenses/wireview-hwmon-firmware/` in place of a license text.
+  Releases up to 1.6.0 shipped the image in `wireview-hwmon`; pacman moves it
+  when both packages are upgraded or installed in one transaction. AUR
+  helpers upgrade the split packages already installed, so upgraders add
+  this one by hand (`paru -S wireview-hwmon-firmware`).
 
 ## Files
 
@@ -44,7 +52,7 @@ git commit -am "wireview-hwmon X.Y.Z" && git push
 ## Install (users)
 
 ```bash
-paru -S wireview-hwmon wireview-hwmon-dkms
+paru -S wireview-hwmon wireview-hwmon-dkms wireview-hwmon-firmware
 sudo systemctl enable --now wireviewd     # Arch does not auto-enable services
 ```
 

@@ -17,8 +17,14 @@ pkgname = wireview-hwmon
 	depends = glibc
 	optdepends = wireview-hwmon-dkms: kernel module exposing sensors via /sys/class/hwmon
 	optdepends = dfu-util: device firmware updates via "wireviewctl flash"
+	optdepends = wireview-hwmon-firmware: bundled firmware image for "wireviewctl flash"
 	backup = etc/wireview/config
 
 pkgname = wireview-hwmon-dkms
 	pkgdesc = WireView Pro II hwmon kernel module (DKMS)
 	depends = dkms
+
+pkgname = wireview-hwmon-firmware
+	pkgdesc = WireView Pro II device firmware image for wireviewctl flash (proprietary)
+	arch = any
+	license = LicenseRef-Proprietary
