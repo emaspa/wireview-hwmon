@@ -1,0 +1,4 @@
+# /etc/wireview/config may hold the shared HMAC secret for remote writes, so
+# the directory and the file are root-only on purpose.
+wireview-hwmon: non-standard-dir-perm 0700 != 0755 [etc/wireview/]
+wireview-hwmon: non-standard-file-perm 0600 != 0644 [etc/wireview/config]

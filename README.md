@@ -128,7 +128,7 @@ After rebooting, both the module and daemon will start automatically.
 
 `make install` puts the udev rules and the systemd unit in `/etc/udev/rules.d/`
 and `/etc/systemd/system/`, and those copies override the packaged ones under
-`/usr/lib` (or `/lib`). After pulling a new version, re-run `sudo make install`,
+`/usr/lib`. After pulling a new version, re-run `sudo make install`,
 then `sudo systemctl restart wireviewd` and replug the device (or run
 `sudo udevadm trigger`). If you have switched to a distro package, delete the
 old copies instead:
