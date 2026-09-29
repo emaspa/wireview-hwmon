@@ -243,7 +243,9 @@ wireviewctl <command> [args]
 
 Commands (require wireviewd running):
   info              Show device firmware, UID, and build info
-  clear-faults      Clear all fault status and log
+  clear-faults [STATUS_MASK [LOG_MASK]]
+                    Clear faults. Masks are hex bits to clear (default FFFF,
+                    i.e. all active faults and the whole fault log)
   read-config       Read device config (hex to stdout)
   write-config FILE Write device config (hex from file)
   screen CMD        Change display (main|simple|current|temp|status|same|pause|resume)
@@ -262,6 +264,12 @@ Monitor:
   top [--host H[:port][,H2...]]... [--interval MS]
                     Live dashboard: local device + remote hosts (q to quit)
 ```
+
+`clear-faults` with no arguments clears every active fault and the whole fault
+log (masks `FFFF FFFF`). `STATUS_MASK` and `LOG_MASK` are 16-bit hex bitmasks,
+with or without `0x`: a set bit clears that fault, and a missing mask defaults
+to `FFFF`. So `wireviewctl clear-faults 0 FFFF` clears only the log, and
+`wireviewctl clear-faults 0x0004` clears status bit 2 plus the whole log.
 
 ### Examples
 
@@ -285,6 +293,9 @@ wireviewctl screen simple
 # reflashed manually.
 wireviewctl flash
 
+# Clear only the fault log, keep active faults
+wireviewctl clear-faults 0 FFFF
+
 # Back up and restore config
 wireviewctl read-config > config.hex
 wireviewctl write-config config.hex
@@ -304,7 +315,7 @@ The daemon listens on a Unix socket at `/run/wireviewd.sock`, allowing external 
 | Command | Description |
 |---------|-------------|
 | GET_DEVICE_INFO | Query firmware version, config version, UID, build string |
-| CLEAR_FAULTS | Clear fault status and/or fault log |
+| CLEAR_FAULTS | Clear fault status and/or fault log (payload: status mask, log mask; u16 LE each, set bit = clear) |
 | READ_CONFIG | Read the device configuration |
 | WRITE_CONFIG | Write a new device configuration |
 | SCREEN_CMD | Send a screen command (change display page) |

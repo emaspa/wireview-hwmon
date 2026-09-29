@@ -181,17 +181,46 @@ static int cmd_info(void)
 	return 0;
 }
 
-static int cmd_clear_faults(void)
+static int parse_fault_mask(const char *s, uint16_t *out)
 {
-	/* Mask 0 = clear all faults */
-	uint8_t payload[4] = { 0, 0, 0, 0 };
+	char *end;
+	unsigned long v;
+
+	errno = 0;
+	v = strtoul(s, &end, 16);
+	if (errno || end == s || *end != '\0' || v > 0xFFFF) {
+		fprintf(stderr, "wireviewctl: invalid fault mask '%s' (hex, 0-FFFF)\n", s);
+		return -1;
+	}
+	*out = (uint16_t)v;
+	return 0;
+}
+
+/*
+ * Payload is status_mask (u16 LE) then log_mask (u16 LE). A set bit clears
+ * that fault; the default 0xFFFF/0xFFFF clears everything.
+ */
+static int cmd_clear_faults(const char *status_arg, const char *log_arg)
+{
+	uint16_t status_mask = 0xFFFF, log_mask = 0xFFFF;
 	uint8_t *data = NULL;
 	uint16_t len = 0;
+
+	if (status_arg && parse_fault_mask(status_arg, &status_mask) < 0)
+		return 1;
+	if (log_arg && parse_fault_mask(log_arg, &log_mask) < 0)
+		return 1;
+
+	uint8_t payload[4] = {
+		status_mask & 0xFF, status_mask >> 8,
+		log_mask & 0xFF, log_mask >> 8,
+	};
 
 	if (sock_command(WCMD_CLEAR_FAULTS, payload, 4, &data, &len) < 0)
 		return 1;
 
-	printf("faults cleared\n");
+	printf("faults cleared (status mask 0x%04X, log mask 0x%04X)\n",
+	       status_mask, log_mask);
 	free(data);
 	return 0;
 }
@@ -1166,7 +1195,9 @@ static void usage(void)
 		"\n"
 		"Commands (require wireviewd running):\n"
 		"  info              Show device firmware, UID, and build info\n"
-		"  clear-faults      Clear all fault status and log\n"
+		"  clear-faults [STATUS_MASK [LOG_MASK]]\n"
+		"                    Clear faults. Masks are hex bits to clear (default FFFF,\n"
+		"                    i.e. all active faults and the whole fault log)\n"
 		"  read-config       Read device config (hex to stdout)\n"
 		"  write-config FILE Write device config (hex from file)\n"
 		"  screen CMD        Change display (main|simple|current|temp|status|same|pause|resume)\n"
@@ -1200,8 +1231,14 @@ int main(int argc, char **argv)
 
 	if (strcmp(cmd, "info") == 0)
 		return cmd_info();
-	if (strcmp(cmd, "clear-faults") == 0)
-		return cmd_clear_faults();
+	if (strcmp(cmd, "clear-faults") == 0) {
+		if (argc > 4) {
+			fprintf(stderr, "wireviewctl: clear-faults takes at most STATUS_MASK LOG_MASK\n");
+			return 1;
+		}
+		return cmd_clear_faults(argc > 2 ? argv[2] : NULL,
+					argc > 3 ? argv[3] : NULL);
+	}
 	if (strcmp(cmd, "read-config") == 0)
 		return cmd_read_config();
 	if (strcmp(cmd, "write-config") == 0) {
