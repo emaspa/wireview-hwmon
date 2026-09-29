@@ -87,7 +87,7 @@ or `dnf install --setopt=install_weak_deps=False`, or remove
 
 #### Requirements
 
-- Linux with kernel headers (`linux-headers-$(uname -r)`)
+- Linux 5.10 or newer with kernel headers (`linux-headers-$(uname -r)`); RHEL 9's 5.14-based kernels included
 - A Thermal Grizzly WireView Pro II device connected via USB
 - `gcc` and `make`
 
