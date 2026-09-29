@@ -345,10 +345,15 @@ Commands (require wireviewd running):
   nvm CMD           NVM operation (load|store|reset|load-cal|store-cal|load-cal-factory|store-cal-factory)
   build             Show firmware build string
   bootloader        Enter DFU bootloader mode
-  flash [FILE] [-y] Flash firmware (.hex or .bin) via DFU (needs dfu-util;
+  flash [FILE] [-y] [--force]
+                    Flash firmware (.hex or .bin) via DFU (needs dfu-util;
                     works without the daemon if the bootloader is already up).
                     Without FILE, flashes the bundled image at
                     /usr/share/wireview/TG-WV-PRO2-FW.hex
+                    Refuses an image for another product, the build the
+                    device runs, an older build, and on a Noctua Edition
+                    a build before 2026-09-02; --force overrides that.
+                    -y only skips the confirmation prompt.
 
 Commands (require wireview_hwmon module):
   sensors [--json]  Show all sensor readings from hwmon sysfs; --json prints
@@ -393,6 +398,40 @@ flash window from `0x08000000`, and no address may be given twice. The error
 names the file and line (`wireviewctl: fw.hex: line 812: bad checksum`) and
 nothing reaches the device. A `.bin` has no checksums to check: it is loaded
 at `0x08000000` as is.
+
+Then `flash` compares the image with the device, before it asks anything of
+the device or the bootloader. It reads the image's BuildStruct (vendor and
+product id, firmware version, product name and build string, at image offset
+192) and asks the daemon for the device's, and prints both with a verdict:
+
+```
+device:  WireView Pro II (EF05, assumed), firmware v05, build TG-WV-PRO2-FW_20260706_1047
+image:   Thermal Grizzly WireView Pro II (EF05), firmware v05, build TG-WV-PRO2-FW_20260902_0741
+verdict: newer: the image is newer than the device firmware
+```
+
+- **Product**: the image vendor must be the device's, and the image product
+  the device's product after the upstream alias table, which maps the Noctua
+  Edition (`EF06`) to the Pro II image (`EF05`). An image for another product,
+  or one too short to carry the ids, is refused.
+- **Noctua Edition**: images built before 2026-09-02 do not know that
+  edition, so a Noctua Edition device refuses them, and any image whose build
+  string has no date.
+- **Build**: the firmware version byte decides first; with the same version,
+  the build time in the build string (`..._yyyyMMdd_HHmm`, as upstream reads
+  it). An older image is refused, and so is the build the device already
+  runs. A newer image goes on to the usual confirmation. When either build
+  string has no date, the verdict is `unknown`: `flash` says which one and
+  asks as usual, with a warning.
+
+`--force` flashes despite a refusal. `-y` only skips the confirmation prompt
+and never overrides a gate, so `wireviewctl flash -y` stays a safe headless
+update: it flashes a newer build and refuses the rest. When the daemon is not
+running or has no device (for example when the bootloader is already up),
+`flash` says that it cannot verify the image against the device and relies on
+the confirmation or `-y`, as before. A daemon that does not report the product
+(wireview-hwmon 1.6.0 and earlier) only runs Pro II devices, so the device
+counts as `EF05` there.
 
 ### Permissions: the `wireview` group
 
@@ -450,7 +489,9 @@ wireviewctl screen simple
 
 # Update the device firmware to the bundled image (no download needed; it
 # comes from the wireview-hwmon-firmware package, see "Firmware image");
-# add -y to skip the confirmation prompt for headless updates.
+# add -y to skip the confirmation prompt for headless updates. The same or
+# an older build, or an image for another product, is refused (--force
+# overrides).
 # Unofficial tool, not affiliated with Thermal Grizzly: flash at your own
 # risk. A power loss mid-flash can leave the device unbootable until
 # reflashed manually.

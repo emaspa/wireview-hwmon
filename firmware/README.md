@@ -41,6 +41,8 @@ The same hex is bundled in two repos:
 - wireview-linux: `WireView2/Firmware/TG-WV-PRO2-FW.hex` (in-app flashing)
 
 When TG ships new firmware, update BOTH copies in the same release cycle.
-`wireviewctl flash` prints the image version and build string at the confirm
-prompt (parsed from the hex: version byte at image offset 194, 32-byte build
-string at offset 227), so a stale copy is visible before flashing.
+`wireviewctl flash` reads the image's BuildStruct at image offset 192 (vendor
+id, product id, version byte, 32-byte product name, 32-byte build string) and
+prints it next to the device's firmware before the confirm prompt; it refuses
+the build the device already runs and older ones, so a stale copy is visible,
+and refused, before flashing.

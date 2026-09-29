@@ -465,7 +465,7 @@ static void test_load_firmware_errors(void)
 	static char out[1024];
 	int rc = -1;
 	path = write_file("bad-flash.hex", bad[0].text, strlen(bad[0].text));
-	QUIET(CAPTURE(out, rc = cmd_flash(path, 1)));
+	QUIET(CAPTURE(out, rc = cmd_flash(path, 1, 0)));
 	CHECK_EQ_INT(rc, 1);
 	CHECK_EQ_STR(out, "");
 

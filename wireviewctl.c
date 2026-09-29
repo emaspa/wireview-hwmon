@@ -887,6 +887,269 @@ static long load_firmware(const char *path, uint8_t **img_out, uint32_t *base_ou
 	return len;
 }
 
+/* ---------- Flash gates: product and build checks ---------- */
+
+/*
+ * The BuildStruct at image offset 192, as upstream reads it: vendor id
+ * (+0), product id (+1), firmware version (+2), product name (+3, 32
+ * bytes), build string (+35, 32 bytes).
+ */
+#define BS_OFF     192
+#define BS_NAME    (BS_OFF + 3)
+#define BS_BUILD   (BS_OFF + 35)
+
+struct fw_ident {
+	int     known;		/* the image is long enough to hold the ids */
+	uint8_t vendor, product;
+	int     version;
+	char    name[33];
+	char    build[33];
+};
+
+static void copy_field(char *out, const uint8_t *in, size_t n)
+{
+	size_t i = 0;
+	for (; i < n && in[i] != 0; i++)
+		out[i] = (in[i] >= 0x20 && in[i] < 0x7F) ? (char)in[i] : '?';
+	out[i] = '\0';
+}
+
+static void fw_image_ident(const uint8_t *img, long len, struct fw_ident *id)
+{
+	memset(id, 0, sizeof(*id));
+	id->version = -1;
+	if (len <= BS_OFF + 2)
+		return;
+	id->known = 1;
+	id->vendor = img[BS_OFF];
+	id->product = img[BS_OFF + 1];
+	id->version = img[BS_OFF + 2];
+	if (len >= BS_NAME + 32)
+		copy_field(id->name, img + BS_NAME, 32);
+	if (len >= BS_BUILD + 32)
+		copy_field(id->build, img + BS_BUILD, 32);
+}
+
+/*
+ * The build time in a build string such as "TG-WV-PRO2-FW_20260902_0741",
+ * as upstream's TryParseBuildTimestamp finds it: the first match of
+ * _(\d{8})_(\d{4})(?!\d), read as yyyyMMdd HHmm, which must be a real
+ * date and time or the string has none. *out is yyyyMMddHHmm as a number,
+ * so two of them compare in time order. Returns 1 if found.
+ */
+static int parse_build_time(const char *s, long long *out)
+{
+	static const int mdays[12] = { 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+	if (!s)
+		return 0;
+	for (size_t i = 0; s[i]; i++) {
+		const char *p = s + i;
+		int ok = p[0] == '_';
+		for (int k = 1; ok && k <= 8; k++)
+			ok = p[k] >= '0' && p[k] <= '9';
+		ok = ok && p[9] == '_';
+		for (int k = 10; ok && k <= 13; k++)
+			ok = p[k] >= '0' && p[k] <= '9';
+		ok = ok && !(p[14] >= '0' && p[14] <= '9');
+		if (!ok)
+			continue;
+
+		/* The first match decides, as Regex.Match does. */
+		long long v = 0;
+		for (int k = 1; k <= 13; k++)
+			if (k != 9)
+				v = v * 10 + (p[k] - '0');
+		int year = (int)(v / 100000000), mon = (int)(v / 1000000 % 100);
+		int day = (int)(v / 10000 % 100), hour = (int)(v / 100 % 100);
+		int min = (int)(v % 100);
+		int leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+		if (year < 1 || mon < 1 || mon > 12 || day < 1 || day > mdays[mon - 1] ||
+		    (mon == 2 && day == 29 && !leap) || hour > 23 || min > 59)
+			return 0;
+		*out = v;
+		return 1;
+	}
+	return 0;
+}
+
+/* Upstream's FirmwareProductIdAliases: the firmware product a device takes.
+ * The Noctua Edition (EF06) runs the Pro II image (product 05). */
+static const struct { uint8_t vendor, product, fw_product; } fw_product_aliases[] = {
+	{ WV_VENDOR_TG, WV_PRODUCT_NOCTUA, WV_PRODUCT_PRO2 },
+};
+
+static uint8_t fw_product_for(uint8_t vendor, uint8_t product)
+{
+	for (size_t i = 0; i < sizeof(fw_product_aliases) / sizeof(fw_product_aliases[0]); i++)
+		if (fw_product_aliases[i].vendor == vendor && fw_product_aliases[i].product == product)
+			return fw_product_aliases[i].fw_product;
+	return product;
+}
+
+/* Images built before this do not know the Noctua Edition. */
+#define NOCTUA_FIRST_BUILD 202609020000LL
+
+/*
+ * Image against device, as upstream's CompareBundledFirmwareToDevice: the
+ * version byte first; the same version, then the build time. Either build
+ * time missing (with the versions equal) or a version missing leaves it
+ * unknown.
+ */
+enum fw_cmp { FW_OLDER = -1, FW_SAME = 0, FW_NEWER = 1, FW_CMP_UNKNOWN = 2 };
+
+static enum fw_cmp fw_compare(int img_ver, const char *img_build,
+			      int dev_ver, const char *dev_build)
+{
+	long long ti, td;
+
+	if (img_ver < 0 || dev_ver < 0)
+		return FW_CMP_UNKNOWN;
+	if (img_ver != dev_ver)
+		return img_ver > dev_ver ? FW_NEWER : FW_OLDER;
+	if (!parse_build_time(img_build, &ti) || !parse_build_time(dev_build, &td))
+		return FW_CMP_UNKNOWN;
+	return ti > td ? FW_NEWER : ti < td ? FW_OLDER : FW_SAME;
+}
+
+/* What the gates make of an image for a device. The ones from FV_SAME on
+ * refuse the flash unless --force is given. */
+enum flash_verdict {
+	FV_NEWER,		/* a newer build: the usual confirmation */
+	FV_UNKNOWN,		/* builds not comparable: confirmation plus a warning */
+	FV_NO_DEVICE,		/* device not reachable: the gates cannot run */
+	FV_SAME,		/* the device already runs this build */
+	FV_OLDER,		/* a downgrade */
+	FV_WRONG_PRODUCT,	/* the image is for another product */
+	FV_PRE_NOCTUA,		/* a Noctua Edition, an image older than its support */
+};
+
+static int flash_refused(enum flash_verdict v)
+{
+	return v >= FV_SAME;
+}
+
+/*
+ * The flash gates, pure so they can be tested exhaustively. dev is NULL when
+ * the device cannot be reached through the daemon. The product gate needs
+ * the image vendor to be the device's and the image product to be the
+ * device's product after the alias; an image too short to carry ids fails
+ * it. A Noctua Edition device also needs an image built on or after
+ * 2026-09-02 (a build string without a date fails that too), since the
+ * alias lets older Pro II images through that do not know the edition.
+ */
+static enum flash_verdict flash_verdict(const struct fw_ident *img,
+					const struct wv_devinfo *dev)
+{
+	long long t;
+
+	if (!dev)
+		return FV_NO_DEVICE;
+	if (!img->known || img->vendor != dev->vendor ||
+	    img->product != fw_product_for(dev->vendor, dev->product))
+		return FV_WRONG_PRODUCT;
+	if (dev->vendor == WV_VENDOR_TG && dev->product == WV_PRODUCT_NOCTUA &&
+	    (!parse_build_time(img->build, &t) || t < NOCTUA_FIRST_BUILD))
+		return FV_PRE_NOCTUA;
+	switch (fw_compare(img->version, img->build, dev->fw, dev->build)) {
+	case FW_NEWER: return FV_NEWER;
+	case FW_SAME:  return FV_SAME;
+	case FW_OLDER: return FV_OLDER;
+	default:       return FV_UNKNOWN;
+	}
+}
+
+static const char *const devinfo_reasons[] = {
+	[-DEVINFO_NO_DAEMON]     = "wireviewd is not reachable",
+	[-DEVINFO_NOT_CONNECTED] = "wireviewd has no device connected (already in the bootloader?)",
+	[-DEVINFO_ERROR]         = "wireviewd gave no device info",
+};
+
+/*
+ * Print the device against the image and the verdict, then decide: 0 to go
+ * on to the confirmation, 1 when a gate refuses and force is not set.
+ * dev_rc is local_device_info()'s result, dev valid only when it is 0.
+ */
+static int flash_check(const struct fw_ident *img, int dev_rc,
+		       const struct wv_devinfo *dev, int force)
+{
+	const struct wv_devinfo *d = dev_rc == 0 ? dev : NULL;
+	enum flash_verdict v = flash_verdict(img, d);
+	long long t;
+
+	if (d) {
+		const char *ed = edition_name(d->vendor, d->product);
+		printf("device:  %s (%02X%02X%s), firmware v%02u, build %s\n",
+		       ed ? ed : "unknown edition", d->vendor, d->product,
+		       d->product_reported ? "" : ", assumed", d->fw,
+		       d->build[0] ? d->build : "unknown");
+	} else {
+		printf("device:  unknown: %s\n", devinfo_reasons[-dev_rc]);
+	}
+	if (img->known)
+		printf("image:   %s (%02X%02X), firmware v%02d, build %s\n",
+		       img->name[0] ? img->name : "unnamed", img->vendor, img->product,
+		       img->version, img->build[0] ? img->build : "unknown");
+	else
+		printf("image:   no BuildStruct (too short to carry a product id)\n");
+
+	const char *why = NULL;
+	switch (v) {
+	case FV_NEWER:
+		printf("verdict: newer: the image is newer than the device firmware\n");
+		break;
+	case FV_UNKNOWN:
+		printf("verdict: unknown: the builds cannot be compared\n");
+		if (!parse_build_time(img->build, &t))
+			printf("warning: the image build string has no _yyyyMMdd_HHmm date\n");
+		if (!parse_build_time(d->build, &t))
+			printf("warning: the device build string has no _yyyyMMdd_HHmm date\n");
+		printf("warning: check yourself that the image is not older than the device firmware\n");
+		break;
+	case FV_NO_DEVICE:
+		printf("verdict: unknown: cannot verify the image against the device\n"
+		       "warning: flash only an image made for this device\n");
+		break;
+	case FV_SAME:
+		printf("verdict: same: the device already runs this build\n");
+		why = "the device already runs this build";
+		break;
+	case FV_OLDER:
+		printf("verdict: older: the image is older than the device firmware\n");
+		why = "the image is older than the device firmware";
+		break;
+	case FV_WRONG_PRODUCT:
+		if (img->known)
+			printf("verdict: wrong product: the image is for %02X%02X, the device "
+			       "(%02X%02X) takes %02X%02X\n", img->vendor, img->product,
+			       d->vendor, d->product, d->vendor,
+			       fw_product_for(d->vendor, d->product));
+		else
+			printf("verdict: wrong product: the image carries no product id\n");
+		why = "the image is not made for this device";
+		break;
+	case FV_PRE_NOCTUA:
+		if (parse_build_time(img->build, &t))
+			printf("verdict: too old: the image was built before 2026-09-02 and "
+			       "does not know the Noctua Edition\n");
+		else
+			printf("verdict: too old: the image build string has no date, so it "
+			       "may predate Noctua Edition support (2026-09-02)\n");
+		why = "the image may not support the Noctua Edition";
+		break;
+	}
+
+	if (!flash_refused(v))
+		return 0;
+	if (force) {
+		printf("--force: flashing anyway\n");
+		return 0;
+	}
+	fflush(stdout);	/* the summary before the refusal */
+	fprintf(stderr, "wireviewctl: refusing to flash: %s (--force overrides)\n", why);
+	return 1;
+}
+
 static int dfu_device_present(void)
 {
 	FILE *p = popen("dfu-util -l 2>/dev/null", "r");
@@ -905,28 +1168,39 @@ static int dfu_device_present(void)
  * headless update. */
 #define DEFAULT_FIRMWARE_PATH "/usr/share/wireview/TG-WV-PRO2-FW.hex"
 
-static int cmd_flash(const char *path, int yes)
+/*
+ * yes skips the confirmation prompt; force overrides the product and build
+ * gates. Neither implies the other.
+ */
+static int cmd_flash(const char *path, int yes, int force)
 {
 	/* Validate the image first: a corrupted file fails here, before
 	 * anything runs or reaches the device. */
 	uint8_t *img = NULL;
 	uint32_t base = 0;
-	int version = -1;
-	char build[40];
-	long len = load_firmware(path, &img, &base, &version, build, sizeof(build));
+	int version = -1;	/* fw_image_ident() reads the BuildStruct */
+	long len = load_firmware(path, &img, &base, &version, NULL, 0);
 	if (len < 0)
 		return 1;
+
+	printf("firmware image: %s (%ld bytes, base 0x%08X)\n", path, len, base);
+
+	/* The gates: only GET_DEVICE_INFO goes to the daemon before them, and
+	 * nothing to the device. */
+	struct fw_ident id;
+	struct wv_devinfo dev;
+	fw_image_ident(img, len, &id);
+	int dev_rc = local_device_info(&dev, 3);
+	if (flash_check(&id, dev_rc, &dev, force)) {
+		free(img);
+		return 1;
+	}
 
 	if (system("dfu-util --version >/dev/null 2>&1") != 0) {
 		fprintf(stderr, "wireviewctl: dfu-util not found; install the dfu-util package\n");
 		free(img);
 		return 1;
 	}
-
-	printf("firmware image: %s (%ld bytes, base 0x%08X)\n", path, len, base);
-	if (version >= 0)
-		printf("image version:  v%02d%s%s%s\n", version,
-		       build[0] ? " (" : "", build, build[0] ? ")" : "");
 
 	if (!yes) {
 		printf("Unofficial tool, not affiliated with Thermal Grizzly: flash at your own risk.\n"
@@ -2411,10 +2685,15 @@ static void usage(void)
 		"  nvm CMD           NVM operation (load|store|reset|load-cal|store-cal|load-cal-factory|store-cal-factory)\n"
 		"  build             Show firmware build string\n"
 		"  bootloader        Enter DFU bootloader mode\n"
-		"  flash [FILE] [-y] Flash firmware (.hex or .bin) via DFU (needs dfu-util;\n"
+		"  flash [FILE] [-y] [--force]\n"
+		"                    Flash firmware (.hex or .bin) via DFU (needs dfu-util;\n"
 		"                    works without the daemon if the bootloader is already up).\n"
 		"                    Without FILE, flashes the bundled image at\n"
 		"                    " DEFAULT_FIRMWARE_PATH "\n"
+		"                    Refuses an image for another product, the build the\n"
+		"                    device runs, an older build, and on a Noctua Edition\n"
+		"                    a build before 2026-09-02; --force overrides that.\n"
+		"                    -y only skips the confirmation prompt.\n"
 		"\n"
 		"Commands (require wireview_hwmon module):\n"
 		"  sensors [--json]  Show all sensor readings from hwmon sysfs; --json prints\n"
@@ -2528,10 +2807,15 @@ int main(int argc, char **argv)
 		return cmd_build();
 	if (strcmp(cmd, "flash") == 0) {
 		const char *path = NULL;
-		int yes = 0;
+		int yes = 0, force = 0;
 		for (int i = 2; i < argc; i++) {
 			if (strcmp(argv[i], "-y") == 0) {
 				yes = 1;
+			} else if (strcmp(argv[i], "--force") == 0) {
+				force = 1;
+			} else if (argv[i][0] == '-' && argv[i][1]) {
+				fprintf(stderr, "wireviewctl: flash: unknown option '%s'\n", argv[i]);
+				return 1;
 			} else if (!path) {
 				path = argv[i];
 			} else {
@@ -2550,7 +2834,7 @@ int main(int argc, char **argv)
 			path = DEFAULT_FIRMWARE_PATH;
 			printf("using bundled firmware: %s\n", path);
 		}
-		return cmd_flash(path, yes);
+		return cmd_flash(path, yes, force);
 	}
 	if (strcmp(cmd, "bootloader") == 0)
 		return cmd_bootloader();
