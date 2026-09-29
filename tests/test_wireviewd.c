@@ -333,14 +333,8 @@ static void test_hmac(void)
 
 /* ---- sensor frame layout and the corrupt-frame rule ---- */
 
-/* The rule main() applies before publishing a frame (see the comment
- * there). It is inline in the poll loop, so this mirrors it; the e2e test
- * checks the daemon itself discards such frames. */
-static int frame_is_corrupt(const struct sensor_struct *ss)
-{
-	return ss->fan_duty > 100 || ss->_pad1 || ss->_pad2;
-}
-
+/* frame_is_sane() is the check main() applies before publishing a frame;
+ * the e2e test checks the daemon discards a corrupt one end to end. */
 static void test_frame(void)
 {
 	/* Firmware SensorStruct layout (Pack=4). */
@@ -361,17 +355,17 @@ static void test_frame(void)
 	uint8_t raw[100];
 
 	memset(&ss, 0, sizeof(ss));
-	CHECK(!frame_is_corrupt(&ss));
+	CHECK(frame_is_sane(&ss));
 	ss.fan_duty = 100;
-	CHECK(!frame_is_corrupt(&ss));
+	CHECK(frame_is_sane(&ss));
 	ss.fan_duty = 101;
-	CHECK(frame_is_corrupt(&ss));
+	CHECK(!frame_is_sane(&ss));
 	ss.fan_duty = 0;
 	ss._pad1 = 1;
-	CHECK(frame_is_corrupt(&ss));
+	CHECK(!frame_is_sane(&ss));
 	ss._pad1 = 0;
 	ss._pad2 = 0x80;
-	CHECK(frame_is_corrupt(&ss));
+	CHECK(!frame_is_sane(&ss));
 
 	/* The corrupt frame seen in the field: fan=105 pad1=122
 	 * status=0x0607, as raw little-endian bytes off the wire. */
@@ -384,7 +378,7 @@ static void test_frame(void)
 	CHECK_EQ_INT(ss.fan_duty, 105);
 	CHECK_EQ_INT(ss._pad1, 122);
 	CHECK_EQ_INT(ss.fault_status, 0x0607);
-	CHECK(frame_is_corrupt(&ss));
+	CHECK(!frame_is_sane(&ss));
 }
 
 /* ---- write_hwmon conversion ---- */

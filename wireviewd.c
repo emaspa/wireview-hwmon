@@ -425,6 +425,16 @@ static int read_sensors(int fd, struct sensor_struct *ss)
 	return 0;
 }
 
+/* The serial protocol has no framing or CRC, so a desynced read corrupts
+ * arbitrary fields for one poll (a real corrupt frame in the field carried
+ * fan=105, pad1=122, status=0x0607). Real frames always have zero padding
+ * and a fan duty <= 100; anything else is discarded, and the next poll's
+ * tcflush realigns the stream. */
+static int frame_is_sane(const struct sensor_struct *ss)
+{
+	return ss->fan_duty <= 100 && !ss->_pad1 && !ss->_pad2;
+}
+
 /* Total power of a frame in uW: sum of the pins' mV * mA, as published
  * to hwmon. */
 static int64_t frame_power_uw(const struct sensor_struct *ss)
@@ -2352,15 +2362,10 @@ int main(int argc, char **argv)
 				goto disconnect;
 			}
 
-			/* The serial protocol has no framing/CRC, so a
-			 * desynced read corrupts arbitrary fields for one
-			 * poll (a real corrupt frame in the field carried
-			 * fan=105, pad1=122, status=0x0607). Two layers:
+			/* A desynced read (no framing or CRC on the wire)
+			 * is handled in two layers:
 			 *
-			 * 1. Discard frames failing sanity checks - real
-			 *    frames always have zero padding and a fan duty
-			 *    <= 100. The next poll's tcflush realigns the
-			 *    stream.
+			 * 1. Discard frames that fail frame_is_sane().
 			 * 2. Debounce fault bits - real faults persist (the
 			 *    device latches them in fault_log until
 			 *    cleared), so publish a bit only if it was set
@@ -2369,7 +2374,7 @@ int main(int argc, char **argv)
 			 *    independently and per bit, so a bit already
 			 *    latched in the log cannot let a corrupt
 			 *    status word (or vice versa) through. */
-			if (ss.fan_duty > 100 || ss._pad1 || ss._pad2) {
+			if (!frame_is_sane(&ss)) {
 				wlog("WARN",
 				     "discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u status=0x%04x log=0x%04x)",
 				     ss.fan_duty, ss._pad1, ss._pad2,
