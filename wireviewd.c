@@ -407,6 +407,14 @@ static int query_device_info(int serial_fd)
 	/* BuildInfo starts at offset 35 (3 + 32), 32 bytes max */
 	memcpy(dev_info.build_string, buf + 35, 32);
 	dev_info.build_string[32] = '\0';
+	/* Zero everything after the first NUL so no device garbage lingers
+	 * past the string. */
+	{
+		size_t bl = strnlen(dev_info.build_string, 32);
+
+		memset(dev_info.build_string + bl, 0,
+		       sizeof(dev_info.build_string) - bl);
+	}
 
 	/* Read config version from the config struct's Version field (byte 2).
 	 * Send CMD_READ_CONFIG, read first 4 bytes, extract version. */
@@ -693,6 +701,47 @@ static int psu_cap_watts(uint8_t cap)
 }
 
 /*
+ * Escape a string for use inside a JSON string literal. Escapes '"' and '\\',
+ * writes control characters (< 0x20) as \\u00XX, and replaces every byte
+ * >= 0x80 with '?'. The inputs (hostname, firmware build string) are ASCII
+ * in practice, so dropping non-ASCII is simpler than validating UTF-8 and
+ * still guarantees valid JSON. Output is always NUL-terminated and never
+ * ends in a partial escape sequence.
+ */
+static void json_escape(const char *in, char *out, size_t cap)
+{
+	size_t o = 0;
+
+	if (cap == 0)
+		return;
+	for (; *in; in++) {
+		unsigned char c = (unsigned char)*in;
+		char esc[8];
+		size_t n;
+
+		if (c == '"' || c == '\\') {
+			esc[0] = '\\';
+			esc[1] = (char)c;
+			n = 2;
+		} else if (c < 0x20) {
+			snprintf(esc, sizeof(esc), "\\u%04x", c);
+			n = 6;
+		} else if (c >= 0x80) {
+			esc[0] = '?';
+			n = 1;
+		} else {
+			esc[0] = (char)c;
+			n = 1;
+		}
+		if (o + n >= cap)
+			break;
+		memcpy(out + o, esc, n);
+		o += n;
+	}
+	out[o] = '\0';
+}
+
+/*
  * Build the GET /sensors JSON body. Matches the WireViewSensorDto schema the
  * desktop app consumes (camelCase; UID is uppercase hex to match the app).
  * This daemon manages a single device.
@@ -701,6 +750,8 @@ static int build_sensors_json(char *out, size_t cap)
 {
 	char host[64] = "wireview";
 	gethostname(host, sizeof(host) - 1);
+	char host_js[sizeof(host) * 6];
+	json_escape(host, host_js, sizeof(host_js));
 
 	char ts[32];
 	time_t now = time(NULL);
@@ -712,11 +763,14 @@ static int build_sensors_json(char *out, size_t cap)
 	if (!g_have_last || !dev_info.valid)
 		return snprintf(out, cap,
 			"{\"host\":\"%s\",\"appVersion\":\"wireviewd\",\"devices\":[]}",
-			host);
+			host_js);
 
 	char uid[25];
 	for (int i = 0; i < 12; i++)
 		snprintf(uid + i * 2, 3, "%02X", dev_info.uid[i]);
+
+	char build_js[33 * 6];
+	json_escape(dev_info.build_string, build_js, sizeof(build_js));
 
 	double pv[6], pc[6], sum_p = 0, sum_c = 0;
 	for (int i = 0; i < 6; i++) {
@@ -725,6 +779,10 @@ static int build_sensors_json(char *out, size_t cap)
 		sum_p += pv[i] * pc[i];
 		sum_c += pc[i];
 	}
+	/* Out-of-range readings (sensor disconnected) are sent as 0.0, not
+	 * null: the consumer's WireViewSensorDto declares TempInC/TempOutC/
+	 * Ext1C/Ext2C as plain (non-nullable) double, so null would fail
+	 * deserialization there. */
 	double t[4];
 	for (int i = 0; i < 4; i++) {
 		int16_t raw = g_last.ts[i];
@@ -740,7 +798,7 @@ static int build_sensors_json(char *out, size_t cap)
 		"\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
 		"\"psuCapW\":%d,\"fan\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
 		"\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f}]}",
-		host, uid, dev_info.fw_version, dev_info.build_string, ts,
+		host_js, uid, dev_info.fw_version, build_js, ts,
 		pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
 		pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
 		t[0], t[1], t[2], t[3],
