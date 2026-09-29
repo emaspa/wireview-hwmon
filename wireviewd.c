@@ -1581,36 +1581,135 @@ static int http_header(const char *req, const char *name, char *out, size_t outs
 }
 
 /* ---- tiny JSON readers for our flat, controlled command schema ---- */
-static const char *json_find(const char *json, const char *key)
+
+static const char *json_ws(const char *p)
 {
-	char k[48];
-	snprintf(k, sizeof(k), "\"%s\"", key);
-	const char *p = strstr(json, k);
-	if (!p) return NULL;
-	p += strlen(k);
-	while (*p == ' ' || *p == ':' || *p == '\t') p++;
+	while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+		p++;
 	return p;
 }
+
+/* p is at an opening '"'. Returns the byte after the closing quote, or
+ * NULL if the string is not terminated. A backslash escapes the next
+ * byte, whatever it is. */
+static const char *json_skip_str(const char *p)
+{
+	for (p++; *p; p++) {
+		if (*p == '\\') {
+			if (!*++p)
+				return NULL;
+		} else if (*p == '"') {
+			return p + 1;
+		}
+	}
+	return NULL;
+}
+
+/* Skip the value at p: a string, an object or array (by depth, with the
+ * strings inside skipped, so no brace or quote in them counts), or a
+ * scalar up to the next ',', '}', ']' or blank. Returns the byte after
+ * it, or NULL if the input ends first. */
+static const char *json_skip_value(const char *p)
+{
+	int depth = 0;
+
+	for (;;) {
+		char c = *p;
+
+		if (c == '\0')
+			return NULL;
+		if (c == '"') {
+			p = json_skip_str(p);
+			if (!p || depth == 0)
+				return p;
+			continue;
+		}
+		if (c == '{' || c == '[') {
+			depth++;
+		} else if (c == '}' || c == ']') {
+			if (depth == 0)
+				return p;	/* ends the enclosing object */
+			if (--depth == 0)
+				return p + 1;
+		} else if (depth == 0 && (c == ',' || c == ' ' || c == '\t' ||
+					  c == '\r' || c == '\n')) {
+			return p;
+		}
+		p++;
+	}
+}
+
+/* Value of a top-level member of the JSON object in json (blanks before
+ * it skipped), or NULL. Walks the object member by member, so only keys
+ * at depth 1 match: key text inside a string value or a nested object or
+ * array is never taken for a key, and cannot shadow the real one. Keys
+ * are compared as written (no unescaping); the first match wins. NULL as
+ * well if the object is malformed or truncated before the key. */
+static const char *json_find(const char *json, const char *key)
+{
+	size_t klen = strlen(key);
+	const char *p = json_ws(json);
+
+	if (*p != '{')
+		return NULL;
+	p = json_ws(p + 1);
+	while (*p == '"') {
+		const char *k = p + 1;
+		const char *kend = json_skip_str(p);
+
+		if (!kend)
+			return NULL;
+		int match = (size_t)(kend - 1 - k) == klen &&
+			    memcmp(k, key, klen) == 0;
+		p = json_ws(kend);
+		if (*p != ':')
+			return NULL;
+		p = json_ws(p + 1);
+		if (match)
+			return *p ? p : NULL;
+		p = json_skip_value(p);
+		if (!p)
+			return NULL;
+		p = json_ws(p);
+		if (*p != ',')
+			return NULL;
+		p = json_ws(p + 1);
+	}
+	return NULL;
+}
+
+/* String member key, unescaped into out (at most n - 1 bytes, always
+ * NUL-terminated): a backslash takes the next byte literally. Returns 0
+ * if key is missing, not a string, or the string is not terminated. */
 static int json_str(const char *json, const char *key, char *out, size_t n)
 {
 	const char *p = json_find(json, key);
-	if (!p || *p != '"') return 0;
+	if (!p || *p != '"' || !json_skip_str(p) || n == 0)
+		return 0;
 	p++;
 	size_t i = 0;
-	while (*p && *p != '"' && i < n - 1) {
-		if (*p == '\\' && p[1]) p++;
+	while (*p != '"' && i < n - 1) {
+		if (*p == '\\')
+			p++;
 		out[i++] = *p++;
 	}
 	out[i] = '\0';
 	return 1;
 }
+
+/* Integer member key. Returns 0, leaving *out alone, if key is missing
+ * or its value is not a whole decimal integer ending the member (so
+ * "5.5", "5x" and a value cut off by the end of input are refused). */
 static int json_int(const char *json, const char *key, long *out)
 {
 	const char *p = json_find(json, key);
 	if (!p) return 0;
 	char *end;
+	errno = 0;
 	long v = strtol(p, &end, 10);
-	if (end == p) return 0;
+	if (end == p || errno == ERANGE) return 0;
+	const char *q = json_ws(end);
+	if (*q != ',' && *q != '}') return 0;
 	*out = v;
 	return 1;
 }

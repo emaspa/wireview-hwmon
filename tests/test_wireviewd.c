@@ -234,6 +234,229 @@ static void test_json_readers(void)
 	CHECK_EQ_STR(s, "clear");
 }
 
+/* Keys only match at the top level of the object: never inside a string
+ * value, a nested object or an array, and never on a truncated input. */
+static void test_json_hostile(void)
+{
+	char s[32];
+	long v;
+
+	/* A value equal to the key name used to be found first. */
+	v = 0;
+	CHECK(json_int("{\"op\":\"cmd\",\"cmd\":5}", "cmd", &v));
+	CHECK_EQ_INT(v, 5);
+	CHECK(json_str("{\"deviceId\":\"op\",\"op\":\"screen\"}", "op", s, sizeof(s)));
+	CHECK_EQ_STR(s, "screen");
+
+	/* Key text inside a string value, with escaped quotes. */
+	CHECK(json_str("{\"a\":\"\\\"op\\\":\\\"evil\\\"\",\"op\":\"good\"}",
+		       "op", s, sizeof(s)));
+	CHECK_EQ_STR(s, "good");
+	CHECK(json_str("{\"a\":\"x \\\"op\\\" \",\"op\":\"good\"}", "op", s, sizeof(s)));
+	CHECK_EQ_STR(s, "good");
+	/* An escaped backslash right before the closing quote. */
+	CHECK(json_str("{\"a\":\"\\\\\",\"op\":\"good\"}", "op", s, sizeof(s)));
+	CHECK_EQ_STR(s, "good");
+	/* Braces and brackets inside strings do not count. */
+	CHECK(json_str("{\"a\":\"}\",\"b\":\"{[\",\"op\":\"good\"}", "op", s, sizeof(s)));
+	CHECK_EQ_STR(s, "good");
+
+	/* Nested objects and arrays are skipped by depth. */
+	CHECK(json_int("{\"x\":{\"cmd\":5},\"cmd\":224}", "cmd", &v));
+	CHECK_EQ_INT(v, 224);
+	CHECK(json_int("{\"x\":[1,{\"cmd\":5},\"]\"],\"cmd\":225}", "cmd", &v));
+	CHECK_EQ_INT(v, 225);
+	CHECK(json_int("{\"x\":{\"y\":{\"z\":[[{}]]}},\"cmd\":226}", "cmd", &v));
+	CHECK_EQ_INT(v, 226);
+	v = 42;
+	CHECK(!json_int("{\"x\":{\"cmd\":5}}", "cmd", &v));
+	CHECK(!json_int("{\"x\":[\"cmd\",5]}", "cmd", &v));
+	CHECK(!json_str("{\"x\":{\"op\":\"evil\"}}", "op", s, sizeof(s)));
+	/* Other scalars are skipped too. */
+	CHECK(json_int("{\"a\":true,\"b\":null,\"c\":-1.5e3,\"cmd\":7}", "cmd", &v));
+	CHECK_EQ_INT(v, 7);
+
+	/* Only whole keys match; the first of duplicates wins. */
+	CHECK(json_str("{\"opx\":\"a\",\"xop\":\"b\",\"op\":\"c\"}", "op", s, sizeof(s)));
+	CHECK_EQ_STR(s, "c");
+	CHECK(!json_str("{\"o\":\"a\"}", "op", s, sizeof(s)));
+	CHECK(json_str("{\"op\":\"first\",\"op\":\"second\"}", "op", s, sizeof(s)));
+	CHECK_EQ_STR(s, "first");
+
+	/* Blanks anywhere between tokens. */
+	CHECK(json_int(" \r\n{ \"a\" : \"b\" ,\n\t\"cmd\"\t:\r\n 9 \n}", "cmd", &v));
+	CHECK_EQ_INT(v, 9);
+
+	/* Not an object, or not a key where one is due. */
+	v = 42;
+	CHECK(!json_int("\"cmd\":5", "cmd", &v));
+	CHECK(!json_int("[{\"cmd\":5}]", "cmd", &v));
+	CHECK(!json_int("{cmd:5}", "cmd", &v));
+	CHECK(!json_int("{\"a\" 1,\"cmd\":5}", "cmd", &v));	/* no ':' */
+	CHECK(!json_int("{\"a\":1 \"cmd\":5}", "cmd", &v));	/* no ',' */
+	CHECK(!json_int("{\"a\":1]\"cmd\":5}", "cmd", &v));
+	CHECK(!json_int("", "cmd", &v));
+	CHECK(!json_int("{}", "cmd", &v));
+
+	/* Truncated input. */
+	CHECK(!json_int("{", "cmd", &v));
+	CHECK(!json_int("{\"cm", "cmd", &v));
+	CHECK(!json_int("{\"cmd\"", "cmd", &v));
+	CHECK(!json_int("{\"cmd\":", "cmd", &v));
+	CHECK(!json_int("{\"cmd\":22", "cmd", &v));	/* could be 227 */
+	CHECK(!json_int("{\"a\":\"xx", "cmd", &v));
+	CHECK(!json_int("{\"a\":\"x\\", "cmd", &v));	/* ends mid-escape */
+	CHECK(!json_int("{\"a\":{\"b\":1", "cmd", &v));
+	CHECK(!json_int("{\"a\":[1,2", "cmd", &v));
+	CHECK(!json_str("{\"op\":\"scr", "op", s, sizeof(s)));
+	CHECK(!json_str("{\"op\":\"scr\\\"", "op", s, sizeof(s)));
+	CHECK_EQ_INT(v, 42);
+	/* A complete member before the cut is still readable. */
+	CHECK(json_int("{\"cmd\":22,\"op\":\"scr", "cmd", &v));
+	CHECK_EQ_INT(v, 22);
+
+	/* Integers must be whole and end the member. */
+	v = 42;
+	CHECK(!json_int("{\"cmd\":5.5}", "cmd", &v));
+	CHECK(!json_int("{\"cmd\":5x}", "cmd", &v));
+	CHECK(!json_int("{\"cmd\":\"5\"}", "cmd", &v));
+	CHECK(!json_int("{\"cmd\":99999999999999999999999}", "cmd", &v));
+	CHECK(!json_int("{\"cmd\":{}}", "cmd", &v));
+	CHECK_EQ_INT(v, 42);
+	CHECK(json_int("{\"cmd\":5 }", "cmd", &v));
+	CHECK_EQ_INT(v, 5);
+
+	/* A string value must be a string; n == 0 writes nothing. */
+	CHECK(!json_str("{\"op\":{\"a\":\"b\"}}", "op", s, sizeof(s)));
+	CHECK(!json_str("{\"op\":[\"a\"]}", "op", s, sizeof(s)));
+	memset(s, 'Z', 4);
+	CHECK(!json_str("{\"op\":\"a\"}", "op", s, 0));
+	CHECK(s[0] == 'Z');
+}
+
+/* ---- handle_post_command, end to end in one process ---- */
+
+/* Sign body as a client would, call handle_post_command() with the serial
+ * relay going into a pipe, and return the HTTP status. serial[] receives
+ * what reached the "device" (*serial_len bytes). */
+static int post_command(const char *body, uint8_t *serial, size_t serial_cap,
+			size_t *serial_len)
+{
+	static int nonce_seq;
+	int sp[2], pp[2];
+	char ts[24], nonce[40], msg[HTTP_MAX_BODY + 128], sig[65];
+	static char req[HTTP_MAX_HEADER + HTTP_MAX_BODY];
+	uint8_t mac[32];
+	int status = -1;
+
+	*serial_len = 0;
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) < 0 || pipe(pp) < 0)
+		return -1;
+	fcntl(pp[0], F_SETFL, O_NONBLOCK);
+	fcntl(sp[1], F_SETFL, O_NONBLOCK);
+
+	snprintf(ts, sizeof(ts), "%ld", (long)time(NULL));
+	snprintf(nonce, sizeof(nonce), "test-nonce-%d", ++nonce_seq);
+	int mlen = snprintf(msg, sizeof(msg), "%s\n%s\n%s", ts, nonce, body);
+	hmac_sha256((const uint8_t *)g_secret, strlen(g_secret),
+		    (const uint8_t *)msg, (size_t)mlen, mac);
+	hex_encode(mac, 32, sig);
+	snprintf(req, sizeof(req),
+		 "POST /command HTTP/1.1\r\nX-Auth-Ts: %s\r\nX-Auth-Nonce: %s\r\n"
+		 "X-Auth-Sig: %s\r\nContent-Length: %zu\r\n\r\n%s",
+		 ts, nonce, sig, strlen(body), body);
+
+	g_serial_fd = pp[1];
+	handle_post_command(sp[0], req, strstr(req, "\r\n\r\n") + 4, "test");
+	g_serial_fd = -1;
+
+	char resp[512];
+	ssize_t n = read(sp[1], resp, sizeof(resp) - 1);
+	if (n > 0) {
+		resp[n] = '\0';
+		sscanf(resp, "HTTP/1.1 %d", &status);
+	}
+	n = read(pp[0], serial, serial_cap);
+	if (n > 0)
+		*serial_len = (size_t)n;
+	close(sp[0]);
+	close(sp[1]);
+	close(pp[0]);
+	close(pp[1]);
+	return status;
+}
+
+static void test_post_command(void)
+{
+	uint8_t ser[512];
+	size_t n;
+
+	snprintf(g_secret, sizeof(g_secret), "unit-test-secret");
+	g_suspend_until.tv_sec = 0;
+
+	/* The requests the GUI (WireViewCommand.ToJson) and wireviewctl
+	 * send, and the serial bytes each must produce. */
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"A1A2\",\"op\":\"screen\",\"cmd\":227}",
+				  ser, sizeof(ser), &n), 200);
+	CHECK_EQ_INT(n, 2);
+	CHECK_EQ_MEM(ser, "\x0c\xe3", 2);
+	CHECK_EQ_INT(post_command("{\"op\":\"nvm\",\"cmd\":2}", ser, sizeof(ser), &n), 200);
+	CHECK_EQ_INT(n, 6);
+	CHECK_EQ_MEM(ser, "\xf2\x55\xaa\x55\xaa\x02", 6);
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"A1A2\",\"op\":\"clearFaults\","
+				  "\"statusMask\":65534,\"logMask\":0}",
+				  ser, sizeof(ser), &n), 200);
+	CHECK_EQ_INT(n, 5);
+	CHECK_EQ_MEM(ser, "\x0e\xfe\xff\x00\x00", 5);
+	/* Masks default to 0 (clear all) when omitted. */
+	CHECK_EQ_INT(post_command("{\"op\":\"clearFaults\"}", ser, sizeof(ser), &n), 200);
+	CHECK_EQ_MEM(ser, "\x0e\x00\x00\x00\x00", 5);
+
+	/* writeConfig: a 96-byte config goes out as offset frames 0 and 62. */
+	uint8_t cfg[96];
+	char b64[200], body[400];
+	for (int i = 0; i < 96; i++)
+		cfg[i] = (uint8_t)(i * 7 + 3);
+	b64_encode(cfg, 96, b64);
+	snprintf(body, sizeof(body),
+		 "{\"deviceId\":\"A1A2\",\"op\":\"writeConfig\",\"version\":2,\"data\":\"%s\"}", b64);
+	CHECK_EQ_INT(post_command(body, ser, sizeof(ser), &n), 200);
+	CHECK_EQ_INT(n, 2 + 62 + 2 + 34);
+	CHECK(ser[0] == 0x06 && ser[1] == 0);
+	CHECK_EQ_MEM(ser + 2, cfg, 62);
+	CHECK(ser[64] == 0x06 && ser[65] == 62);
+	CHECK_EQ_MEM(ser + 66, cfg + 62, 34);
+
+	/* Key names inside values or nested members no longer derail the
+	 * lookup: each of these used to fail or pick the wrong value. */
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"op\",\"op\":\"screen\",\"cmd\":224}",
+				  ser, sizeof(ser), &n), 200);
+	CHECK_EQ_MEM(ser, "\x0c\xe0", 2);
+	CHECK_EQ_INT(post_command("{\"op\":\"screen\",\"x\":{\"cmd\":5},\"cmd\":225}",
+				  ser, sizeof(ser), &n), 200);
+	CHECK_EQ_MEM(ser, "\x0c\xe1", 2);
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"\\\"op\\\":\\\"nvm\\\"\",\"op\":\"screen\",\"cmd\":226}",
+				  ser, sizeof(ser), &n), 200);
+	CHECK_EQ_MEM(ser, "\x0c\xe2", 2);
+
+	/* Bad requests reach nothing. */
+	QUIET(CHECK_EQ_INT(post_command("{\"x\":{\"op\":\"screen\"},\"cmd\":1}",
+					ser, sizeof(ser), &n), 400));
+	CHECK_EQ_INT(n, 0);
+	CHECK_EQ_INT(post_command("{\"op\":\"bogus\"}", ser, sizeof(ser), &n), 400);
+	CHECK_EQ_INT(n, 0);
+	CHECK_EQ_INT(post_command("{\"op\":\"screen\",\"cmd\":22", ser, sizeof(ser), &n), 500);
+	CHECK_EQ_INT(n, 0);
+	CHECK_EQ_INT(post_command("{\"op\":\"screen\",\"cmd\":\"227\"}", ser, sizeof(ser), &n), 500);
+	CHECK_EQ_INT(n, 0);
+	CHECK_EQ_INT(post_command("{\"op\":\"writeConfig\",\"data\":\"AAEC", ser, sizeof(ser), &n), 500);
+	CHECK_EQ_INT(n, 0);
+
+	g_secret[0] = '\0';
+	memset(g_nonces, 0, sizeof(g_nonces));
+	g_nonce_idx = 0;
+}
+
 /* ---- http_header ---- */
 
 static void test_http_header(void)
@@ -1018,7 +1241,9 @@ int main(void)
 	test_json_escape();
 	test_b64();
 	test_json_readers();
+	test_json_hostile();
 	test_http_header();
+	test_post_command();
 	test_hmac();
 	test_frame();
 	test_write_hwmon();
