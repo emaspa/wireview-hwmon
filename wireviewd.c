@@ -670,7 +670,9 @@ static int query_device_info(int serial_fd)
 
 done:
 	dev_info.valid = 1;
-	printf("wireviewd: FW v%d, config v%d\n",
+	printf("wireviewd: %s (%02X%02X), FW v%d, config v%d\n",
+	       edition_name(dev_info.vendor_id, dev_info.product_id),
+	       dev_info.vendor_id, dev_info.product_id,
 	       dev_info.fw_version, dev_info.config_version);
 	return 0;
 }
@@ -854,6 +856,33 @@ static long client_uid(const struct client *c)
 	return c->uid == (uid_t)-1 ? -1L : (long)c->uid;
 }
 
+/* GET_DEVICE_INFO reply: fw_version u8, config_version u8, uid[12], the
+ * build string NUL-terminated, then vendor_id u8, product_id u8. The two
+ * ids follow the NUL so clients that read the build string up to the
+ * first NUL (GUI <= 1.2.5.0, wireviewctl <= 1.6.0) are unaffected; a
+ * reply without them comes from an older daemon, which only ever
+ * attached vendor 0xEF product 0x05. */
+#define DEVICE_INFO_MAX (2 + 12 + sizeof(dev_info.build_string) + 2)
+
+/* Fill out (DEVICE_INFO_MAX bytes) from dev_info; returns the length. */
+static size_t device_info_reply(uint8_t *out)
+{
+	size_t n = 0;
+	size_t blen = strnlen(dev_info.build_string,
+			      sizeof(dev_info.build_string) - 1) + 1;
+
+	out[n++] = dev_info.fw_version;
+	out[n++] = dev_info.config_version;
+	memcpy(out + n, dev_info.uid, 12);
+	n += 12;
+	memcpy(out + n, dev_info.build_string, blen - 1);
+	n += blen - 1;
+	out[n++] = '\0';
+	out[n++] = dev_info.vendor_id;
+	out[n++] = dev_info.product_id;
+	return n;
+}
+
 /* Execute the complete request held in c->req. */
 static void handle_client_request(const struct client *c, int serial_fd)
 {
@@ -912,15 +941,9 @@ static void handle_client_request(const struct client *c, int serial_fd)
 			send_response(client_fd, RESP_NOT_CONNECTED, NULL, 0);
 			return;
 		}
-		uint8_t resp[2 + 12 + 64];
-		int resp_len = 0;
-		resp[resp_len++] = dev_info.fw_version;
-		resp[resp_len++] = dev_info.config_version;
-		memcpy(resp + resp_len, dev_info.uid, 12);
-		resp_len += 12;
-		int blen = (int)strlen(dev_info.build_string) + 1;
-		memcpy(resp + resp_len, dev_info.build_string, blen);
-		resp_len += blen;
+		uint8_t resp[DEVICE_INFO_MAX];
+		size_t resp_len = device_info_reply(resp);
+
 		send_response(client_fd, RESP_OK, resp, (uint16_t)resp_len);
 		break;
 	}
@@ -1250,6 +1273,12 @@ static int build_sensors_json(char *out, size_t cap)
 	char build_js[33 * 6];
 	json_escape(dev_info.build_string, build_js, sizeof(build_js));
 
+	/* hwRev as the Thermal Grizzly client formats it: vendor and
+	 * product id, two uppercase hex digits each (EF05, EF06). */
+	const char *edition = edition_name(dev_info.vendor_id, dev_info.product_id);
+	char name_js[64 * 6];
+	json_escape(edition ? edition : "WireView Pro II", name_js, sizeof(name_js));
+
 	double pv[6], pc[6], sum_p = 0, sum_c = 0;
 	for (int i = 0; i < 6; i++) {
 		pv[i] = g_last.pins[i].voltage / 1000.0;
@@ -1269,14 +1298,15 @@ static int build_sensors_json(char *out, size_t cap)
 
 	return snprintf(out, cap,
 		"{\"host\":\"%s\",\"appVersion\":\"wireviewd\",\"devices\":[{"
-		"\"id\":\"%s\",\"name\":\"WireView Pro II\",\"connected\":true,"
-		"\"hwRev\":\"\",\"fwVer\":\"%d\",\"buildString\":\"%s\",\"timestamp\":\"%s\","
+		"\"id\":\"%s\",\"name\":\"%s\",\"connected\":true,"
+		"\"hwRev\":\"%02X%02X\",\"fwVer\":\"%d\",\"buildString\":\"%s\",\"timestamp\":\"%s\","
 		"\"pinVoltage\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
 		"\"pinCurrent\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
 		"\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
 		"\"psuCapW\":%d,\"fan\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
 		"\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f,\"energyJ\":%.3f}]}",
-		host_js, uid, dev_info.fw_version, build_js, ts,
+		host_js, uid, name_js, dev_info.vendor_id, dev_info.product_id,
+		dev_info.fw_version, build_js, ts,
 		pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
 		pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
 		t[0], t[1], t[2], t[3],
@@ -1467,10 +1497,15 @@ static int build_metrics(struct outbuf *b)
 
 	char build[33 * 2 + 1];
 	prom_escape(dev_info.build_string, build, sizeof(build));
+	const char *ed = edition_name(dev_info.vendor_id, dev_info.product_id);
+	char edition[64 * 2 + 1];
+	prom_escape(ed ? ed : "", edition, sizeof(edition));
 	prom_family(b, "wireview_firmware_info", "gauge",
-		    "Firmware version and build string.");
-	ob_printf(b, "wireview_firmware_info{%s,version=\"%d\",build=\"%s\"} 1\n",
-		  dev, dev_info.fw_version, build);
+		    "Firmware version and build string, product id and edition.");
+	ob_printf(b, "wireview_firmware_info{%s,version=\"%d\",build=\"%s\","
+		  "product=\"%02X%02X\",edition=\"%s\"} 1\n",
+		  dev, dev_info.fw_version, build,
+		  dev_info.vendor_id, dev_info.product_id, edition);
 
 	return b->overflow ? -1 : 0;
 }

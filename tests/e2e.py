@@ -457,8 +457,11 @@ def exercise(tmp, dev, daemon, hwmon, sock):
           f"status {status} data {data!r}")
     check(data[1:2] == b"\x02" and data[2:14] == UID,
           "GET_DEVICE_INFO returns the config version and UID")
-    check(data[14:].rstrip(b"\0") == BUILD,
+    check(data[14:].split(b"\0")[0] == BUILD,
           "GET_DEVICE_INFO returns the build string", repr(data[14:]))
+    check(data[14:] == BUILD + b"\0\xef\x05",
+          "GET_DEVICE_INFO ends with vendor EF, product 05 after the "
+          "build string's NUL", repr(data[14:]))
 
     r = ctl(tmp, "info")
     check(r.returncode == 0 and f"firmware: {FW_VERSION}" in r.stdout and
@@ -712,8 +715,10 @@ def exercise_http(tmp, dev, daemon, port):
           "# TYPE wireview_energy_joules_total counter" in body,
           "wireview_energy_joules_total is a counter above 0")
     check(metric(samples, "wireview_firmware_info", device=UID_HEX,
-                 version=str(FW_VERSION), build=BUILD.decode()) == 1,
-          "wireview_firmware_info labels the version and build string")
+                 version=str(FW_VERSION), build=BUILD.decode(),
+                 product="EF05", edition="WireView Pro II") == 1,
+          "wireview_firmware_info labels the version, build string, "
+          "product and edition")
     check(metric(samples, "wireview_temperature_celsius", device=UID_HEX,
                  sensor="onboard_in") == 35.5 and
           metric(samples, "wireview_temperature_celsius", device=UID_HEX,

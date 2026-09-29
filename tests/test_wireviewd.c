@@ -1134,6 +1134,8 @@ static void test_metrics(void)
 	g_last.fault_log = 0x8001;
 	memset(&dev_info, 0, sizeof(dev_info));
 	dev_info.fw_version = 7;
+	dev_info.vendor_id = 0xEF;
+	dev_info.product_id = 0x06;
 	snprintf(dev_info.build_string, sizeof(dev_info.build_string),
 		 "b\"1\\2\n3\xff");
 	dev_info.valid = 1;
@@ -1176,7 +1178,8 @@ static void test_metrics(void)
 	HAS("# TYPE wireview_energy_joules_total counter\n"
 	    "wireview_energy_joules_total%s} 1234.567891\n", d);
 	/* The build string is escaped as a label value. */
-	HAS("\nwireview_firmware_info%s,version=\"7\",build=\"b\\\"1\\\\2\\n3?\"} 1\n", d);
+	HAS("\nwireview_firmware_info%s,version=\"7\",build=\"b\\\"1\\\\2\\n3?\","
+	    "product=\"EF06\",edition=\"WireView Pro II Noctua Edition\"} 1\n", d);
 #undef HAS
 	/* Every sample line belongs to a family declared just before it. */
 	CHECK(strncmp(body, "# HELP wireview_up ", 19) == 0);
