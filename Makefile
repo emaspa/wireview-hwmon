@@ -40,6 +40,8 @@ install: all
 	udevadm control --reload-rules
 	systemctl daemon-reload
 
+# modules_install puts external modules in updates/ (older kernels: extra/),
+# compressed as .ko.{zst,xz,gz} when CONFIG_MODULE_COMPRESS_* is set.
 uninstall:
 	systemctl stop wireviewd 2>/dev/null || true
 	systemctl disable wireviewd 2>/dev/null || true
@@ -51,7 +53,8 @@ uninstall:
 	rmdir /usr/share/wireview 2>/dev/null || true
 	rm -f /etc/modules-load.d/wireview-hwmon.conf
 	rm -f /etc/avahi/services/wireview.service
-	rm -f /lib/modules/$(shell uname -r)/extra/wireview_hwmon.ko
+	rm -f $(foreach d,updates extra,$(foreach x,ko ko.zst ko.xz ko.gz,\
+		/lib/modules/$(shell uname -r)/$(d)/wireview_hwmon.$(x)))
 	depmod -a
 	udevadm control --reload-rules
 	systemctl daemon-reload
