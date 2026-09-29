@@ -1342,6 +1342,10 @@ int main(int argc, char **argv)
 		int client_fds[MAX_CLIENTS];
 		int num_clients = 0;
 
+		/* Fault bits seen in the previous frame (debounce state),
+		 * reset on every (re)connect. */
+		uint16_t prev_status = 0, prev_log = 0;
+
 		memset(client_fds, -1, sizeof(client_fds));
 
 		/* Use the -d path every time; otherwise auto-detect. Clearing
@@ -1534,26 +1538,29 @@ int main(int argc, char **argv)
 				 *    stream.
 				 * 2. Debounce fault bits - real faults persist (the
 				 *    device latches them in fault_log until
-				 *    cleared), so require two consecutive frames
-				 *    before publishing fault bits. */
+				 *    cleared), so publish a bit only if it was set
+				 *    in both the previous and the current frame.
+				 *    fault_status and fault_log are debounced
+				 *    independently and per bit, so a bit already
+				 *    latched in the log cannot let a corrupt
+				 *    status word (or vice versa) through. */
 				if (ss.fan_duty > 100 || ss._pad1 || ss._pad2) {
 					wlog("WARN",
 					     "discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u status=0x%04x log=0x%04x)",
 					     ss.fan_duty, ss._pad1, ss._pad2,
 					     ss.fault_status, ss.fault_log);
 				} else {
-					static uint16_t prev_status, prev_log;
 					uint16_t raw_status = ss.fault_status;
 					uint16_t raw_log = ss.fault_log;
+					uint16_t new_status = raw_status & ~prev_status;
+					uint16_t new_log = raw_log & ~prev_log;
 
-					if ((raw_status || raw_log) &&
-					    !(prev_status || prev_log)) {
+					if (new_status || new_log)
 						wlog("WARN",
-						     "suppressed unconfirmed fault frame: status=0x%04x log=0x%04x",
-						     raw_status, raw_log);
-						ss.fault_status = 0;
-						ss.fault_log = 0;
-					}
+						     "suppressed unconfirmed fault bits: status=0x%04x log=0x%04x",
+						     new_status, new_log);
+					ss.fault_status = raw_status & prev_status;
+					ss.fault_log = raw_log & prev_log;
 					prev_status = raw_status;
 					prev_log = raw_log;
 
