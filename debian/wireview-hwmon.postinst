@@ -1,10 +1,9 @@
 #!/bin/sh
 set -e
 if [ "$1" = "configure" ]; then
-    systemctl daemon-reload || true
     udevadm control --reload-rules || true
     udevadm trigger || true
-    deb-systemd-helper enable wireviewd.service || true
-    deb-systemd-invoke start wireviewd.service || true
 fi
+# dh_installsystemd adds daemon-reload, enable on first install (an admin's
+# "systemctl disable" is kept), start, and restart on upgrade here.
 #DEBHELPER#
