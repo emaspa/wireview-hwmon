@@ -750,6 +750,31 @@ CI runs the same tests on every push and pull request, plus a `-Werror` build
 of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
 (shellcheck, checkpatch, the version check).
 
+## Roadmap
+
+- **Multi-device support** (deferred). One hwmon device per WireView. The
+  `/sensors` schema already has a `devices[]` array, but the daemon handles one
+  device: this needs a misc node per device or a device id in the record, and a
+  decision on how the hwmon devices are named.
+- **Idle-client timeout on the command socket**, once the GUI retries after a
+  reconnect. Today a client may stay connected indefinitely, and only 4 fit.
+- **Drop `fan1_input` and `psu_cap`** after one release, now that `pwm1` and
+  `power1_cap` replace them.
+- **Move the packaged systemd unit and udev rules from `lib/` to `usr/lib/`**
+  (lintian `aliased-location`).
+- **Firmware packaging**: split the Thermal Grizzly `.hex` into its own
+  package, or document permission to redistribute it.
+
+### Known issues and small follow-ups
+
+- `ct_str_equal()` in `sha256.c` squeezes the length difference into one byte, so strings whose lengths differ by a multiple of 256 can compare equal when one is a prefix of the other; harmless today, since it only compares a fixed 64-character MAC.
+- `load_firmware()` in `wireviewctl` ignores Intel HEX record checksums and accepts short or truncated records, so a corrupted `.hex` would load silently; add checksum verification.
+- `parse_remote()` (`wireviewctl top`, `--host`) splits device objects at the first `}`, and `json_escape()` does not escape braces, so a remote build string containing a brace would break parsing.
+- `json_find()` and `j_find()` match a key anywhere in the text, including inside a string value.
+- Kernels before 6.4 declare `hwmon_chip_info.info` without the `* const`, so a stock 5.14 build may warn; add a `LINUX_VERSION_CODE` guard if RHEL 9 support stays.
+- The serial `WRITE_CONFIG` command has no length field, so the end-to-end test does not cover config writes.
+- In the GUI ([wireview-linux](https://github.com/emaspa/wireview-linux)): the theme preview loads on connect and borrows the serial port, so users outside the `wireview` group get the permission message on every connect; and the `ClearFaults` defaults of `0xFFFF`/`0xFFFF` clear nothing under the firmware's keep-mask rule (callers pass explicit masks today).
+
 ## License
 
 GPL-2.0
