@@ -26,6 +26,7 @@
 #include <dirent.h>
 #include <termios.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <time.h>
 #include <poll.h>
 #include <sys/stat.h>
@@ -62,7 +63,7 @@
 #endif
 
 #define WIREVIEW_MAGIC   0x57565032
-#define WIREVIEW_VERSION 2
+#define WIREVIEW_VERSION 3
 
 #define MAX_CLIENTS 4
 
@@ -126,9 +127,16 @@ struct __attribute__((packed)) hwmon_data {
 	uint16_t fault_status;
 	uint16_t fault_log;
 	uint16_t _pad;
+	/* v3: energy since daemon start, microjoules, saturating at INT64_MAX */
+	int64_t  energy_uj;
 };
 
-_Static_assert(sizeof(struct hwmon_data) == 148, "hwmon_data size mismatch");
+_Static_assert(sizeof(struct hwmon_data) == 156, "hwmon_data size mismatch");
+
+/* A v2 record is the v3 one without energy_uj. A module from before v3
+ * rejects the longer record with EINVAL; write_hwmon() then falls back. */
+#define HWMON_V2_SIZE offsetof(struct hwmon_data, energy_uj)
+_Static_assert(HWMON_V2_SIZE == 148, "hwmon_data v2 prefix mismatch");
 
 /*
  * SensorStruct from the WireView firmware (Pack=4, little-endian).
@@ -171,6 +179,19 @@ static struct device_info dev_info;
 /* Latest sensor frame, cached for the HTTP /sensors publisher. */
 static struct sensor_struct g_last;
 static int g_have_last;
+
+/* Energy integrated from accepted frames since daemon start (never reset
+ * on reconnect). g_energy_frac carries the sub-microjoule remainder in
+ * uW*ns so no rounding accumulates; g_energy_ts is the CLOCK_MONOTONIC
+ * time of the previous accepted frame, valid while g_energy_ts_valid. */
+static int64_t g_energy_uj;
+static int64_t g_energy_frac;
+static struct timespec g_energy_ts;
+static int g_energy_ts_valid;
+
+/* Set when the loaded module rejected a v3 record: write v2 (no energy)
+ * until the next connect. */
+static int g_hwmon_v2;
 
 /* Write-command auth + relay state for the HTTP POST /command endpoint. */
 static char g_secret[128];      /* shared HMAC secret; empty => writes disabled */
@@ -395,11 +416,69 @@ static int read_sensors(int fd, struct sensor_struct *ss)
 	return 0;
 }
 
+/* Total power of a frame in uW: sum of the pins' mV * mA, as published
+ * to hwmon. */
+static int64_t frame_power_uw(const struct sensor_struct *ss)
+{
+	int64_t sum = 0;
+
+	for (int i = 0; i < 6; i++)
+		sum += (int64_t)ss->pins[i].voltage *
+		       (int64_t)ss->pins[i].current;
+	return sum;
+}
+
+#define NSEC_PER_SEC 1000000000LL
+
+/* energy_uj += p_uw * dt_ns / 1e9, exactly (the remainder carries over in
+ * g_energy_frac), saturating at INT64_MAX. Plain 64-bit arithmetic with
+ * overflow checks, since 32-bit targets have no __int128:
+ *   p * dt / 1e9 = p * s + a * n + (b * n) / 1e9
+ * with dt = s * 1e9 + n and p = a * 1e9 + b, where b * n < 1e18. */
+static void energy_add(int64_t p_uw, int64_t dt_ns)
+{
+	int64_t s = dt_ns / NSEC_PER_SEC, n = dt_ns % NSEC_PER_SEC;
+	int64_t a = p_uw / NSEC_PER_SEC, b = p_uw % NSEC_PER_SEC;
+	int64_t add, t, bn;
+	int ovf = 0;
+
+	if (p_uw <= 0 || dt_ns <= 0 || g_energy_uj == INT64_MAX)
+		return;
+	ovf |= __builtin_mul_overflow(p_uw, s, &add);
+	ovf |= __builtin_mul_overflow(a, n, &t);
+	ovf |= __builtin_add_overflow(add, t, &add);
+	bn = b * n + g_energy_frac;
+	g_energy_frac = bn % NSEC_PER_SEC;
+	ovf |= __builtin_add_overflow(add, bn / NSEC_PER_SEC, &add);
+	ovf |= __builtin_add_overflow(g_energy_uj, add, &g_energy_uj);
+	if (ovf)
+		g_energy_uj = INT64_MAX;
+}
+
+/* Integrate an accepted frame's power over the time since the previous
+ * accepted frame. After a gap longer than max_gap_ms (serial handover,
+ * reconnect, system suspend) the step is skipped rather than attributing
+ * the whole gap to this frame's power; the frame only restarts the clock. */
+static void energy_accumulate(const struct sensor_struct *ss, long max_gap_ms)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (g_energy_ts_valid) {
+		int64_t dt_ns = (int64_t)(now.tv_sec - g_energy_ts.tv_sec) *
+				NSEC_PER_SEC + (now.tv_nsec - g_energy_ts.tv_nsec);
+
+		if (dt_ns <= (int64_t)max_gap_ms * 1000000)
+			energy_add(frame_power_uw(ss), dt_ns);
+	}
+	g_energy_ts = now;
+	g_energy_ts_valid = 1;
+}
+
 /* Convert sensor data to hwmon format and write to kernel module */
 static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 {
 	struct hwmon_data hd;
-	int64_t power_sum = 0;
 	int i;
 
 	memset(&hd, 0, sizeof(hd));
@@ -411,9 +490,8 @@ static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 		hd.current_ma[i] = (int32_t)ss->pins[i].current;
 		hd.pin_power_uw[i] = (int64_t)ss->pins[i].voltage *
 				     (int64_t)ss->pins[i].current;
-		power_sum += hd.pin_power_uw[i];
 	}
-	hd.total_power_uw = power_sum;
+	hd.total_power_uw = frame_power_uw(ss);
 
 	for (i = 0; i < 4; i++) {
 		int16_t raw = ss->ts[i];
@@ -431,8 +509,21 @@ static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 	hd.psu_cap = ss->hpwr_cap;
 	hd.fault_status = ss->fault_status;
 	hd.fault_log = ss->fault_log;
+	hd.energy_uj = g_energy_uj;
 
-	if (write(hwmon_fd, &hd, sizeof(hd)) != sizeof(hd))
+	if (!g_hwmon_v2) {
+		if (write(hwmon_fd, &hd, sizeof(hd)) == sizeof(hd))
+			return 0;
+		if (errno != EINVAL)
+			return -1;
+		/* A module older than v3 is still loaded (e.g. upgraded
+		 * package, no reboot yet): keep it fed with v2 records. */
+		g_hwmon_v2 = 1;
+		printf("wireviewd: hwmon module does not accept v3 records, writing v2 (no energy)\n");
+		wlog("WARN", "hwmon module rejected a v3 record; writing v2 until the next connect (reload wireview_hwmon for energy)");
+	}
+	hd.version = 2;
+	if (write(hwmon_fd, &hd, HWMON_V2_SIZE) != (ssize_t)HWMON_V2_SIZE)
 		return -1;
 
 	return 0;
@@ -1019,14 +1110,14 @@ static int build_sensors_json(char *out, size_t cap)
 		"\"pinCurrent\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
 		"\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
 		"\"psuCapW\":%d,\"fan\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
-		"\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f}]}",
+		"\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f,\"energyJ\":%.3f}]}",
 		host_js, uid, dev_info.fw_version, build_js, ts,
 		pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
 		pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
 		t[0], t[1], t[2], t[3],
 		psu_cap_watts(g_last.hpwr_cap), g_last.fan_duty,
 		g_last.fault_status, g_last.fault_log,
-		sum_c, sum_p);
+		sum_c, sum_p, g_energy_uj / 1e6);
 }
 
 static int setup_http(void)
@@ -1784,6 +1875,7 @@ int main(int argc, char **argv)
 				g_serial_fd = serial_fd;
 				prev_status = 0;
 				prev_log = 0;
+				g_hwmon_v2 = 0;
 				printf("wireviewd: polling every %d ms\n", interval_ms);
 				clock_gettime(CLOCK_MONOTONIC, &next_poll);
 			}
@@ -1979,6 +2071,10 @@ int main(int argc, char **argv)
 				prev_status = raw_status;
 				prev_log = raw_log;
 
+				/* Allow a few missed polls, never less than 5 s. */
+				energy_accumulate(&ss, interval_ms * 3 > 5000 ?
+						       interval_ms * 3 : 5000);
+
 				if (write_hwmon(hwmon_fd, &ss) < 0) {
 					fprintf(stderr,
 						"wireviewd: hwmon write failed\n");
@@ -2011,6 +2107,8 @@ disconnect:
 		dev_path[0] = '\0';
 		g_have_last = 0;
 		dev_info.valid = 0;
+		/* The next device's first frame restarts the energy clock. */
+		g_energy_ts_valid = 0;
 		/* A serial handover belonged to the old connection; do not
 		 * let it hold off polling on the next one. */
 		g_suspend_until.tv_sec = 0;
