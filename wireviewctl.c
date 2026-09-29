@@ -27,7 +27,9 @@
 #include <sys/time.h>
 #include <linux/limits.h>
 
+#ifndef SOCK_PATH
 #define SOCK_PATH "/run/wireviewd.sock"
+#endif
 
 /* Package version, injected by the Makefile (-DWIREVIEW_PKG_VERSION="x.y.z"). */
 #ifndef WIREVIEW_PKG_VERSION
@@ -48,6 +50,11 @@
 #define RESP_OK            0
 #define RESP_ERROR         1
 #define RESP_NOT_CONNECTED 2
+#define RESP_DENIED        3	/* privileged command, peer not root or in "wireview" */
+
+/* sock_command() return values other than 0 */
+#define SOCK_FAIL   (-1)
+#define SOCK_DENIED (-2)
 
 static int sock_connect(void)
 {
@@ -78,7 +85,9 @@ static int sock_connect(void)
 	return fd;
 }
 
-/* Send request and receive response. Returns 0 on success.
+/* Send request and receive response. Returns 0 on success, SOCK_DENIED if
+ * the daemon refused a privileged command, SOCK_FAIL on any other failure
+ * (both negative, so callers can test "< 0").
  * On success, *resp_buf is malloc'd and must be freed, *resp_len is set.
  * On failure, *resp_buf is NULL. */
 static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
@@ -86,7 +95,7 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 {
 	int fd = sock_connect();
 	if (fd < 0)
-		return -1;
+		return SOCK_FAIL;
 
 	/* Send: [cmd:1][len:2 LE][payload] */
 	uint8_t hdr[3] = { cmd, payload_len & 0xFF, payload_len >> 8 };
@@ -94,7 +103,7 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 	    (payload_len > 0 && write(fd, payload, payload_len) != payload_len)) {
 		perror("write");
 		close(fd);
-		return -1;
+		return SOCK_FAIL;
 	}
 
 	/* Receive: [status:1][len:2 LE][data] */
@@ -105,7 +114,7 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 		if (n <= 0) {
 			perror("read header");
 			close(fd);
-			return -1;
+			return SOCK_FAIL;
 		}
 		off += n;
 	}
@@ -118,7 +127,7 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 		data = calloc(1, rlen);
 		if (!data) {
 			close(fd);
-			return -1;
+			return SOCK_FAIL;
 		}
 		off = 0;
 		while (off < rlen) {
@@ -127,7 +136,7 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 				perror("read data");
 				free(data);
 				close(fd);
-				return -1;
+				return SOCK_FAIL;
 			}
 			off += n;
 		}
@@ -138,12 +147,24 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 	if (status == RESP_NOT_CONNECTED) {
 		fprintf(stderr, "wireviewctl: device not connected\n");
 		free(data);
-		return -1;
+		return SOCK_FAIL;
 	}
 	if (status == RESP_ERROR) {
 		fprintf(stderr, "wireviewctl: command failed\n");
 		free(data);
-		return -1;
+		return SOCK_FAIL;
+	}
+	if (status == RESP_DENIED) {
+		fprintf(stderr, "wireviewctl: permission denied: this command needs root "
+				"or membership of the 'wireview' group\n"
+				"(sudo usermod -aG wireview $USER, then log in again)\n");
+		free(data);
+		return SOCK_DENIED;
+	}
+	if (status != RESP_OK) {
+		fprintf(stderr, "wireviewctl: unexpected status %u from wireviewd\n", status);
+		free(data);
+		return SOCK_FAIL;
 	}
 
 	*resp_buf = data;
@@ -587,10 +608,15 @@ static int cmd_flash(const char *path, int yes)
 		uint8_t *resp = NULL;
 		uint16_t rlen = 0;
 		printf("entering bootloader...\n");
-		if (sock_command(WCMD_ENTER_BOOTLOADER, NULL, 0, &resp, &rlen) < 0)
+		int rc = sock_command(WCMD_ENTER_BOOTLOADER, NULL, 0, &resp, &rlen);
+		free(resp);
+		if (rc == SOCK_DENIED) {
+			free(img);
+			return 1;
+		}
+		if (rc < 0)
 			fprintf(stderr, "warning: could not reach wireviewd; waiting for a "
 					"manually started DFU bootloader\n");
-		free(resp);
 
 		int waited = 0;
 		while (!dfu_device_present() && waited < 25) {
