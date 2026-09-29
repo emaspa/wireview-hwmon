@@ -36,6 +36,7 @@
 #include <linux/limits.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <stdarg.h>
@@ -51,6 +52,9 @@
 #endif
 #ifndef SOCK_PATH
 #define SOCK_PATH    "/run/wireviewd.sock"
+#endif
+#ifndef CONFIG_PATH
+#define CONFIG_PATH  "/etc/wireview/config"
 #endif
 #define HTTP_PORT    9876
 
@@ -221,6 +225,7 @@ static int serial_suspended(void)
 }
 static int  g_http_enabled = 0; /* network listener off unless config enables it */
 static int  g_http_port = HTTP_PORT; /* listener port (config: port=) */
+static char g_bind_addr[192];   /* numeric listen address (config: bind=); empty = all */
 static int  g_log_retain_days = 14; /* days of audit logs to keep (config: log_days=) */
 
 #define HTTP_MAX_BODY    8192
@@ -1314,29 +1319,107 @@ static int build_metrics(struct outbuf *b)
 	return b->overflow ? -1 : 0;
 }
 
-static int setup_http(void)
+/* Open a listening socket on sa. Returns the fd, or -1 with errno set. */
+static int listen_on(const struct sockaddr *sa, socklen_t len)
 {
-	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	int fd = socket(sa->sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd < 0) return -1;
 
-	int yes = 1;
+	int yes = 1, no = 0;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	/* Dual-stack: IPv4 peers of an IPv6 socket arrive v4-mapped. */
+	if (sa->sa_family == AF_INET6)
+		setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
 
-	struct sockaddr_in addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	addr.sin_port = htons((uint16_t)g_http_port);
+	if (bind(fd, sa, len) < 0 || listen(fd, 8) < 0) {
+		int e = errno;
 
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
 		close(fd);
-		return -1;
-	}
-	if (listen(fd, 8) < 0) {
-		close(fd);
+		errno = e;
 		return -1;
 	}
 	return fd;
+}
+
+/*
+ * Open the LAN listener on bind= (a numeric IPv4 or IPv6 address) or, by
+ * default, on every address: [::] dual-stack, falling back to 0.0.0.0 when
+ * the host has no IPv6. desc receives the address for messages. Returns
+ * the fd, or -1 with errno set. A bind= value that is not a numeric
+ * address fails the listener rather than widening it to all addresses.
+ */
+static int setup_http(char *desc, size_t desc_len)
+{
+	int fd;
+
+	if (g_bind_addr[0]) {
+		struct addrinfo hints, *res;
+		char port[8];
+		int rc;
+
+		if (strchr(g_bind_addr, ':'))
+			snprintf(desc, desc_len, "[%s]:%d", g_bind_addr, g_http_port);
+		else
+			snprintf(desc, desc_len, "%s:%d", g_bind_addr, g_http_port);
+
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV | AI_PASSIVE;
+		snprintf(port, sizeof(port), "%d", g_http_port);
+		rc = getaddrinfo(g_bind_addr, port, &hints, &res);
+		if (rc != 0) {
+			fprintf(stderr, "wireviewd: bind=%s is not a numeric IPv4/IPv6 address (%s)\n",
+				g_bind_addr, gai_strerror(rc));
+			errno = EINVAL;
+			return -1;
+		}
+		fd = listen_on(res->ai_addr, res->ai_addrlen);
+		freeaddrinfo(res);
+		return fd;
+	}
+
+	struct sockaddr_in6 a6;
+	memset(&a6, 0, sizeof(a6));
+	a6.sin6_family = AF_INET6;
+	a6.sin6_addr = in6addr_any;
+	a6.sin6_port = htons((uint16_t)g_http_port);
+	snprintf(desc, desc_len, "[::]:%d", g_http_port);
+	fd = listen_on((struct sockaddr *)&a6, sizeof(a6));
+	if (fd >= 0 || (errno != EAFNOSUPPORT && errno != EPROTONOSUPPORT &&
+			errno != EADDRNOTAVAIL))
+		return fd;
+
+	/* No IPv6 on this host (ipv6.disable=1 or a sandbox without
+	 * AF_INET6): IPv4 only. */
+	struct sockaddr_in a4;
+	memset(&a4, 0, sizeof(a4));
+	a4.sin_family = AF_INET;
+	a4.sin_addr.s_addr = htonl(INADDR_ANY);
+	a4.sin_port = htons((uint16_t)g_http_port);
+	snprintf(desc, desc_len, "0.0.0.0:%d", g_http_port);
+	return listen_on((struct sockaddr *)&a4, sizeof(a4));
+}
+
+/* Numeric peer address for the audit log. IPv4 clients of the dual-stack
+ * listener arrive v4-mapped (::ffff:a.b.c.d) and are shown as plain IPv4. */
+static void peer_ip(const struct sockaddr_storage *ss, socklen_t len,
+		    char *out, size_t outlen)
+{
+	snprintf(out, outlen, "?");
+	if (ss->ss_family == AF_INET6) {
+		const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)ss;
+
+		if (IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) {
+			if (!inet_ntop(AF_INET, &s6->sin6_addr.s6_addr[12],
+				       out, (socklen_t)outlen))
+				snprintf(out, outlen, "?");
+			return;
+		}
+	}
+	if (getnameinfo((const struct sockaddr *)ss, len, out, (socklen_t)outlen,
+			NULL, 0, NI_NUMERICHOST) != 0)
+		snprintf(out, outlen, "?");
 }
 
 /* ---- Daily-rotating audit log ---- */
@@ -1409,10 +1492,11 @@ static int truthy(const char *s)
 	return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
 }
 
-/* Load the network-listener flag and shared HMAC secret from /etc/wireview/config.
- * The file holds "key=value" lines: "remote_enabled=0|1" gates the listener (default
- * OFF, so no port is opened unless explicitly enabled) and "secret=<passphrase>" sets
- * the write secret; a bare line is taken as the secret (backward compatible).
+/* Load the network-listener flag and shared HMAC secret from CONFIG_PATH
+ * (/etc/wireview/config). The file holds "key=value" lines: "remote_enabled=0|1" gates
+ * the listener (default OFF, so no port is opened unless explicitly enabled),
+ * "port=" and "bind=" (numeric address, default all) place it, and "secret=<passphrase>"
+ * sets the write secret; a bare line is taken as the secret (backward compatible).
  * $WIREVIEW_LISTEN and $WIREVIEW_SECRET override the file. An empty secret leaves
  * writes refused (403) even when the listener is on. */
 static void load_config(void)
@@ -1420,7 +1504,7 @@ static void load_config(void)
 	g_secret[0] = '\0';
 	g_http_enabled = 0;
 
-	FILE *f = fopen("/etc/wireview/config", "r");
+	FILE *f = fopen(CONFIG_PATH, "r");
 	if (f) {
 		char line[192];
 		while (fgets(line, sizeof(line), f)) {
@@ -1442,6 +1526,8 @@ static void load_config(void)
 					g_http_enabled = truthy(val);
 				else if (strcmp(p, "secret") == 0 && !g_secret[0])
 					snprintf(g_secret, sizeof(g_secret), "%s", val);
+				else if (strcmp(p, "bind") == 0)
+					snprintf(g_bind_addr, sizeof(g_bind_addr), "%s", val);
 				else if (strcmp(p, "log_days") == 0)
 					g_log_retain_days = atoi(val);
 				else if (strcmp(p, "port") == 0) {
@@ -1783,14 +1869,14 @@ static ssize_t recv_deadline(int fd, void *buf, size_t len,
  * recv), so a slow client cannot stall sensor polling. */
 static void http_handle(int http_fd)
 {
-	struct sockaddr_in peer;
+	struct sockaddr_storage peer;
 	socklen_t plen = sizeof(peer);
 	/* Left blocking: recv_deadline() polls before every recv and
 	 * uses MSG_DONTWAIT, so reads never block. */
 	int cfd = accept4(http_fd, (struct sockaddr *)&peer, &plen, SOCK_CLOEXEC);
 	if (cfd < 0) return;
-	char client_ip[INET_ADDRSTRLEN] = "?";
-	inet_ntop(AF_INET, &peer.sin_addr, client_ip, sizeof(client_ip));
+	char client_ip[64];
+	peer_ip(&peer, plen, client_ip, sizeof(client_ip));
 
 	struct timespec deadline;
 	deadline_in(&deadline, HTTP_DEADLINE_MS);
@@ -2037,20 +2123,27 @@ int main(int argc, char **argv)
 	resolve_wireview_group();
 
 	int http_fd = -1;
+	char listen_desc[256] = "";
 	if (g_http_enabled) {
-		http_fd = setup_http();
-		if (http_fd < 0)
-			fprintf(stderr, "wireviewd: warning: network listener failed (port %d in use?)\n",
-				g_http_port);
-		else
-			printf("wireviewd: network listener ENABLED on :%d; remote writes %s\n",
-			       g_http_port, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
+		http_fd = setup_http(listen_desc, sizeof(listen_desc));
+		if (http_fd < 0) {
+			fprintf(stderr, "wireviewd: warning: network listener on %s failed: %s\n",
+				listen_desc, strerror(errno));
+			wlog("WARN", "network listener on %s failed: %s",
+			     listen_desc, strerror(errno));
+		} else {
+			printf("wireviewd: network listener ENABLED on %s; remote writes %s\n",
+			       listen_desc, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
+		}
 	} else {
-		printf("wireviewd: network listener disabled (set remote_enabled=1 in /etc/wireview/config to publish)\n");
+		printf("wireviewd: network listener disabled (set remote_enabled=1 in %s to publish)\n",
+		       CONFIG_PATH);
 	}
 
-	wlog("INFO", "wireviewd %s started; listener %s, remote writes %s, log retention %d days",
-	     WIREVIEW_PKG_VERSION, g_http_enabled ? "enabled" : "disabled",
+	wlog("INFO", "wireviewd %s started; listener %s%s%s, remote writes %s, log retention %d days",
+	     WIREVIEW_PKG_VERSION,
+	     !g_http_enabled ? "disabled" : http_fd >= 0 ? "enabled" : "failed",
+	     http_fd >= 0 ? " on " : "", http_fd >= 0 ? listen_desc : "",
 	     g_secret[0] ? "enabled" : "disabled", g_log_retain_days);
 
 	printf("wireviewd %s: starting\n", WIREVIEW_PKG_VERSION);

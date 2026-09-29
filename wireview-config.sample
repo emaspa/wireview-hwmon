@@ -10,6 +10,11 @@ remote_enabled=0
 # Listener port.
 port=9876
 
+# Listener address: a numeric IPv4 or IPv6 address, e.g. 127.0.0.1, ::1 or
+# 192.168.1.10.  Unset = all addresses, IPv4 and IPv6 (IPv4 only on hosts
+# without IPv6).  A value that is not a numeric address disables the listener.
+#bind=
+
 # Shared HMAC passphrase for authenticated remote writes.
 # Empty = reads only, no remote writes accepted.  Keep this file mode 600.
 #secret=
