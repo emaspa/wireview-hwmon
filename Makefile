@@ -87,4 +87,8 @@ check-version:
 	head -n1 debian/changelog | grep -Fq "($$v" || { echo "debian/changelog: top entry is not $$v"; rc=1; }; \
 	[ $$rc -eq 0 ] && echo "version $$v consistent"; exit $$rc
 
-.PHONY: all module clean install uninstall check-version
+.PHONY: all module clean install uninstall check-version test
+
+# Unit tests (see tests/Makefile).
+test:
+	$(MAKE) -C tests
