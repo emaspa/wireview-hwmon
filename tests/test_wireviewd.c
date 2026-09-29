@@ -912,6 +912,14 @@ static void test_load_config(void)
 	load_config();
 	CHECK_EQ_STR(g_bind_addr, "");
 
+	/* Blanks around '=' are ignored on both sides. */
+	write_config("port = 9000\nsecret\t= spaced\nremote_enabled =1\n");
+	config_defaults();
+	load_config();
+	CHECK_EQ_INT(g_http_port, 9000);
+	CHECK_EQ_STR(g_secret, "spaced");
+	CHECK_EQ_INT(g_http_enabled, 1);
+
 	/* The environment wins over the file. */
 	write_config("remote_enabled=1\nsecret=file\n");
 	setenv("WIREVIEW_SECRET", "env", 1);

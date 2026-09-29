@@ -1519,7 +1519,11 @@ static void load_config(void)
 
 			char *eq = strchr(p, '=');
 			if (eq) {
-				*eq = '\0';
+				/* "key = value": trim blanks on both sides of '='. */
+				char *kend = eq;
+				while (kend > p && (kend[-1] == ' ' || kend[-1] == '\t'))
+					kend--;
+				*kend = '\0';
 				char *val = eq + 1;
 				while (*val == ' ' || *val == '\t') val++;
 				if (strcmp(p, "remote_enabled") == 0)
