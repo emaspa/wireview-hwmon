@@ -5,7 +5,7 @@
  * writes it to /dev/wireview-hwmon for the wireview_hwmon kernel module.
  * Also exposes a Unix socket for bidirectional command relay from apps.
  *
- * Usage: wireviewd [-i interval_ms] [-d device_path]
+ * Usage: wireviewd [-i interval_ms] [-d device_path] [-V]
  *
  * SPDX-License-Identifier: GPL-2.0
  */
@@ -39,6 +39,11 @@
 #define HWMON_DEV    "/dev/wireview-hwmon"
 #define SOCK_PATH    "/run/wireviewd.sock"
 #define HTTP_PORT    9876
+
+/* Package version, injected by the Makefile (-DWIREVIEW_PKG_VERSION=\"x.y.z\"). */
+#ifndef WIREVIEW_PKG_VERSION
+#define WIREVIEW_PKG_VERSION "unknown"
+#endif
 
 #define WIREVIEW_MAGIC   0x57565032
 #define WIREVIEW_VERSION 2
@@ -1339,9 +1344,10 @@ static void http_handle(int http_fd)
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage: %s [-i interval_ms] [-d /dev/ttyACMx]\n", prog);
+	fprintf(stderr, "Usage: %s [-i interval_ms] [-d /dev/ttyACMx] [-V]\n", prog);
 	fprintf(stderr, "  -i  Poll interval in milliseconds (default: 1000)\n");
 	fprintf(stderr, "  -d  Serial device path (default: auto-detect)\n");
+	fprintf(stderr, "  -V  Print version and exit\n");
 	exit(1);
 }
 
@@ -1356,7 +1362,7 @@ int main(int argc, char **argv)
 	 * lines reach the journal promptly and in order with stderr. */
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
-	while ((opt = getopt(argc, argv, "i:d:h")) != -1) {
+	while ((opt = getopt(argc, argv, "i:d:hV")) != -1) {
 		switch (opt) {
 		case 'i':
 			interval_ms = atoi(optarg);
@@ -1368,6 +1374,9 @@ int main(int argc, char **argv)
 		case 'd':
 			snprintf(user_dev_path, sizeof(user_dev_path), "%s", optarg);
 			break;
+		case 'V':
+			printf("wireviewd %s\n", WIREVIEW_PKG_VERSION);
+			return 0;
 		default:
 			usage(argv[0]);
 		}
@@ -1391,11 +1400,11 @@ int main(int argc, char **argv)
 		printf("wireviewd: network listener disabled (set remote_enabled=1 in /etc/wireview/config to publish)\n");
 	}
 
-	wlog("INFO", "wireviewd started; listener %s, remote writes %s, log retention %d days",
-	     g_http_enabled ? "enabled" : "disabled",
+	wlog("INFO", "wireviewd %s started; listener %s, remote writes %s, log retention %d days",
+	     WIREVIEW_PKG_VERSION, g_http_enabled ? "enabled" : "disabled",
 	     g_secret[0] ? "enabled" : "disabled", g_log_retain_days);
 
-	printf("wireviewd: starting\n");
+	printf("wireviewd %s: starting\n", WIREVIEW_PKG_VERSION);
 
 	while (running) {
 		int serial_fd = -1;
