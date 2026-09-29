@@ -1294,6 +1294,10 @@ int main(int argc, char **argv)
 	char dev_path[256] = "";	/* path in use this connection */
 	int opt;
 
+	/* stdout is block-buffered when not a tty (systemd); make status
+	 * lines reach the journal promptly and in order with stderr. */
+	setvbuf(stdout, NULL, _IOLBF, 0);
+
 	while ((opt = getopt(argc, argv, "i:d:h")) != -1) {
 		switch (opt) {
 		case 'i':
