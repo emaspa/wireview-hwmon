@@ -7,6 +7,11 @@
  *
  * Usage: wireviewd [-i interval_ms] [-d device_path] [-V]
  *
+ * The command socket (/run/wireviewd.sock) is world-connectable, but commands
+ * that can alter or brick the device (bootloader, NVM, config write, serial
+ * handover) are only accepted from root or members of the "wireview" group
+ * (see WIREVIEW_GROUP); other peers get RESP_DENIED.
+ *
  * SPDX-License-Identifier: GPL-2.0
  */
 
@@ -31,7 +36,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <stdarg.h>
+#include <pwd.h>
+#include <grp.h>
 #include "sha256.h"
 
 #define WIREVIEW_VID "0483"
@@ -39,6 +47,9 @@
 #define HWMON_DEV    "/dev/wireview-hwmon"
 #define SOCK_PATH    "/run/wireviewd.sock"
 #define HTTP_PORT    9876
+
+/* Members of this group (and root) may send privileged socket commands. */
+#define WIREVIEW_GROUP "wireview"
 
 /* Package version, injected by the Makefile (-DWIREVIEW_PKG_VERSION=\"x.y.z\"). */
 #ifndef WIREVIEW_PKG_VERSION
@@ -62,26 +73,29 @@
 #define CMD_BOOTLOADER         0xF1
 #define CMD_NVM_CONFIG         0xF2
 
-/* Socket protocol command types */
+/* Socket protocol command types. Commands marked [priv] are refused with
+ * RESP_DENIED unless the peer is root or in WIREVIEW_GROUP (primary or
+ * supplementary); the rest are open to any local user. */
 #define WCMD_GET_DEVICE_INFO   0x01
 #define WCMD_CLEAR_FAULTS      0x02
 #define WCMD_READ_CONFIG       0x03
-#define WCMD_WRITE_CONFIG      0x04
+#define WCMD_WRITE_CONFIG      0x04	/* [priv] */
 #define WCMD_SCREEN_CMD        0x05
-#define WCMD_NVM_CMD           0x06
+#define WCMD_NVM_CMD           0x06	/* [priv] store / factory reset */
 #define WCMD_READ_BUILD        0x07
-#define WCMD_ENTER_BOOTLOADER  0x08
+#define WCMD_ENTER_BOOTLOADER  0x08	/* [priv] */
 /* Serial handover: the GUI asks the daemon to stop all serial I/O for N
  * seconds so it can drive the port directly (SPI-flash log reads, theme
  * asset transfers). The daemon keeps its fd open but goes quiet; sensor
  * polling resumes automatically at the deadline or on RESUME. */
-#define WCMD_SUSPEND_SERIAL    0x09
-#define WCMD_RESUME_SERIAL     0x0A
+#define WCMD_SUSPEND_SERIAL    0x09	/* [priv] */
+#define WCMD_RESUME_SERIAL     0x0A	/* [priv] */
 
 /* Response status */
 #define RESP_OK            0
 #define RESP_ERROR         1
 #define RESP_NOT_CONNECTED 2
+#define RESP_DENIED        3	/* privileged command from unprivileged peer */
 
 static volatile int running = 1;
 
@@ -475,6 +489,113 @@ static void cleanup_socket(int sock_fd)
 	unlink(SOCK_PATH);
 }
 
+/* ---- Command socket peer privileges ---- */
+
+/* One connected command-socket client. privileged is decided once at
+ * accept time from SO_PEERCRED. */
+struct client {
+	int   fd;
+	int   privileged;
+	uid_t uid;
+};
+
+static gid_t g_wireview_gid;
+static int   g_have_wireview_gid;	/* 0 => group missing, only root is privileged */
+
+/* Resolve WIREVIEW_GROUP once at startup. */
+static void resolve_wireview_group(void)
+{
+	struct group *gr = getgrnam(WIREVIEW_GROUP);
+
+	if (gr) {
+		g_wireview_gid = gr->gr_gid;
+		g_have_wireview_gid = 1;
+		return;
+	}
+	g_have_wireview_gid = 0;
+	printf("wireviewd: group '%s' not found; privileged socket commands limited to root\n",
+	       WIREVIEW_GROUP);
+	wlog("INFO", "group '%s' not found; privileged socket commands (bootloader, NVM, "
+	     "config write, serial suspend/resume) limited to root", WIREVIEW_GROUP);
+}
+
+/* Decide whether a peer (uid, primary gid) is privileged, given the
+ * wireview group gid (have_gid == 0 => group does not exist). Supplementary
+ * groups come from the group database for the uid's user name. */
+static int peer_is_privileged(uid_t uid, gid_t gid, int have_gid, gid_t wv_gid)
+{
+	if (uid == 0)
+		return 1;
+	if (!have_gid)
+		return 0;
+	if (gid == wv_gid)
+		return 1;
+
+	struct passwd *pw = getpwuid(uid);
+	if (!pw || !pw->pw_name)
+		return 0;
+
+	gid_t stackbuf[64];
+	gid_t *groups = stackbuf;
+	int ngroups = (int)(sizeof(stackbuf) / sizeof(stackbuf[0]));
+	int ok = 0;
+
+	if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &ngroups) < 0) {
+		/* ngroups now holds the required size */
+		if (ngroups <= 0 || ngroups > 65536)
+			return 0;
+		groups = malloc((size_t)ngroups * sizeof(gid_t));
+		if (!groups)
+			return 0;
+		if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &ngroups) < 0) {
+			free(groups);
+			return 0;
+		}
+	}
+	for (int i = 0; i < ngroups; i++) {
+		if (groups[i] == wv_gid) {
+			ok = 1;
+			break;
+		}
+	}
+	if (groups != stackbuf)
+		free(groups);
+	return ok;
+}
+
+/* Fetch the peer's credentials and classify it. Unknown peers are
+ * unprivileged. */
+static void client_init(struct client *c, int fd)
+{
+	struct ucred cred;
+	socklen_t len = sizeof(cred);
+
+	c->fd = fd;
+	c->privileged = 0;
+	c->uid = (uid_t)-1;
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 &&
+	    len == sizeof(cred)) {
+		c->uid = cred.uid;
+		c->privileged = peer_is_privileged(cred.uid, cred.gid,
+						   g_have_wireview_gid,
+						   g_wireview_gid);
+	}
+}
+
+static int cmd_is_privileged(uint8_t cmd_type)
+{
+	switch (cmd_type) {
+	case WCMD_ENTER_BOOTLOADER:
+	case WCMD_NVM_CMD:
+	case WCMD_WRITE_CONFIG:
+	case WCMD_SUSPEND_SERIAL:
+	case WCMD_RESUME_SERIAL:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 static int send_response(int client_fd, uint8_t status,
 			 const void *payload, uint16_t payload_len)
 {
@@ -491,8 +612,9 @@ static int send_response(int client_fd, uint8_t status,
 	return 0;
 }
 
-static void handle_client_request(int client_fd, int serial_fd)
+static void handle_client_request(const struct client *c, int serial_fd)
 {
+	int client_fd = c->fd;
 	uint8_t hdr[3];
 	uint8_t cmd_type;
 	uint16_t payload_len;
@@ -511,6 +633,13 @@ static void handle_client_request(int client_fd, int serial_fd)
 	if (payload_len > 0) {
 		if (read_exact(client_fd, payload, payload_len, 2000) < 0)
 			return;
+	}
+
+	if (cmd_is_privileged(cmd_type) && !c->privileged) {
+		wlog("WARN", "socket cmd 0x%02x from uid %ld denied: not root or in group '%s'",
+		     cmd_type, c->uid == (uid_t)-1 ? -1L : (long)c->uid, WIREVIEW_GROUP);
+		send_response(client_fd, RESP_DENIED, NULL, 0);
+		return;
 	}
 
 	if (serial_fd < 0) {
@@ -1453,6 +1582,7 @@ int main(int argc, char **argv)
 	signal(SIGTERM, sig_handler);
 
 	load_config();
+	resolve_wireview_group();
 
 	int http_fd = -1;
 	if (g_http_enabled) {
@@ -1477,14 +1607,14 @@ int main(int argc, char **argv)
 		int serial_fd = -1;
 		int hwmon_fd = -1;
 		int sock_fd = -1;
-		int client_fds[MAX_CLIENTS];
+		struct client clients[MAX_CLIENTS];
 		int num_clients = 0;
 
 		/* Fault bits seen in the previous frame (debounce state),
 		 * reset on every (re)connect. */
 		uint16_t prev_status = 0, prev_log = 0;
 
-		memset(client_fds, -1, sizeof(client_fds));
+		memset(clients, 0, sizeof(clients));
 
 		/* Use the -d path every time; otherwise auto-detect. Clearing
 		 * dev_path below only forgets an auto-detected path. */
@@ -1576,7 +1706,7 @@ int main(int argc, char **argv)
 			/* Client sockets */
 			int client_pfd_start = nfds;
 			for (int i = 0; i < num_clients; i++) {
-				pfds[nfds].fd = client_fds[i];
+				pfds[nfds].fd = clients[i].fd;
 				pfds[nfds].events = POLLIN;
 				nfds++;
 			}
@@ -1597,7 +1727,8 @@ int main(int argc, char **argv)
 				int new_fd = accept(sock_fd, NULL, NULL);
 				if (new_fd >= 0) {
 					if (num_clients < MAX_CLIENTS) {
-						client_fds[num_clients++] = new_fd;
+						client_init(&clients[num_clients++],
+							    new_fd);
 					} else {
 						send_response(new_fd, RESP_ERROR,
 							      NULL, 0);
@@ -1617,15 +1748,15 @@ int main(int argc, char **argv)
 				if (idx < nfds && pfds[idx].revents) {
 					if (pfds[idx].revents & POLLIN) {
 						handle_client_request(
-							client_fds[i],
+							&clients[i],
 							serial_fd);
 					}
 					if (pfds[idx].revents &
 					    (POLLHUP | POLLERR)) {
-						close(client_fds[i]);
-						client_fds[i] =
-							client_fds[--num_clients];
-						client_fds[num_clients] = -1;
+						close(clients[i].fd);
+						clients[i] =
+							clients[--num_clients];
+						clients[num_clients].fd = -1;
 						continue;
 					}
 				}
@@ -1725,7 +1856,7 @@ int main(int argc, char **argv)
 
 		/* Cleanup */
 		for (int i = 0; i < num_clients; i++) {
-			if (client_fds[i] >= 0) close(client_fds[i]);
+			if (clients[i].fd >= 0) close(clients[i].fd);
 		}
 		cleanup_socket(sock_fd);
 
