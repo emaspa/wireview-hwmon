@@ -354,6 +354,15 @@ to `FFFF`. So `wireviewctl clear-faults 0 FFFF` clears only the log, and
 (On the wire the firmware takes the inverse, a keep-mask; `wireviewctl` does
 the inversion, the raw socket and HTTP `clearFaults` do not.)
 
+`flash` checks the whole image before it runs `dfu-util` or asks the daemon
+for the bootloader. In an Intel HEX file every record must hold only hex
+digits, exactly the bytes its count declares and a correct checksum; the file
+must end with an end-of-file record (type 01); data must fall in the 4 MiB
+flash window from `0x08000000`, and no address may be given twice. The error
+names the file and line (`wireviewctl: fw.hex: line 812: bad checksum`) and
+nothing reaches the device. A `.bin` has no checksums to check: it is loaded
+at `0x08000000` as is.
+
 ### Permissions: the `wireview` group
 
 Commands that can change or brick the device are accepted only from root or

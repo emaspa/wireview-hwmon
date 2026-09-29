@@ -38,6 +38,46 @@ static const char *write_file(const char *name, const void *data, size_t len)
 	return path;
 }
 
+/* Run stmt with stdout captured into buf (NUL-terminated). */
+#define CAPTURE(buf, stmt) do {						\
+	char cpath_[PATH_MAX];						\
+	snprintf(cpath_, sizeof(cpath_), "%s/stdout", g_tmpdir);	\
+	fflush(stdout);							\
+	int saved_out_ = dup(1);					\
+	int cfd_ = open(cpath_, O_WRONLY | O_CREAT | O_TRUNC, 0600);	\
+	if (cfd_ >= 0) { dup2(cfd_, 1); close(cfd_); }			\
+	stmt;								\
+	fflush(stdout);							\
+	if (saved_out_ >= 0) { dup2(saved_out_, 1); close(saved_out_); } \
+	FILE *cf_ = fopen(cpath_, "r");					\
+	size_t cn_ = cf_ ? fread((buf), 1, sizeof(buf) - 1, cf_) : 0;	\
+	(buf)[cn_] = '\0';						\
+	if (cf_) fclose(cf_);						\
+} while (0)
+
+/* load_firmware() with stderr captured into err (NUL-terminated). */
+static long load_capture(const char *path, uint8_t **img, char *err, size_t cap)
+{
+	char epath[PATH_MAX];
+	uint32_t base;
+	int ver;
+	long len;
+
+	snprintf(epath, sizeof(epath), "%s/stderr", g_tmpdir);
+	fflush(stderr);
+	int saved = dup(2);
+	int fd = open(epath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd >= 0) { dup2(fd, 2); close(fd); }
+	len = load_firmware(path, img, &base, &ver, NULL, 0);
+	fflush(stderr);
+	if (saved >= 0) { dup2(saved, 2); close(saved); }
+	FILE *f = fopen(epath, "r");
+	size_t n = f ? fread(err, 1, cap - 1, f) : 0;
+	err[n] = '\0';
+	if (f) fclose(f);
+	return len;
+}
+
 /* Append one Intel HEX record (with checksum) to buf. */
 static void hex_record(char *buf, unsigned addr, unsigned type,
 		       const uint8_t *data, unsigned n)
@@ -113,17 +153,19 @@ static void test_load_firmware_handwritten(void)
 	}
 	free(img);
 
-	/* Type 02 (extended segment address): upper = 0x1000 << 4. The
-	 * image starts at the first data byte, not at 0x08000000. */
-	static const char seg[] =
-		":020000021000EC\n"
-		":02001000ABCD76\n"
-		":00000001FF\n";
-	path = write_file("seg.hex", seg, sizeof(seg) - 1);
+	/* The image starts at the first data byte, not at 0x08000000, and
+	 * CRLF line ends, blank lines and blanks around a record are fine
+	 * (the file itself must start with ':' to be taken as Intel HEX). */
+	static const char crlf[] =
+		":020000040800F2\r\n"
+		"\r\n"
+		" \t:02001000ABCD76 \r\n"
+		":00000001FF\r\n";
+	path = write_file("crlf.hex", crlf, sizeof(crlf) - 1);
 	img = NULL;
 	len = load_firmware(path, &img, &base, &ver, build, sizeof(build));
 	CHECK_EQ_INT(len, 2);
-	CHECK_EQ_INT(base, 0x10010);
+	CHECK_EQ_INT(base, 0x08000010u);
 	if (img && len == 2)
 		CHECK(img[0] == 0xAB && img[1] == 0xCD);
 	/* Too short to hold the version byte or build string. */
@@ -131,17 +173,139 @@ static void test_load_firmware_handwritten(void)
 	CHECK_EQ_STR(build, "");
 	free(img);
 
-	/* Records after the EOF record are ignored. */
+	/* Type 02 (extended segment address) replaces a type 04 upper
+	 * address and vice versa: segment 0x1000 then ELA 0x0800 puts the
+	 * data at 0x08000000 again. Lowercase digits are accepted. */
+	static const char seg_then_ela[] =
+		":020000021000ec\n"
+		":020000040800F2\n"
+		":0100000011EE\n"
+		":00000001FF\n";
+	path = write_file("seg-ela.hex", seg_then_ela, sizeof(seg_then_ela) - 1);
+	img = NULL;
+	len = load_firmware(path, &img, &base, &ver, NULL, 0);
+	CHECK_EQ_INT(len, 1);
+	CHECK_EQ_INT(base, 0x08000000u);
+	if (img && len == 1)
+		CHECK_EQ_INT(img[0], 0x11);
+	free(img);
+
+	/* Start-address records (03 and 05) are checked and ignored. */
+	static const char start[] =
+		":020000040800F2\n"
+		":0100000011EE\n"
+		":040000050800018965\n"
+		":0400000300001000E9\n"
+		":00000001FF\n";
+	path = write_file("start.hex", start, sizeof(start) - 1);
+	img = NULL;
+	len = load_firmware(path, &img, &base, &ver, NULL, 0);
+	CHECK_EQ_INT(len, 1);
+	free(img);
+
+	/* Records after the EOF record are ignored, even broken ones. */
 	static const char eof[] =
+		":020000040800F2\n"
 		":0100000011EE\n"
 		":00000001FF\n"
-		":0100100022CD\n";
+		":0100100022CD\n"
+		"garbage\n";
 	path = write_file("eof.hex", eof, sizeof(eof) - 1);
 	img = NULL;
 	len = load_firmware(path, &img, &base, &ver, NULL, 0);
 	CHECK_EQ_INT(len, 1);
-	CHECK_EQ_INT(base, 0);
+	CHECK_EQ_INT(base, 0x08000000u);
 	free(img);
+
+	/* The last byte of the 4 MiB window is still inside it. */
+	static const char edge[] =
+		":020000040800F2\n"
+		":0100000011EE\n"
+		":02000004083FB3\n"
+		":01FFFF0022DF\n"
+		":00000001FF\n";
+	path = write_file("edge.hex", edge, sizeof(edge) - 1);
+	img = NULL;
+	len = load_firmware(path, &img, &base, &ver, NULL, 0);
+	CHECK_EQ_INT(len, 4 * 1024 * 1024);
+	if (img && len == 4 * 1024 * 1024)
+		CHECK(img[0] == 0x11 && img[len - 1] == 0x22 && img[len - 2] == 0xFF);
+	free(img);
+}
+
+/* The firmware image the packages ship: it must keep loading, with the
+ * version byte and build string where cmd_flash() reads them. */
+static void test_load_firmware_bundled(void)
+{
+	uint8_t *img = NULL;
+	uint32_t base = 0;
+	int ver = -1;
+	char build[40] = "";
+
+	long len = load_firmware(WV_SRCDIR "/firmware/TG-WV-PRO2-FW.hex",
+				 &img, &base, &ver, build, sizeof(build));
+	CHECK(len > 64 * 1024);
+	CHECK_EQ_INT(base, 0x08000000u);
+	CHECK(ver > 0 && ver < 0xFF);
+	CHECK(strlen(build) > 0);
+	for (const char *p = build; *p; p++)
+		CHECK(*p >= 0x20 && *p < 0x7F);
+	if (img && len > 0) {
+		/* An STM32 vector table: the initial SP in RAM, the reset
+		 * vector in this image (Thumb bit set). */
+		uint32_t sp = img[0] | img[1] << 8 | img[2] << 16 | (uint32_t)img[3] << 24;
+		uint32_t pc = img[4] | img[5] << 8 | img[6] << 16 | (uint32_t)img[7] << 24;
+		CHECK((sp & 0xFF000000u) == 0x20000000u);
+		CHECK((pc & 1) && pc - 1 >= base && pc - 1 < base + (uint32_t)len);
+	}
+	CHECK(strncmp(build, "TG-WV-PRO2-FW_", 14) == 0);
+	free(img);
+
+	/* One flipped digit, or the file cut short, and it no longer loads. */
+	static char text[512 * 1024];
+	FILE *f = fopen(WV_SRCDIR "/firmware/TG-WV-PRO2-FW.hex", "rb");
+	size_t n = f ? fread(text, 1, sizeof(text) - 1, f) : 0;
+	if (f)
+		fclose(f);
+	CHECK(n > 0 && n < sizeof(text) - 1);
+	text[n] = '\0';
+	char *line = text;
+	for (int i = 1; i < 100 && line; i++) {
+		line = strchr(line, '\n');
+		if (line)
+			line++;
+	}
+	CHECK(line && line[0] == ':' && line[9] != '\r');
+	if (line && line[0] == ':') {
+		char err[512], orig = line[9];
+		line[9] = orig == '0' ? '1' : '0';	/* first data digit */
+		const char *path = write_file("flipped.hex", text, n);
+		img = NULL;
+		len = load_capture(path, &img, err, sizeof(err));
+		CHECK_EQ_INT(len, -1);
+		CHECK(strstr(err, "line 100: bad checksum") != NULL);
+		if (len >= 0)
+			free(img);
+
+		/* Cut inside record 100 (':' and 20 digits), then right
+		 * after it. */
+		line[9] = orig;
+		path = write_file("cut.hex", text, (size_t)(line - text) + 21);
+		img = NULL;
+		len = load_capture(path, &img, err, sizeof(err));
+		CHECK_EQ_INT(len, -1);
+		CHECK(strstr(err, "line 100: record shorter than its byte count") != NULL);
+		if (len >= 0)
+			free(img);
+
+		path = write_file("cut.hex", text, (size_t)(strchr(line, '\n') + 1 - text));
+		img = NULL;
+		len = load_capture(path, &img, err, sizeof(err));
+		CHECK_EQ_INT(len, -1);
+		CHECK(strstr(err, "no end-of-file record after line 100") != NULL);
+		if (len >= 0)
+			free(img);
+	}
 }
 
 static void test_load_firmware_buildstruct(void)
@@ -216,24 +380,85 @@ static void test_load_firmware_errors(void)
 	long len;
 	const char *path;
 
-	/* No data records at all. */
-	static const char empty[] = ":00000001FF\n";
-	path = write_file("empty.hex", empty, sizeof(empty) - 1);
-	QUIET(len = load_firmware(path, &img, &base, &ver, NULL, 0));
-	CHECK_EQ_INT(len, -1);
-	if (len >= 0) { free(img); img = NULL; }
+	/* Each file fails, and the message on stderr names the file line.
+	 * ELA is the usual first record, putting data at 0x08000000. */
+#define ELA ":020000040800F2\n"
+#define EOR ":00000001FF\n"
+	static char toolong[800];
+	snprintf(toolong, sizeof(toolong), ELA ":10000000%0700d\n" EOR, 0);
+	static const struct { const char *name, *text, *want; } bad[] = {
+		{ "checksum", ELA ":0100000011EF\n" EOR, "line 2: bad checksum" },
+		{ "checksum-data", ELA ":10000000000102030405060708090A0B0C0D0E1F78\n" EOR,
+		  "line 2: bad checksum" },
+		{ "truncated", ELA ":0200000011EE\n" EOR,
+		  "line 2: record shorter than its byte count" },
+		{ "cut-mid-record", ELA ":10000000000102030405",
+		  "line 2: record shorter than its byte count" },
+		{ "missing-eof", ELA ":0100000011EE\n",
+		  "no end-of-file record after line 2" },
+		{ "bad-digit", ELA ":01000000G1EE\n" EOR, "line 2: invalid hex digit" },
+		{ "bad-digit-space", ELA ":01000000 11EE\n" EOR, "line 2: invalid hex digit" },
+		{ "odd-digits", ELA ":0100000011E\n" EOR, "line 2: odd number of hex digits" },
+		{ "too-short", ELA ":00000001\n" EOR, "line 2: record too short" },
+		{ "colon-only", ELA ":\n" EOR, "line 2: record too short" },
+		{ "extra-bytes", ELA ":0100000011AAEE\n" EOR,
+		  "line 2: record longer than its byte count" },
+		{ "line-too-long", toolong, "line 2: line too long" },
+		{ "not-a-record", ELA "hello\n" EOR, "line 2: not an Intel HEX record" },
+		{ "unknown-type", ELA ":00000006FA\n" EOR, "line 2: unknown record type" },
+		{ "eof-with-data", ELA ":0100000011EE\n:01000001FFFF\n",
+		  "line 3: end-of-file record carries data" },
+		{ "ela-length", ":0100000408F3\n:0100000011EE\n" EOR,
+		  "line 1: address record must carry 2 bytes" },
+		{ "esa-length", ELA ":0100000210ED\n:0100000011EE\n" EOR,
+		  "line 2: address record must carry 2 bytes" },
+		{ "start-length", ELA ":0100000011EE\n:020000050800F1\n" EOR,
+		  "line 3: start-address record must carry 4 bytes" },
+		{ "segment-wrap", ELA ":02FFFF001122CD\n" EOR,
+		  "line 2: data record runs past its 64 KiB segment" },
+		/* no ELA: address 0 */
+		{ "below-window", ":0100000011EE\n" EOR, "line 1: data outside the flash window" },
+		/* 0x09000000, past the 4 MiB window */
+		{ "above-window", ELA ":0100000011EE\n:020000040900F1\n:0100000022DD\n" EOR,
+		  "line 4: data outside the flash window" },
+		{ "window-end", ":020000040840B2\n:0100000011EE\n" EOR,
+		  "line 2: data outside the flash window" },
+		/* type 02 replaces the ELA: segment 0 puts this at 0x10 */
+		{ "esa-outside", ELA ":0100000011EE\n:020000020000FC\n:0100100022CD\n" EOR,
+		  "line 4: data outside the flash window" },
+		{ "duplicate", ELA ":0100000011EE\n:0100000022DD\n" EOR,
+		  "line 3: data overlaps an earlier record" },
+		{ "overlap", ELA ":020000001122CB\n:0100010033CB\n" EOR,
+		  "line 3: data overlaps an earlier record" },
+		{ "no-data", EOR, "no data records" },
+		{ "no-data-ela", ELA ":00000000" "00\n" EOR, "no data records" },
+	};
+#undef ELA
+#undef EOR
+	char err[512];
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		char name[64];
+		snprintf(name, sizeof(name), "bad-%s.hex", bad[i].name);
+		path = write_file(name, bad[i].text, strlen(bad[i].text));
+		img = NULL;
+		len = load_capture(path, &img, err, sizeof(err));
+		if (len != -1 || !strstr(err, bad[i].want) || !strstr(err, name))
+			fprintf(stderr, "  case %s: len %ld, stderr \"%s\"\n",
+				bad[i].name, len, err);
+		CHECK_EQ_INT(len, -1);
+		CHECK(strstr(err, bad[i].want) != NULL);
+		CHECK(strstr(err, name) != NULL);
+		if (len >= 0) { free(img); img = NULL; }
+	}
 
-	/* Data spread over more than 4 MiB. */
-	static const char huge[] =
-		":020000040800F2\n"
-		":0100000011EE\n"
-		":020000040900F1\n"
-		":0100000022DD\n"
-		":00000001FF\n";
-	path = write_file("huge.hex", huge, sizeof(huge) - 1);
-	QUIET(len = load_firmware(path, &img, &base, &ver, NULL, 0));
-	CHECK_EQ_INT(len, -1);
-	if (len >= 0) { free(img); img = NULL; }
+	/* flash fails on a corrupted image before it prints the image line,
+	 * looks for dfu-util or talks to the daemon or the bootloader. */
+	static char out[1024];
+	int rc = -1;
+	path = write_file("bad-flash.hex", bad[0].text, strlen(bad[0].text));
+	QUIET(CAPTURE(out, rc = cmd_flash(path, 1)));
+	CHECK_EQ_INT(rc, 1);
+	CHECK_EQ_STR(out, "");
 
 	/* Empty .bin and a missing file. */
 	path = write_file("empty.bin", "", 0);
@@ -651,23 +876,6 @@ static void test_read_local(void)
 
 /* ---- sensors / sensors --json output ---- */
 
-/* Run stmt with stdout captured into buf (NUL-terminated). */
-#define CAPTURE(buf, stmt) do {						\
-	char cpath_[PATH_MAX];						\
-	snprintf(cpath_, sizeof(cpath_), "%s/stdout", g_tmpdir);	\
-	fflush(stdout);							\
-	int saved_out_ = dup(1);					\
-	int cfd_ = open(cpath_, O_WRONLY | O_CREAT | O_TRUNC, 0600);	\
-	if (cfd_ >= 0) { dup2(cfd_, 1); close(cfd_); }			\
-	stmt;								\
-	fflush(stdout);							\
-	if (saved_out_ >= 0) { dup2(saved_out_, 1); close(saved_out_); } \
-	FILE *cf_ = fopen(cpath_, "r");					\
-	size_t cn_ = cf_ ? fread((buf), 1, sizeof(buf) - 1, cf_) : 0;	\
-	(buf)[cn_] = '\0';						\
-	if (cf_) fclose(cf_);						\
-} while (0)
-
 /* Collect the object keys of a flat JSON document, in order, as
  * "key1,key2,...": every string directly followed by ':' is a key. */
 static void json_keys(const char *j, char *out, size_t cap)
@@ -826,6 +1034,7 @@ int main(void)
 	}
 
 	test_load_firmware_handwritten();
+	test_load_firmware_bundled();
 	test_load_firmware_buildstruct();
 	test_load_firmware_errors();
 	test_ct_str_equal();

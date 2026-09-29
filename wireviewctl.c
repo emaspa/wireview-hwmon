@@ -507,6 +507,211 @@ static int cmd_bootloader(void)
 
 /* ---------- Firmware flashing (DFU via dfu-util) ---------- */
 
+/* Where an image may land: the STM32's main flash, and no more than the
+ * 4 MiB a .bin may hold either. */
+#define FW_FLASH_BASE 0x08000000u
+#define FW_FLASH_SIZE (4u * 1024 * 1024)
+
+static int hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	return -1;
+}
+
+/*
+ * Decode one Intel HEX record, t pointing at its ':' with trailing blanks
+ * already stripped, into rec[]: count, address (2 bytes), type, data,
+ * checksum. Returns the data byte count, or -1 with *why set when the
+ * record has a non-hex character, an odd number of digits, fewer or more
+ * bytes than its count says, or a checksum that does not bring the sum of
+ * all its bytes to 0 mod 256.
+ */
+static int ihex_record(const char *t, uint8_t rec[260], const char **why)
+{
+	if (*t++ != ':') {
+		*why = "not an Intel HEX record (no leading ':')";
+		return -1;
+	}
+	size_t n = strlen(t);
+	for (size_t i = 0; i < n; i++) {
+		if (hex_nibble(t[i]) < 0) {
+			*why = "invalid hex digit";
+			return -1;
+		}
+	}
+	if (n % 2) {
+		*why = "odd number of hex digits";
+		return -1;
+	}
+	if (n < 10) {
+		*why = "record too short";
+		return -1;
+	}
+	n /= 2;
+	if (n > 260) {
+		*why = "record longer than its byte count";
+		return -1;
+	}
+	uint8_t sum = 0;
+	for (size_t i = 0; i < n; i++) {
+		rec[i] = (uint8_t)(hex_nibble(t[2 * i]) << 4 | hex_nibble(t[2 * i + 1]));
+		sum += rec[i];
+	}
+	if (n < (size_t)rec[0] + 5) {
+		*why = "record shorter than its byte count (truncated?)";
+		return -1;
+	}
+	if (n > (size_t)rec[0] + 5) {
+		*why = "record longer than its byte count";
+		return -1;
+	}
+	if (sum != 0) {
+		*why = "bad checksum";
+		return -1;
+	}
+	return rec[0];
+}
+
+/*
+ * Intel HEX into a flat image padded with 0xFF, in two passes: the first
+ * checks every record up to the EOF record (which must be there) and finds
+ * the address range, the second fills the image. Data must lie within the
+ * flash window and no byte may be given twice; a data record may not run
+ * past its 64 KiB segment. Start-address records (03, 05) are checked and
+ * ignored: DFU does not use them. Errors name the file and line.
+ */
+static long load_ihex(FILE *f, const char *path, uint8_t **img_out, uint32_t *base_out)
+{
+	char line[600];		/* the longest record is 521 characters */
+	uint8_t rec[260];
+	uint32_t minaddr = 0xFFFFFFFFu, maxaddr = 0;
+	uint8_t *img = NULL, *seen = NULL;
+	size_t len = 0;
+	int lineno = 0;
+	const char *why = NULL;
+
+	for (int pass = 0; pass < 2; pass++) {
+		uint32_t upper = 0;
+		int eof = 0;
+
+		rewind(f);
+		lineno = 0;
+		while (!eof && fgets(line, sizeof(line), f)) {
+			lineno++;
+			size_t l = strlen(line);
+			if (l == sizeof(line) - 1 && line[l - 1] != '\n' && !feof(f)) {
+				why = "line too long";
+				goto bad;
+			}
+			while (l && (line[l - 1] == '\n' || line[l - 1] == '\r' ||
+				     line[l - 1] == ' ' || line[l - 1] == '\t'))
+				line[--l] = '\0';
+			const char *t = line;
+			while (*t == ' ' || *t == '\t') t++;
+			if (!*t)
+				continue;
+
+			int cnt = ihex_record(t, rec, &why);
+			if (cnt < 0)
+				goto bad;
+			uint32_t addr = (uint32_t)rec[1] << 8 | rec[2];
+			switch (rec[3]) {
+			case 0: {
+				if (cnt == 0)
+					break;
+				if (addr + (uint32_t)cnt > 0x10000) {
+					why = "data record runs past its 64 KiB segment";
+					goto bad;
+				}
+				uint32_t a = upper + addr;
+				if (a < FW_FLASH_BASE || a - FW_FLASH_BASE > FW_FLASH_SIZE - (uint32_t)cnt) {
+					why = "data outside the flash window 0x08000000-0x083FFFFF";
+					goto bad;
+				}
+				if (pass == 0) {
+					if (a < minaddr) minaddr = a;
+					if (a + (uint32_t)cnt - 1 > maxaddr) maxaddr = a + (uint32_t)cnt - 1;
+					break;
+				}
+				size_t off = a - minaddr;
+				for (int i = 0; i < cnt; i++, off++) {
+					uint8_t bit = (uint8_t)(1u << (off & 7));
+					if (seen[off >> 3] & bit) {
+						why = "data overlaps an earlier record";
+						goto bad;
+					}
+					seen[off >> 3] |= bit;
+					img[off] = rec[4 + i];
+				}
+				break;
+			}
+			case 1:
+				if (cnt != 0) {
+					why = "end-of-file record carries data";
+					goto bad;
+				}
+				eof = 1;	/* anything after it is ignored */
+				break;
+			case 2:
+			case 4:
+				if (cnt != 2) {
+					why = "address record must carry 2 bytes";
+					goto bad;
+				}
+				upper = (uint32_t)rec[4] << 8 | rec[5];
+				upper <<= rec[3] == 4 ? 16 : 4;
+				break;
+			case 3:
+			case 5:
+				if (cnt != 4) {
+					why = "start-address record must carry 4 bytes";
+					goto bad;
+				}
+				break;
+			default:
+				why = "unknown record type";
+				goto bad;
+			}
+		}
+		if (ferror(f)) {
+			fprintf(stderr, "wireviewctl: %s: read error\n", path);
+			goto fail;
+		}
+		if (!eof) {
+			fprintf(stderr, "wireviewctl: %s: no end-of-file record after line %d "
+				"(truncated file?)\n", path, lineno);
+			goto fail;
+		}
+		if (pass == 0) {
+			if (minaddr > maxaddr) {
+				fprintf(stderr, "wireviewctl: %s: no data records\n", path);
+				goto fail;
+			}
+			len = (size_t)(maxaddr - minaddr) + 1;
+			img = malloc(len);
+			seen = calloc(len / 8 + 1, 1);
+			if (!img || !seen) {
+				fprintf(stderr, "wireviewctl: out of memory\n");
+				goto fail;
+			}
+			memset(img, 0xFF, len);
+		}
+	}
+	free(seen);
+	*img_out = img;
+	*base_out = minaddr;
+	return (long)len;
+
+bad:
+	fprintf(stderr, "wireviewctl: %s: line %d: %s\n", path, lineno, why);
+fail:
+	free(img);
+	free(seen);
+	return -1;
+}
+
 /* Load .hex (Intel HEX) or raw .bin into a flat image. Returns image length,
  * sets *base_out to the image base address (0x08000000 assumed for .bin) and
  * *version_out to the BuildStruct firmware version byte (-1 if unknown). */
@@ -525,56 +730,13 @@ static long load_firmware(const char *path, uint8_t **img_out, uint32_t *base_ou
 
 	uint8_t *img = NULL;
 	long len = -1;
-	uint32_t base = 0x08000000u;
+	uint32_t base = FW_FLASH_BASE;
 
 	if (c == ':') {
-		/* Intel HEX: two passes (find range, then fill). */
-		char line[600];
-		uint32_t upper = 0, minaddr = 0xFFFFFFFFu, maxaddr = 0;
-		int linear = 0;
-		for (int pass = 0; pass < 2; pass++) {
-			rewind(f);
-			upper = 0; linear = 0;
-			while (fgets(line, sizeof(line), f)) {
-				char *t = line;
-				while (*t == ' ' || *t == '\r' || *t == '\n') t++;
-				if (*t != ':' || strlen(t) < 11) continue;
-				unsigned cnt, addr, typ;
-				if (sscanf(t + 1, "%2x%4x%2x", &cnt, &addr, &typ) != 3) continue;
-				if (typ == 1) break;
-				if (typ == 2 || typ == 4) {
-					unsigned v;
-					if (sscanf(t + 9, "%4x", &v) != 1) continue;
-					upper = (typ == 4) ? (uint32_t)v << 16 : (uint32_t)v << 4;
-					linear = (typ == 4);
-					(void)linear;
-					continue;
-				}
-				if (typ != 0) continue;
-				for (unsigned i = 0; i < cnt; i++) {
-					unsigned b;
-					if (sscanf(t + 9 + i * 2, "%2x", &b) != 1) break;
-					uint32_t a = upper + addr + i;
-					if (pass == 0) {
-						if (a < minaddr) minaddr = a;
-						if (a > maxaddr) maxaddr = a;
-					} else {
-						img[a - minaddr] = (uint8_t)b;
-					}
-				}
-			}
-			if (pass == 0) {
-				if (minaddr > maxaddr || maxaddr - minaddr >= 4u * 1024 * 1024) {
-					fprintf(stderr, "wireviewctl: invalid or oversized hex image\n");
-					fclose(f);
-					return -1;
-				}
-				len = (long)(maxaddr - minaddr + 1);
-				img = malloc((size_t)len);
-				if (!img) { fclose(f); return -1; }
-				memset(img, 0xFF, (size_t)len);
-				base = minaddr;
-			}
+		len = load_ihex(f, path, &img, &base);
+		if (len < 0) {
+			fclose(f);
+			return -1;
 		}
 	} else {
 		fseek(f, 0, SEEK_END);
@@ -631,11 +793,8 @@ static int dfu_device_present(void)
 
 static int cmd_flash(const char *path, int yes)
 {
-	if (system("dfu-util --version >/dev/null 2>&1") != 0) {
-		fprintf(stderr, "wireviewctl: dfu-util not found; install the dfu-util package\n");
-		return 1;
-	}
-
+	/* Validate the image first: a corrupted file fails here, before
+	 * anything runs or reaches the device. */
 	uint8_t *img = NULL;
 	uint32_t base = 0;
 	int version = -1;
@@ -643,6 +802,12 @@ static int cmd_flash(const char *path, int yes)
 	long len = load_firmware(path, &img, &base, &version, build, sizeof(build));
 	if (len < 0)
 		return 1;
+
+	if (system("dfu-util --version >/dev/null 2>&1") != 0) {
+		fprintf(stderr, "wireviewctl: dfu-util not found; install the dfu-util package\n");
+		free(img);
+		return 1;
+	}
 
 	printf("firmware image: %s (%ld bytes, base 0x%08X)\n", path, len, base);
 	if (version >= 0)
