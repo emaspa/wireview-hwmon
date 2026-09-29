@@ -75,8 +75,10 @@ DKMS needs the matching kernel headers (`linux-headers`, `linux-cachyos-headers`
 ### Firmware image
 
 `wireviewctl flash` with no file argument flashes Thermal Grizzly's official
-firmware image from `/usr/share/wireview/TG-WV-PRO2-FW.hex`. The image is
-proprietary and not covered by the GPL (see
+firmware image from `/usr/share/wireview/TG-WV-PRO2-FW.hex`: v05, build
+`TG-WV-PRO2-FW_20260902_0741`, from the upstream WireView2 1.0.8 Windows
+release. The one image serves both the WireView Pro II and the Noctua Edition.
+The image is proprietary and not covered by the GPL (see
 [firmware/README.md](firmware/README.md)), so the packages ship it on its own
 as `wireview-hwmon-firmware`: apt and dnf install it by default as a
 recommended package, the AUR lists it as optional, and `make install` installs
