@@ -2,7 +2,7 @@
 pkgbase=wireview-hwmon
 pkgname=('wireview-hwmon' 'wireview-hwmon-dkms')
 # Must match the top-level VERSION file ("make check-version").
-pkgver=1.5.1
+pkgver=1.6.0
 pkgrel=1
 pkgdesc="WireView Pro II hwmon daemon, CLI and DKMS kernel module"
 arch=('x86_64')

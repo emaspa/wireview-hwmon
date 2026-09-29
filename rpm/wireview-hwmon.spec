@@ -2,7 +2,7 @@
 
 Name:           wireview-hwmon
 # Must match the top-level VERSION file ("make check-version").
-Version:        1.5.1
+Version:        1.6.0
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -126,6 +126,39 @@ dkms status -m %{name} -v %{version} -k "$(uname -r)" 2>/dev/null | grep -q ': i
 dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
 
 %changelog
+* Tue Sep 29 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.6.0-1
+- hwmon: standard attributes: pwm1 (fan duty), power1_cap (PSU capability),
+  energy1_input (energy since daemon start), and temp/curr/power alarms
+  derived from the device fault bits. fan1_input and psu_cap are
+  deprecated and will be removed after this release. The module accepts
+  both the old 148-byte and the new 156-byte sensor record.
+- wireviewd: privileged socket commands (bootloader, NVM, config write,
+  serial handover) now require root or the new "wireview" system group;
+  other peers get status 3 (denied). The package creates the group; add
+  users with "usermod -aG wireview USER".
+- wireviewd: command socket persists across device unplug/replug; clients
+  are served non-blocking with a 2 s request deadline; HTTP requests are
+  bounded to 3 s; energy integration; GET /metrics (Prometheus); bind=
+  config key with IPv6 support; -V prints the version.
+- wireviewd: bug fixes: -d path kept across reconnects, per-bit fault
+  debounce, JSON escaping of host and build string, ordered journal
+  output, config keys accept blanks around "=".
+- wireviewctl: clear-faults sends the correct keep-masks and takes
+  optional bit arguments; sensors --json; --host remote mode with
+  HMAC-signed writes (--secret-file / WIREVIEW_SECRET); new sensor lines
+  for pwm1, power1_cap, energy and alarms; -V/--version; top no longer
+  spins with stdin at EOF; denied commands are reported as failures.
+- systemd: sandboxed unit (ProtectSystem=strict, no capabilities, device
+  policy limited to ttyACM and misc). udev: serial and DFU devices are
+  0660 root:dialout plus seat uaccess; the hwmon node is root-only.
+- packaging: /etc/wireview/config shipped as a conffile; debhelper-compat
+  13 with dh_installsystemd owning the service; hardened build flags via
+  dpkg-buildflags; single VERSION file; copyright lists the CC0 sha256
+  code and the proprietary firmware image; DKMS output no longer hidden
+  (rpm).
+- tests: unit tests, a pty-based end-to-end test with a fake device, and
+  a GitHub Actions workflow.
+
 * Sat Jul 18 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.5.1-1
 - dkms: deregister on upgrade as well as erase (drop the $1 -eq 0 guard on
   preun); upgrades used to leave the old version registered in /var/lib/dkms
