@@ -21,7 +21,6 @@ import grp
 import http.client
 import json
 import os
-import pwd
 import re
 import select
 import shlex
@@ -48,9 +47,15 @@ FRAME_SIZE = {2: 148, 3: 156}
 OFF_VOLTAGE, OFF_CURRENT, OFF_VDD, OFF_ENERGY = 8, 32, 136, 148
 
 WCMD_GET_DEVICE_INFO = 0x01
+WCMD_READ_CONFIG = 0x03
+WCMD_WRITE_CONFIG = 0x04
 WCMD_SCREEN_CMD = 0x05
 WCMD_NVM_CMD = 0x06
+WCMD_ENTER_BOOTLOADER = 0x08
+WCMD_SUSPEND_SERIAL = 0x09
+WCMD_RESUME_SERIAL = 0x0A
 RESP_OK, RESP_NOT_CONNECTED, RESP_DENIED = 0, 2, 3
+SECRET = "e2e-secret"   # POST /command on the loopback listener
 
 FW_VERSION = 7
 BUILD = b"FAKE build 1.0"
@@ -86,7 +91,22 @@ def make_tmpdir():
     sys.exit("e2e: no temp dir short enough for a Unix socket path")
 
 
-def build(tmp):
+# The privileged socket commands are gated on WIREVIEW_GROUP. The main test
+# daemon is built with the test user's own primary group there, so the
+# privileged path (config writes, NVM, serial handover) runs as an ordinary
+# user; a second build names a group that does not exist, so the same user
+# is an unprivileged peer (root is always privileged: those checks skip).
+NO_GROUP = "wv-e2e-no-such-group"
+
+
+def primary_group():
+    try:
+        return grp.getgrgid(os.getgid()).gr_name
+    except KeyError:
+        return None
+
+
+def build(tmp, group, programs=("wireviewd", "wireviewctl")):
     cc = os.environ.get("CC", "cc")
     san = shlex.split(os.environ.get("SAN_FLAGS", ""))
     version = open(os.path.join(TOP, "VERSION")).read().strip()
@@ -96,10 +116,13 @@ def build(tmp):
         f'-DSOCK_PATH="{tmp}/wireviewd.sock"',
         f'-DLOG_DIR="{tmp}/log"',
         f'-DCONFIG_PATH="{tmp}/config"',
+        f'-DWIREVIEW_GROUP="{group}"',
     ]
     flags = ["-g", "-O1", "-Wall", "-Wextra", "-Wno-format-truncation"] + san
     for out, srcs in (("wireviewd", ["wireviewd.c", "sha256.c"]),
                       ("wireviewctl", ["wireviewctl.c", "sha256.c"])):
+        if out not in programs:
+            continue
         cmd = [cc] + flags + defs + ["-o", os.path.join(tmp, out)] + \
             [os.path.join(TOP, s) for s in srcs]
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -194,18 +217,6 @@ def parse_metrics(text):
 
 def metric(samples, name, **labels):
     return samples.get((name, tuple(sorted(labels.items()))))
-
-
-def privileged():
-    """Mirror wireviewd's peer check: root, or the wireview group."""
-    if os.getuid() == 0:
-        return True
-    try:
-        gid = grp.getgrnam("wireview").gr_gid
-    except KeyError:
-        return False
-    pw = pwd.getpwuid(os.getuid())
-    return gid == os.getgid() or gid in os.getgrouplist(pw.pw_name, pw.pw_gid)
 
 
 class HwmonSink:
@@ -311,40 +322,50 @@ def fake_sysfs(tmp):
     return d
 
 
+def daemon_env():
+    env = dict(os.environ)
+    for k in ("WIREVIEW_LISTEN", "WIREVIEW_SECRET", "WIREVIEW_HWMON_PATH"):
+        env.pop(k, None)
+    return env
+
+
+def stop_daemon(daemon, what):
+    if daemon.poll() is None:
+        daemon.send_signal(signal.SIGTERM)
+        try:
+            rc = daemon.wait(5)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+            rc = daemon.wait()
+        check(rc == 0, f"{what} exits 0 on SIGTERM", f"exit status {rc}")
+
+
 def run(tmp):
     hwmon = HwmonSink(os.path.join(tmp, "hwmon"))
     sock = os.path.join(tmp, "wireviewd.sock")
 
-    # LAN listener on loopback only, read-only (no secret).
+    # LAN listener on loopback only; the secret enables POST /command.
     port = free_port()
     with open(os.path.join(tmp, "config"), "w") as f:
-        f.write(f"remote_enabled=1\nbind=127.0.0.1\nport={port}\n")
+        f.write(f"remote_enabled=1\nbind=127.0.0.1\nport={port}\n"
+                f"secret={SECRET}\n")
 
     dev = fd.FakeWireView(fw_version=FW_VERSION, uid=UID, build=BUILD,
                           sensors=fd.pack_sensors(pins=PINS))
     dev.start(link=os.path.join(tmp, "ttyWV"))
-    env = dict(os.environ)
-    for k in ("WIREVIEW_LISTEN", "WIREVIEW_SECRET", "WIREVIEW_HWMON_PATH"):
-        env.pop(k, None)
     out = open(os.path.join(tmp, "daemon.out"), "w")
     daemon = subprocess.Popen(
         [os.path.join(tmp, "wireviewd"), "-i", "100", "-d", dev.path],
-        env=env, stdout=out, stderr=subprocess.STDOUT)
+        env=daemon_env(), stdout=out, stderr=subprocess.STDOUT)
     unplug_at = 0       # frames written before the device went away
     try:
         exercise(tmp, dev, daemon, hwmon, sock)
+        exercise_config(tmp, dev, sock, port)
         exercise_http(tmp, dev, daemon, port)
         exercise_ctl_json(tmp, port)
         unplug_at = exercise_unplug(tmp, dev, daemon, hwmon, sock, port)
     finally:
-        if daemon.poll() is None:
-            daemon.send_signal(signal.SIGTERM)
-            try:
-                rc = daemon.wait(5)
-            except subprocess.TimeoutExpired:
-                daemon.kill()
-                rc = daemon.wait()
-            check(rc == 0, "daemon exits 0 on SIGTERM", f"exit status {rc}")
+        stop_daemon(daemon, "daemon")
         out.close()
         dev.stop()
         hwmon.stop()
@@ -453,18 +474,13 @@ def exercise(tmp, dev, daemon, hwmon, sock):
           "wireviewctl clear-faults 1 0 sends keep-masks FFFE/FFFF",
           f"{r.stderr} {dev.writes_of(fd.CMD_CLEAR_FAULTS)}")
 
-    # Privileged commands: refused unless root or in the wireview group.
+    # Privileged commands: this daemon takes the test user as privileged
+    # (see build()); exercise_unprivileged() covers the denial.
     status, _ = request(sock, WCMD_NVM_CMD, b"\x02")
-    if privileged():
-        check(status == RESP_OK and dev.wait_for(
-              lambda: dev.writes_of(fd.CMD_NVM_CONFIG)) ==
-              [b"\x55\xaa\x55\xaa\x02"],
-              "privileged NVM store reaches the device")
-    else:
-        time.sleep(0.2)
-        check(status == RESP_DENIED and not dev.writes_of(fd.CMD_NVM_CONFIG),
-              "NVM from an unprivileged peer is denied and not relayed",
-              f"status {status}")
+    check(status == RESP_OK and dev.wait_for(
+          lambda: dev.writes_of(fd.CMD_NVM_CONFIG)) ==
+          [b"\x55\xaa\x55\xaa\x02"],
+          "privileged NVM store reaches the device", f"status {status}")
 
     # A corrupt frame is dropped and audited; polling carries on.
     polls = dev.polls
@@ -476,6 +492,165 @@ def exercise(tmp, dev, daemon, hwmon, sock):
                      in audit_log(tmp), 3),
           "audit log records the discarded corrupt frame")
     check(daemon.poll() is None, "daemon still running after the corrupt frame")
+
+
+def config_pattern(size, version, seed):
+    """A config image with every byte position distinct from the last
+    one written; byte 2 is the ConfigStruct version, as on the device."""
+    b = bytearray((i * seed + 11) & 0xFF for i in range(size))
+    b[2] = version
+    return bytes(b)
+
+
+def check_fake_reassembly():
+    """The fake device's WRITE_CONFIG framing must not depend on how the
+    bytes happen to be split across read() calls."""
+    for ver, size in sorted(fd.CONFIG_SIZE.items()):
+        want = config_pattern(size, ver, 53)
+        stream = bytearray()
+        for off in range(0, size, fd.CONFIG_CHUNK):
+            stream += bytes([fd.CMD_WRITE_CONFIG, off]) + \
+                want[off:off + fd.CONFIG_CHUNK]
+        stream += bytes([fd.CMD_READ_CONFIG])
+        bad = []
+        for split in range(0, len(stream) + 1):
+            dev = fd.FakeWireView(config_version=ver)
+            reply = dev.feed(stream[:split]) + dev.feed(stream[split:])
+            if not (reply == want and dev.configs_written == [want] and
+                    not dev.unknown):
+                bad.append(split)
+        dev = fd.FakeWireView(config_version=ver)
+        reply = b"".join(dev.feed(stream[i:i + 1])
+                         for i in range(len(stream)))
+        if reply != want:
+            bad.append("bytewise")
+        check(not bad, f"fake device reassembles a v{ver} ({size}-byte) "
+              "config write however the stream is split",
+              f"bad splits: {bad[:5]}")
+
+
+def exercise_config(tmp, dev, sock, port):
+    """Config writes over the socket, wireviewctl and POST /command, each
+    read back from the device; the test user is privileged here."""
+    size, ver = len(dev.config), dev.config_version
+    check(size == 96 and ver == 2, "fake device has a 96-byte v2 config")
+    written = len(dev.configs_written)
+
+    new = config_pattern(size, ver, 37)
+    before = len(dev.writes_of(fd.CMD_WRITE_CONFIG))
+    status, _ = request(sock, WCMD_WRITE_CONFIG, bytes([ver]) + new)
+    check(status == RESP_OK and
+          dev.wait_for(lambda: bytes(dev.config) == new),
+          "privileged WRITE_CONFIG reaches the device byte-exact",
+          f"status {status}")
+    frames = dev.writes_of(fd.CMD_WRITE_CONFIG)[before:]
+    check(frames == [bytes([0]) + new[:62], bytes([62]) + new[62:]],
+          "the config goes out as frames at offset 0 (62 bytes) and 62 "
+          "(34 bytes)", str([(f[0], len(f) - 1) for f in frames]))
+    status, data = request(sock, WCMD_READ_CONFIG)
+    check(status == RESP_OK and data == bytes([ver]) + new,
+          "READ_CONFIG returns the config just written",
+          f"status {status} {data.hex()}")
+
+    new2 = config_pattern(size, ver, 101)
+    path = os.path.join(tmp, "config2.hex")
+    with open(path, "w") as f:
+        f.write(new2.hex() + "\n")
+    r = ctl(tmp, "write-config", path)
+    check(r.returncode == 0 and
+          "config written (96 bytes, version 2)" in r.stdout and
+          dev.wait_for(lambda: bytes(dev.config) == new2),
+          "wireviewctl write-config writes the file's config byte-exact",
+          r.stdout + r.stderr)
+    r = ctl(tmp, "read-config")
+    check(r.returncode == 0 and r.stdout.strip() == new2.hex(),
+          "wireviewctl read-config prints it back", r.stdout + r.stderr)
+
+    # The signed LAN path: POST /command writeConfig, then GET /config.
+    new3 = config_pattern(size, ver, 199)
+    path = os.path.join(tmp, "config3.hex")
+    with open(path, "w") as f:
+        f.write(new3.hex() + "\n")
+    host = f"127.0.0.1:{port}"
+    env = dict(os.environ, WIREVIEW_SECRET=SECRET)
+    r = ctl(tmp, "--host", host, "write-config", path, env=env)
+    check(r.returncode == 0 and
+          dev.wait_for(lambda: bytes(dev.config) == new3),
+          "wireviewctl --host write-config (signed POST /command) writes "
+          "the config byte-exact", r.stdout + r.stderr)
+    r = ctl(tmp, "--host", host, "read-config")
+    check(r.returncode == 0 and r.stdout.strip() == new3.hex(),
+          "GET /config (wireviewctl --host read-config) returns it",
+          r.stdout + r.stderr)
+    check(dev.configs_written[written:] == [new, new2, new3] and
+          not dev.unknown,
+          "the device saw exactly three complete config writes",
+          f"{len(dev.configs_written) - written} writes, "
+          f"unknown {dev.unknown}")
+
+
+def run_unprivileged(tmp):
+    """A daemon built with a WIREVIEW_GROUP that does not exist, so the
+    test user is an unprivileged peer: privileged commands get status 3
+    and never reach its (separate) fake device."""
+    if os.getuid() == 0:
+        print("skip unprivileged-peer checks: running as root")
+        return
+    utmp = os.path.join(tmp, "u")
+    os.mkdir(utmp)
+    build(utmp, NO_GROUP, programs=("wireviewd",))
+    with open(os.path.join(utmp, "config"), "w") as f:
+        f.write("remote_enabled=0\n")
+    hwmon = HwmonSink(os.path.join(utmp, "hwmon"))
+    sock = os.path.join(utmp, "wireviewd.sock")
+    dev = fd.FakeWireView(fw_version=FW_VERSION, uid=UID, build=BUILD)
+    dev.start()
+    out = open(os.path.join(utmp, "daemon.out"), "w")
+    daemon = subprocess.Popen(
+        [os.path.join(utmp, "wireviewd"), "-i", "100", "-d", dev.path],
+        env=daemon_env(), stdout=out, stderr=subprocess.STDOUT)
+    try:
+        if not check(wait_until(lambda: (os.path.exists(sock) and
+                                         dev.polls >= 2) or
+                                daemon.poll() is not None, 10) and
+                     daemon.poll() is None,
+                     "unprivileged-peer daemon starts and polls its device"):
+            return
+        ver = dev.config_version
+        orig = bytes(dev.config)
+        new = config_pattern(len(orig), ver, 37)
+        status, _ = request(sock, WCMD_WRITE_CONFIG, bytes([ver]) + new)
+        check(status == RESP_DENIED,
+              "WRITE_CONFIG from an unprivileged peer gets status 3",
+              f"status {status}")
+        status, data = request(sock, WCMD_READ_CONFIG)
+        check(status == RESP_OK and data == bytes([ver]) + orig,
+              "READ_CONFIG (open to everyone) shows the config unchanged",
+              f"status {status}")
+        denied = {name: request(sock, cmd, payload)[0]
+                  for name, cmd, payload in (
+                      ("NVM", WCMD_NVM_CMD, b"\x02"),
+                      ("ENTER_BOOTLOADER", WCMD_ENTER_BOOTLOADER, b""),
+                      ("SUSPEND_SERIAL", WCMD_SUSPEND_SERIAL,
+                       struct.pack("<H", 5)),
+                      ("RESUME_SERIAL", WCMD_RESUME_SERIAL, b""))}
+        check(all(s == RESP_DENIED for s in denied.values()),
+              "NVM, bootloader and serial handover get status 3 too",
+              str(denied))
+        polls = dev.polls
+        check(dev.wait_for(lambda: dev.polls >= polls + 3),
+              "polling carries on: no handover was granted")
+        check(not dev.writes and not dev.unknown,
+              "nothing an unprivileged peer sent reached the device",
+              f"writes {dev.writes} unknown {dev.unknown}")
+        check(wait_until(lambda: f"socket cmd 0x04 from uid {os.getuid()} "
+                         "denied" in audit_log(utmp), 2),
+              "the denied config write is audited with the peer's uid")
+    finally:
+        stop_daemon(daemon, "unprivileged-peer daemon")
+        out.close()
+        dev.stop()
+        hwmon.stop()
 
 
 def exercise_http(tmp, dev, daemon, port):
@@ -690,17 +865,25 @@ def exercise_unplug(tmp, dev, daemon, hwmon, sock, port):
 def main():
     tmp = make_tmpdir()
     try:
-        build(tmp)
-        try:
-            run(tmp)
-        except Exception as e:  # report, then fall through to the summary
-            check(False, "e2e run", f"{type(e).__name__}: {e}")
+        group = primary_group()
+        if group is None:
+            print(f"e2e: gid {os.getgid()} has no name; privileged "
+                  "checks will fail")
+        build(tmp, group or NO_GROUP)
+        check_fake_reassembly()
+        for step in (run, run_unprivileged):
+            try:
+                step(tmp)
+            except Exception as e:  # report, then go on to the summary
+                check(False, f"e2e {step.__name__}",
+                      f"{type(e).__name__}: {e}")
         if failed:
-            for name in ("daemon.out",):
+            for name in ("daemon.out", "u/daemon.out"):
                 p = os.path.join(tmp, name)
                 if os.path.exists(p):
                     print(f"--- {name}\n" + open(p).read())
             print("--- audit log\n" + audit_log(tmp))
+            print("--- u/audit log\n" + audit_log(os.path.join(tmp, "u")))
     finally:
         if os.environ.get("WIREVIEW_E2E_KEEP"):
             print(f"e2e: kept {tmp}")

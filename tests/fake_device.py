@@ -4,7 +4,10 @@
 
 Speaks the device's serial protocol closely enough for wireviewd: one
 command byte in, a fixed-size little-endian struct out (layouts as
-documented in wireviewd.c). Write commands are accepted and recorded.
+documented in wireviewd.c). Write commands are accepted and recorded;
+WRITE_CONFIG frames are reassembled from the byte stream by the config
+size of the device's config version (see _write_len) and applied to the
+config that READ_CONFIG returns.
 
 As a library:
 
@@ -68,6 +71,7 @@ assert SENSOR_SIZE == 100
 VENDOR_ID = (0xEF, 0x05)    # VendorDataStruct bytes 0-1, checked by wireviewd
 BUILD_SIZE = 68             # VendorData(3) + ProductName(32) + BuildInfo(32) + len(1)
 CONFIG_SIZE = {0: 72, 1: 74, 2: 96}
+CONFIG_CHUNK = 62           # data bytes per WRITE_CONFIG frame
 
 
 def pack_sensors(ts=(355, 400, 2001, 2001), vdd=3300, fan=42, pad1=0,
@@ -104,7 +108,9 @@ class FakeWireView:
         self.polls = 0              # sensor reads answered
         self.corrupt_sent = 0
         self.writes = []            # (cmd, bytes) of every write command
+        self.configs_written = []   # config after each complete write
         self.unknown = []           # command bytes we did not understand
+        self._rx = bytearray()      # bytes of a command not complete yet
         self._corrupt_pending = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -154,6 +160,7 @@ class FakeWireView:
         else:
             self.path = tty_path
         self.plugs += 1
+        self._rx = bytearray()      # a new pty starts a new stream
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run,
                                         args=(self._stop, self.master),
@@ -215,34 +222,68 @@ class FakeWireView:
             return self.sensors
         return None
 
-    def _handle(self, master, chunk):
-        """Handle one read() worth of bytes. Write commands with a variable
-        length (WRITE_CONFIG) take the rest of the chunk, like the USB
-        packet the real device receives."""
-        i = 0
-        while i < len(chunk):
-            cmd = chunk[i]
+    def _write_len(self, rx):
+        """Total length (command byte included) of the write command at
+        the start of rx, None while more bytes are needed to know it, or
+        0 for an unknown command byte.
+
+        WRITE_CONFIG has no length field: [0x06][offset][data]. The real
+        device takes the USB packet as the frame; a pty has no packets,
+        so the frame is sized from what wireviewd sends: 62-byte chunks
+        of a config of the size this device's config version has, i.e.
+        min(62, size - offset) data bytes. That does not depend on how
+        the bytes happen to be split across read() calls."""
+        cmd = rx[0]
+        if cmd in WRITE_LEN:
+            return WRITE_LEN[cmd]
+        if cmd != CMD_WRITE_CONFIG:
+            return 0
+        if len(rx) < 2:
+            return None
+        off = rx[1]
+        if off >= len(self.config):
+            return 2        # nothing to write there; recorded as bad
+        return 2 + min(CONFIG_CHUNK, len(self.config) - off)
+
+    def feed(self, data):
+        """Parse bytes from the host; returns the reply bytes. Commands
+        may be split across calls: an incomplete write command waits in
+        the receive buffer for the rest."""
+        self._rx += data
+        out = bytearray()
+        while self._rx:
+            cmd = self._rx[0]
             reply = self._reply(cmd)
             if reply is not None:
-                os.write(master, reply)
-                i += 1
+                out += reply
+                del self._rx[:1]
                 continue
-            if cmd == CMD_WRITE_CONFIG:
-                n = len(chunk) - i
-            elif cmd in WRITE_LEN:
-                n = WRITE_LEN[cmd]
-            else:
+            n = self._write_len(self._rx)
+            if n is None or len(self._rx) < n:
+                break       # rest of the command still to come
+            if n == 0:
                 with self._lock:
                     self.unknown.append(cmd)
-                i += 1
+                del self._rx[:1]
                 continue
-            data = bytes(chunk[i + 1:i + n])
-            if cmd == CMD_WRITE_CONFIG and len(data) >= 1:
-                off = data[0]
-                self.config[off:off + len(data) - 1] = data[1:]
+            data = bytes(self._rx[1:n])
+            del self._rx[:n]
             with self._lock:
+                if cmd == CMD_WRITE_CONFIG:
+                    off = data[0]
+                    if off >= len(self.config):
+                        self.unknown.append(cmd)
+                        continue
+                    self.config[off:off + len(data) - 1] = data[1:]
+                    if off + len(data) - 1 == len(self.config):
+                        self.configs_written.append(bytes(self.config))
                 self.writes.append((cmd, data))
-            i += n
+        return bytes(out)
+
+    def _handle(self, master, chunk):
+        reply = self.feed(chunk)
+        if reply:
+            os.write(master, reply)
 
     def _run(self, stop, master):
         while not stop.is_set():

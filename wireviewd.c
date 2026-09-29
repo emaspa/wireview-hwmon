@@ -58,8 +58,13 @@
 #endif
 #define HTTP_PORT    9876
 
-/* Members of this group (and root) may send privileged socket commands. */
+/* Members of this group (and root) may send privileged socket commands.
+ * Overridable (-D) only so the e2e test can run the privileged path as an
+ * ordinary user (its own primary group) and the denied path (a group
+ * that does not exist). */
+#ifndef WIREVIEW_GROUP
 #define WIREVIEW_GROUP "wireview"
+#endif
 
 /* Package version, injected by the Makefile (-DWIREVIEW_PKG_VERSION=\"x.y.z\"). */
 #ifndef WIREVIEW_PKG_VERSION
