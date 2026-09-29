@@ -1318,47 +1318,195 @@ static int http_get_sensors(const char *hostport, char *out, size_t cap)
 	return 0;
 }
 
-/* ---- minimal JSON readers for the flat /sensors schema ---- */
-static const char *j_find(const char *j, const char *key)
+/*
+ * ---- a small JSON reader for GET /sensors and GET /config ----
+ *
+ * Not a validator: it walks the structure far enough to find an object's
+ * own members, skipping strings (with their escapes) and nested values, so
+ * text inside a string or a key of a nested object never matches. Every
+ * step stops at the terminating NUL, so a truncated body reads as absent
+ * members, never past the buffer.
+ */
+static const char *js_ws(const char *p)
 {
-	char k[40];
-	snprintf(k, sizeof(k), "\"%s\"", key);
-	const char *p = strstr(j, k);
-	if (!p) return NULL;
-	p += strlen(k);
-	while (*p == ' ' || *p == ':') p++;
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
 	return p;
 }
-static double j_num(const char *j, const char *key)
+
+/* p is on a '"'; returns the byte after the closing quote, NULL if the
+ * string is unterminated. */
+static const char *js_skip_string(const char *p)
 {
-	const char *p = j_find(j, key);
-	return p ? strtod(p, NULL) : 0;
-}
-static void j_str(const char *j, const char *key, char *out, size_t n)
-{
-	const char *p = j_find(j, key);
-	out[0] = '\0';
-	if (!p || *p != '"') return;
-	p++;
-	size_t i = 0;
-	while (*p && *p != '"' && i < n - 1) {
-		if (*p == '\\' && p[1]) p++;	/* undo the \" and \\ escapes */
-		out[i++] = *p++;
+	for (p++; *p; p++) {
+		if (*p == '\\') {
+			if (!p[1])
+				return NULL;
+			p++;
+		} else if (*p == '"') {
+			return p + 1;
+		}
 	}
-	out[i] = '\0';
+	return NULL;
 }
-static void j_arr6(const char *j, const char *key, double out[6])
+
+/* Skip one value (string, object, array or scalar) at p; returns the byte
+ * after it, NULL if it is missing or truncated. */
+static const char *js_skip_value(const char *p)
 {
-	const char *p = j_find(j, key);
-	if (!p || *p != '[') return;
-	p++;
+	p = js_ws(p);
+	if (*p == '"')
+		return js_skip_string(p);
+	if (*p == '{' || *p == '[') {
+		size_t depth = 0;
+		while (*p) {
+			if (*p == '"') {
+				p = js_skip_string(p);
+				if (!p)
+					return NULL;
+				continue;
+			}
+			if (*p == '{' || *p == '[') {
+				depth++;
+			} else if (*p == '}' || *p == ']') {
+				if (--depth == 0)
+					return p + 1;
+			}
+			p++;
+		}
+		return NULL;
+	}
+	const char *s = p;	/* number, true, false, null */
+	while (*p && *p != ',' && *p != '}' && *p != ']' && *p != ' ' &&
+	       *p != '\t' && *p != '\n' && *p != '\r' && *p != '"' &&
+	       *p != '{' && *p != '[' && *p != ':')
+		p++;
+	return p == s ? NULL : p;
+}
+
+/* The value of member key of the object at obj (only its own members, the
+ * first one wins), whitespace skipped; NULL if obj is not an object or has
+ * no such member before it ends or breaks off. */
+static const char *js_member(const char *obj, const char *key)
+{
+	size_t klen = strlen(key);
+	const char *p = js_ws(obj);
+
+	if (*p != '{')
+		return NULL;
+	p = js_ws(p + 1);
+	while (*p == '"') {
+		const char *kend = js_skip_string(p);
+		if (!kend)
+			return NULL;
+		const char *v = js_ws(kend);
+		if (*v != ':')
+			return NULL;
+		v = js_ws(v + 1);
+		if ((size_t)(kend - p - 2) == klen && memcmp(p + 1, key, klen) == 0)
+			return v;
+		p = js_skip_value(v);
+		if (!p)
+			return NULL;
+		p = js_ws(p);
+		if (*p != ',')
+			return NULL;
+		p = js_ws(p + 1);
+	}
+	return NULL;
+}
+
+/* A number at v (NULL-safe); 1 and *out set if there is one. */
+static int js_number_at(const char *v, double *out)
+{
 	char *end;
-	for (int i = 0; i < 6; i++) {
-		out[i] = strtod(p, &end);
-		if (end == p) break;
-		p = end;
-		while (*p == ',' || *p == ' ') p++;
+
+	if (!v || !(*v == '-' || (*v >= '0' && *v <= '9')))
+		return 0;
+	*out = strtod(v, &end);
+	return end != v;
+}
+
+/* Member key of obj as a number; 1 and *out set if present and numeric. */
+static int js_num(const char *obj, const char *key, double *out)
+{
+	return js_number_at(js_member(obj, key), out);
+}
+
+/* Member key of obj as a number, 0 when absent or not a number. */
+static double js_num0(const char *obj, const char *key)
+{
+	double d = 0;
+	return js_num(obj, key, &d) ? d : 0;
+}
+
+/* Member key of obj as a string, unescaped into out (always terminated,
+ * truncated to n - 1). \uXXXX other than ASCII becomes '?', as wireviewd
+ * writes non-ASCII bytes. Returns 1 if the member is a string. */
+static int js_str(const char *obj, const char *key, char *out, size_t n)
+{
+	const char *p = js_member(obj, key);
+	size_t i = 0;
+
+	out[0] = '\0';
+	if (!p || *p != '"')
+		return 0;
+	for (p++; *p && *p != '"'; p++) {
+		char c = *p;
+		if (c == '\\') {
+			p++;
+			switch (*p) {
+			case 'b': c = '\b'; break;
+			case 'f': c = '\f'; break;
+			case 'n': c = '\n'; break;
+			case 'r': c = '\r'; break;
+			case 't': c = '\t'; break;
+			case 'u': {
+				unsigned u = 0;
+				int k;
+				for (k = 1; k <= 4 && hex_nibble(p[k]) >= 0; k++)
+					u = u << 4 | (unsigned)hex_nibble(p[k]);
+				if (k <= 4)
+					return 1;	/* broken escape: keep what we have */
+				p += 4;
+				c = u >= 0x01 && u < 0x80 ? (char)u : '?';
+				break;
+			}
+			case '\0':
+				return 1;
+			default:	/* \" \\ \/ */
+				c = *p;
+			}
+		}
+		if (i + 1 < n) {
+			out[i++] = c;
+			out[i] = '\0';
+		}
 	}
+	return 1;
+}
+
+/* Member key of obj as an array of up to 6 numbers into out; returns the
+ * count read (it stops at the first element that is not a number). */
+static int js_arr6(const char *obj, const char *key, double out[6])
+{
+	const char *p = js_member(obj, key);
+	int i = 0;
+
+	if (!p || *p != '[')
+		return 0;
+	p = js_ws(p + 1);
+	while (i < 6 && js_number_at(p, &out[i])) {
+		i++;
+		p = js_skip_value(p);
+		if (!p)
+			break;
+		p = js_ws(p);
+		if (*p != ',')
+			break;
+		p = js_ws(p + 1);
+	}
+	return i;
 }
 
 /* Round a reading to the integer sysfs unit the snapshot stores. */
@@ -1367,76 +1515,83 @@ static long long to_ll(double x)
 	return (long long)(x >= 0 ? x + 0.5 : x - 0.5);
 }
 
+/* One device object of GET /sensors into a snapshot. */
+static void parse_device(const char *hostport, const char *obj, struct wv_snap *s)
+{
+	memset(s, 0, sizeof(*s));
+	snprintf(s->source, sizeof(s->source), "%s", hostport);
+	js_str(obj, "name", s->name, sizeof(s->name));
+	js_str(obj, "fwVer", s->fw, sizeof(s->fw));
+	js_str(obj, "id", s->uid, sizeof(s->uid));
+	js_str(obj, "buildString", s->build, sizeof(s->build));
+
+	double pv[6] = {0}, pc[6] = {0};
+	js_arr6(obj, "pinVoltage", pv);
+	js_arr6(obj, "pinCurrent", pc);
+	for (int i = 0; i < 6; i++) {
+		s->in_mv[i] = to_ll(pv[i] * 1000.0);
+		s->curr_ma[i] = to_ll(pc[i] * 1000.0);
+		s->power_uw[i + 1] = to_ll(pv[i] * pc[i] * 1e6);
+	}
+	s->curr_ma[6] = to_ll(js_num0(obj, "sumCurrentA") * 1000.0);
+	s->power_uw[0] = to_ll(js_num0(obj, "sumPowerW") * 1e6);
+	s->have_in = 0x3F;	/* no average / vdd over the network */
+	s->have_curr = 0x7F;
+	s->have_power = 0x7F;
+
+	s->temp_mc[0] = to_ll(js_num0(obj, "tempInC") * 1000.0);
+	s->temp_mc[1] = to_ll(js_num0(obj, "tempOutC") * 1000.0);
+	s->have_temp = 0x3;
+	/* Disconnected externals read 0.0 (daemon clamp) or a deeply negative
+	 * sentinel (~-100, app publisher) — treat both as "not present".
+	 * -40.0 is the lowest reading the daemon publishes, so keep it. */
+	double e[2] = { js_num0(obj, "ext1C"), js_num0(obj, "ext2C") };
+	for (int i = 0; i < 2; i++) {
+		if (e[i] != 0.0 && e[i] >= -40.0) {
+			s->temp_mc[2 + i] = to_ll(e[i] * 1000.0);
+			s->have_temp |= 1u << (2 + i);
+		}
+	}
+
+	s->psu_cap_w = (int)js_num0(obj, "psuCapW");
+	s->fault_status = (unsigned)js_num0(obj, "faultStatus");
+	s->fault_log = (unsigned)js_num0(obj, "faultLog");
+	s->have_fault_status = s->have_fault_log = 1;
+	double d;
+	s->fan = js_num(obj, "fan", &d) ? (int)d : -1;
+	if (js_num(obj, "energyJ", &d)) {
+		s->energy_uj = to_ll(d * 1e6);
+		s->have_energy = 1;
+	}
+	for (int i = 0; i < WV_NALARM; i++)
+		s->alarm[i] = -1;	/* /sensors carries no per-channel alarms */
+	if (s->name[0] == '\0') snprintf(s->name, sizeof(s->name), "WireView");
+	const char *cp = js_member(obj, "connected");
+	s->ok = !(cp && strncmp(cp, "false", 5) == 0);
+}
+
+/* The complete device objects in the root's "devices" array, up to max; a
+ * truncated body stops at the last complete one, other elements are
+ * skipped. Returns the number of snapshots written. */
 static int parse_remote(const char *hostport, const char *body,
 			struct wv_snap *snaps, int max)
 {
-	const char *devs = strstr(body, "\"devices\"");
-	if (!devs) return 0;
-	const char *p = strchr(devs, '[');
-	if (!p) return 0;
+	const char *p = js_member(body, "devices");
 	int n = 0;
-	while (n < max && (p = strchr(p, '{')) != NULL) {
-		const char *end = strchr(p, '}');     /* device objects hold no nested {} */
-		if (!end) break;
-		size_t len = (size_t)(end - p + 1);
-		char obj[2048];
-		if (len >= sizeof(obj)) len = sizeof(obj) - 1;
-		memcpy(obj, p, len);
-		obj[len] = '\0';
 
-		struct wv_snap *s = &snaps[n];
-		memset(s, 0, sizeof(*s));
-		snprintf(s->source, sizeof(s->source), "%s", hostport);
-		j_str(obj, "name", s->name, sizeof(s->name));
-		j_str(obj, "fwVer", s->fw, sizeof(s->fw));
-		j_str(obj, "id", s->uid, sizeof(s->uid));
-		j_str(obj, "buildString", s->build, sizeof(s->build));
-
-		double pv[6] = {0}, pc[6] = {0};
-		j_arr6(obj, "pinVoltage", pv);
-		j_arr6(obj, "pinCurrent", pc);
-		for (int i = 0; i < 6; i++) {
-			s->in_mv[i] = to_ll(pv[i] * 1000.0);
-			s->curr_ma[i] = to_ll(pc[i] * 1000.0);
-			s->power_uw[i + 1] = to_ll(pv[i] * pc[i] * 1e6);
-		}
-		s->curr_ma[6] = to_ll(j_num(obj, "sumCurrentA") * 1000.0);
-		s->power_uw[0] = to_ll(j_num(obj, "sumPowerW") * 1e6);
-		s->have_in = 0x3F;	/* no average / vdd over the network */
-		s->have_curr = 0x7F;
-		s->have_power = 0x7F;
-
-		s->temp_mc[0] = to_ll(j_num(obj, "tempInC") * 1000.0);
-		s->temp_mc[1] = to_ll(j_num(obj, "tempOutC") * 1000.0);
-		s->have_temp = 0x3;
-		/* Disconnected externals read 0.0 (daemon clamp) or a deeply negative
-		 * sentinel (~-100, app publisher) — treat both as "not present".
-		 * -40.0 is the lowest reading the daemon publishes, so keep it. */
-		double e[2] = { j_num(obj, "ext1C"), j_num(obj, "ext2C") };
-		for (int i = 0; i < 2; i++) {
-			if (e[i] != 0.0 && e[i] >= -40.0) {
-				s->temp_mc[2 + i] = to_ll(e[i] * 1000.0);
-				s->have_temp |= 1u << (2 + i);
-			}
-		}
-
-		s->psu_cap_w = (int)j_num(obj, "psuCapW");
-		s->fault_status = (unsigned)j_num(obj, "faultStatus");
-		s->fault_log = (unsigned)j_num(obj, "faultLog");
-		s->have_fault_status = s->have_fault_log = 1;
-		const char *fp = j_find(obj, "fan");
-		s->fan = fp ? (int)strtod(fp, NULL) : -1;
-		if (j_find(obj, "energyJ")) {
-			s->energy_uj = to_ll(j_num(obj, "energyJ") * 1e6);
-			s->have_energy = 1;
-		}
-		for (int i = 0; i < WV_NALARM; i++)
-			s->alarm[i] = -1;	/* /sensors carries no per-channel alarms */
-		if (s->name[0] == '\0') snprintf(s->name, sizeof(s->name), "WireView");
-		const char *cp = j_find(obj, "connected");
-		s->ok = !(cp && strncmp(cp, "false", 5) == 0);
-		n++;
-		p = end + 1;
+	if (!p || *p != '[')
+		return 0;
+	p = js_ws(p + 1);
+	while (n < max && *p && *p != ']') {
+		const char *end = js_skip_value(p);
+		if (!end)
+			break;
+		if (*p == '{')
+			parse_device(hostport, p, &snaps[n++]);
+		p = js_ws(end);
+		if (*p != ',')
+			break;
+		p = js_ws(p + 1);
 	}
 	return n;
 }
@@ -1693,14 +1848,14 @@ static int remote_read_config(void)
 
 	char b64[1024];
 	uint8_t cfg[512];
-	j_str(body, "data", b64, sizeof(b64));
+	double ver;
+	js_str(body, "data", b64, sizeof(b64));
 	int n = b64_decode(b64, cfg, sizeof(cfg));
-	if (n <= 0 || !j_find(body, "version")) {
+	if (n <= 0 || !js_num(body, "version", &ver)) {
 		fprintf(stderr, "wireviewctl: %s: malformed /config reply\n", g_host);
 		return 1;
 	}
-	fprintf(stderr, "config_version: %d, size: %d bytes\n",
-		(int)j_num(body, "version"), n);
+	fprintf(stderr, "config_version: %d, size: %d bytes\n", (int)ver, n);
 	for (int i = 0; i < n; i++)
 		printf("%02x", cfg[i]);
 	printf("\n");

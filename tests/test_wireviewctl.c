@@ -675,6 +675,152 @@ static void test_parse_remote(void)
 	CHECK_EQ_INT(parse_remote("h", cut, s, 4), 1);
 }
 
+/* A body built to fool a reader that splits objects at the first '}' or
+ * matches keys anywhere: braces, brackets, quotes, backslashes and key-like
+ * text inside strings, nested objects and arrays holding the same keys,
+ * unknown members, non-object array elements and a "devices" key nested
+ * in another root member before the real one. Pretty-printed, too. */
+static const char tricky_body[] =
+	"{ \"note\" : \"not \\\"devices\\\":[{\\\"id\\\":\\\"X\\\"}] here\",\n"
+	"  \"meta\": {\"devices\": [{\"id\": \"NESTED\"}], \"n\": [1, {\"}\": \"]\"}]},\n"
+	"  \"host\": \"r{i}g\",\n"
+	"  \"devices\" : [\n"
+	"    {\n"
+	"      \"extra\": {\"fan\": 7, \"tempInC\": 99.0, \"name\": \"inner\", \"deep\": {\"a\": [[]]}},\n"
+	"      \"list\": [{\"id\": \"x\"}, [1, 2], \"}]\", null, true],\n"
+	"      \"id\": \"C0FFEE\",\n"
+	"      \"name\": \"a}{b] \\\"q\\\" \\\\ [c\",\n"
+	"      \"connected\": true,\n"
+	"      \"fwVer\": \"8\",\n"
+	"      \"buildString\": \"x\\\"psuCapW\\\":1234,\\\"connected\\\":false,\\\"fan\\\":99}\",\n"
+	"      \"pinVoltage\": [ 12.0 , 12.1,12.2 ,12.3, 12.4, 12.5 ],\n"
+	"      \"pinCurrent\": [1, 2, 3, 4, 5, 6],\n"
+	"      \"tempInC\": 30.5, \"tempOutC\": 31.5, \"ext1C\": 20.0, \"ext2C\": 0.0,\n"
+	"      \"psuCapW\": 450, \"fan\": 55, \"faultStatus\": 2, \"faultLog\": 4,\n"
+	"      \"sumCurrentA\": 21.0, \"sumPowerW\": 256.0, \"energyJ\": 1.5,\n"
+	"      \"unknown\": {\"energyJ\": 999}\n"
+	"    },\n"
+	"    null, 42, \"{\\\"id\\\":\\\"S\\\"}\", [ {\"id\": \"IN-ARRAY\"} ],\n"
+	"    {\"id\": \"D2\", \"name\": \"esc \\/ \\n\\t\\u0041\\u00e9\\u005c\", \"fan\": null,\n"
+	"     \"connected\": false, \"note\": \"{\\\"fan\\\":1}\"}\n"
+	"  ],\n"
+	"  \"trailer\": {\"devices\": []}\n"
+	"}\n";
+
+static void test_parse_remote_tricky(void)
+{
+	struct wv_snap s[4];
+
+	memset(s, 0xAB, sizeof(s));
+	CHECK_EQ_INT(parse_remote("rig", tricky_body, s, 4), 2);
+
+	CHECK_EQ_STR(s[0].uid, "C0FFEE");
+	CHECK_EQ_STR(s[0].name, "a}{b] \"q\" \\ [c");
+	CHECK_EQ_STR(s[0].fw, "8");
+	CHECK_EQ_STR(s[0].build, "x\"psuCapW\":1234,\"connected\":false,\"fan\":99}");
+	CHECK(s[0].ok == 1);
+	CHECK_EQ_INT(s[0].in_mv[0], 12000);
+	CHECK_EQ_INT(s[0].in_mv[2], 12200);
+	CHECK_EQ_INT(s[0].in_mv[5], 12500);
+	CHECK_EQ_INT(s[0].curr_ma[5], 6000);
+	CHECK_EQ_INT(s[0].curr_ma[6], 21000);
+	CHECK_EQ_INT(s[0].power_uw[0], 256000000);
+	/* The device's own keys, not the nested "extra" object's. */
+	CHECK_EQ_INT(s[0].temp_mc[0], 30500);
+	CHECK_EQ_INT(s[0].temp_mc[1], 31500);
+	CHECK_EQ_INT(s[0].temp_mc[2], 20000);
+	CHECK_EQ_INT(s[0].have_temp, 0x7);
+	CHECK_EQ_INT(s[0].fan, 55);
+	CHECK_EQ_INT(s[0].psu_cap_w, 450);
+	CHECK_EQ_INT(s[0].fault_status, 2);
+	CHECK_EQ_INT(s[0].fault_log, 4);
+	CHECK_EQ_INT(s[0].have_energy, 1);
+	CHECK_EQ_INT(s[0].energy_uj, 1500000);
+
+	/* null, 42, a string and an array are skipped, not devices. */
+	CHECK_EQ_STR(s[1].uid, "D2");
+	CHECK_EQ_STR(s[1].name, "esc / \n\tA?\\");
+	CHECK(s[1].ok == 0);
+	CHECK_EQ_INT(s[1].fan, -1);		/* null is not a number */
+	CHECK_EQ_INT(s[1].have_energy, 0);
+	CHECK_EQ_STR(s[1].build, "");
+	CHECK_EQ_INT((unsigned char)s[2].source[0], 0xAB);	/* untouched past n */
+
+	/* Root members are found the same way, only at the top level. */
+	char host[16];
+	CHECK_EQ_INT(js_str(tricky_body, "host", host, sizeof(host)), 1);
+	CHECK_EQ_STR(host, "r{i}g");
+	CHECK(js_member(tricky_body, "fan") == NULL);
+	CHECK(js_member(tricky_body, "id") == NULL);
+	double d = -1;
+	CHECK_EQ_INT(js_num(tricky_body, "host", &d), 0);	/* a string */
+	CHECK_EQ_INT(d, -1);
+
+	/* GET /config: "version" is the root member, not text in "data". */
+	static const char cfg[] =
+		"{\"deviceId\":\"\\\"version\\\":9\",\"data\":\"AAEC\",\"version\":2}";
+	CHECK_EQ_INT(js_num(cfg, "version", &d), 1);
+	CHECK_EQ_INT(d, 2);
+	char b64[16];
+	CHECK_EQ_INT(js_str(cfg, "data", b64, sizeof(b64)), 1);
+	CHECK_EQ_STR(b64, "AAEC");
+
+	/* Strings are cut to the buffer, escapes never split. */
+	char small[5];
+	js_str(tricky_body + strlen("{ \"note\" : "), "x", small, sizeof(small));
+	CHECK_EQ_STR(small, "");			/* not an object */
+	CHECK_EQ_INT(js_str(tricky_body, "note", small, sizeof(small)), 1);
+	CHECK_EQ_STR(small, "not ");
+
+	/* Not a /sensors document, or "devices" not an array. */
+	CHECK_EQ_INT(parse_remote("h", "[{\"devices\":[{}]}]", s, 4), 0);
+	CHECK_EQ_INT(parse_remote("h", "{\"devices\":{\"id\":\"x\"}}", s, 4), 0);
+	CHECK_EQ_INT(parse_remote("h", "{\"x\":\"\\\"devices\\\":[{}]\"}", s, 4), 0);
+	CHECK_EQ_INT(parse_remote("h", "{\"devices\":[{}]}", s, 4), 1);
+	CHECK_EQ_STR(s[0].name, "WireView");
+
+	/* Every prefix of the body, each in a buffer of exactly its size so
+	 * ASan catches any read past the NUL: no crash, and the count only
+	 * grows once an object is complete. */
+	size_t full = strlen(tricky_body);
+	size_t first_end = (size_t)(strstr(tricky_body, "    },\n") - tricky_body) + 5;
+	size_t second_end = (size_t)(strstr(tricky_body, "\"{\\\"fan\\\":1}\"}") - tricky_body) + 14;
+	int prev = 0, bad_order = 0, bad_count = 0;
+	for (size_t len = 0; len <= full; len++) {
+		char *buf = malloc(len + 1);
+		if (!buf)
+			break;
+		memcpy(buf, tricky_body, len);
+		buf[len] = '\0';
+		int n = parse_remote("h", buf, s, 4);
+		int want = len >= second_end ? 2 : len >= first_end ? 1 : 0;
+		if (n < prev)
+			bad_order++;
+		if (n != want) {
+			if (!bad_count)
+				fprintf(stderr, "  prefix %zu: %d devices, want %d\n", len, n, want);
+			bad_count++;
+		}
+		prev = n;
+		/* The root and /config readers on the same prefix. */
+		js_str(buf, "host", host, sizeof(host));
+		js_num(buf, "version", &d);
+		js_arr6(buf, "pinVoltage", (double[6]){0});
+		free(buf);
+	}
+	CHECK_EQ_INT(bad_order, 0);
+	CHECK_EQ_INT(bad_count, 0);
+
+	/* The old reader's failure: it cut the device at the '}' in its
+	 * first string and lost every key after it. */
+	static const char brace[] =
+		"{\"devices\":[{\"name\":\"}\",\"fan\":3,\"tempInC\":1.5}]}";
+	CHECK_EQ_INT(parse_remote("h", brace, s, 4), 1);
+	CHECK_EQ_STR(s[0].name, "}");
+	CHECK_EQ_INT(s[0].fan, 3);
+	CHECK_EQ_INT(s[0].temp_mc[0], 1500);
+}
+
 /* ---- a fake hwmon sysfs directory for read_local() ---- */
 
 static char g_hwmon[PATH_MAX];
@@ -1040,6 +1186,7 @@ int main(void)
 	test_ct_str_equal();
 	test_parse_fault_mask();
 	test_parse_remote();
+	test_parse_remote_tricky();
 	test_read_local();
 	test_sensors_output();
 
