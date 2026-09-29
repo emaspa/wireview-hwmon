@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  userspace:
+    name: Daemon, CLI and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wireviewd and wireviewctl with -Werror
+        run: make wireviewd wireviewctl CFLAGS="-O2 -Werror"
+
+      # ASan aborts at startup with the high mmap randomisation of some
+      # runner kernels; 28 bits is what it supports.
+      - name: Allow ASan to start
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Unit and end-to-end tests
+        run: make test
+
+  module:
+    name: Kernel module
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kernel headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-headers-$(uname -r)" ||
+            sudo apt-get install -y linux-headers-generic
+
+      - name: Build with W=1
+        run: |
+          kdir="/lib/modules/$(uname -r)/build"
+          if [ ! -d "$kdir" ]; then
+            kdir=$(find /usr/src -maxdepth 1 -name 'linux-headers-*-generic' | sort -V | tail -n1)
+          fi
+          echo "building against $kdir"
+          make module KDIR="$kdir" W=1 2>&1 | tee build.log
+          test -f wireview_hwmon.ko
+          if grep -E 'wireview_hwmon\.c:[0-9]+:[0-9]+: (warning|error):' build.log; then
+            echo "::error::the module does not build cleanly with W=1"
+            exit 1
+          fi
+
+      - name: modinfo
+        run: modinfo ./wireview_hwmon.ko
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck the Debian maintainer scripts
+        run: shellcheck debian/*.postinst debian/*.prerm
+
+      - name: PKGBUILD syntax
+        run: bash -n aur/PKGBUILD
+
+      - name: Version literals match VERSION
+        run: make check-version
+
+      # checkpatch exits non-zero on warnings too; only errors fail the job.
+      - name: checkpatch
+        run: |
+          base=https://raw.githubusercontent.com/torvalds/linux/master/scripts
+          mkdir -p "$RUNNER_TEMP/checkpatch"
+          for f in checkpatch.pl spelling.txt const_structs.checkpatch; do
+            curl -fsSL -o "$RUNNER_TEMP/checkpatch/$f" "$base/$f"
+          done
+          perl "$RUNNER_TEMP/checkpatch/checkpatch.pl" --no-tree -f \
+            wireview_hwmon.c | tee checkpatch.log || true
+          if grep -q '^ERROR:' checkpatch.log; then
+            echo "::error::checkpatch reported errors in wireview_hwmon.c"
+            exit 1
+          fi
