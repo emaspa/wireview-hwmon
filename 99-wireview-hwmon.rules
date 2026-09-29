@@ -1,6 +1,26 @@
 # WireView Pro II udev rules
-# Serial port access
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", MODE="0666", TAG+="uaccess"
+#
+# The uaccess tag gives the user logged in at the local seat an ACL on the
+# device node. systemd applies it on hotplug from 73-seat-late.rules, which
+# runs before this 99- file and so never sees the tag, so each rule also runs
+# the uaccess builtin itself. The tag is still needed: logind uses it to move
+# the ACL to the new active session on a user switch.
 
-# hwmon misc device — allow daemon write access
-KERNEL=="wireview-hwmon", SUBSYSTEM=="misc", MODE="0222"
+ACTION=="remove", GOTO="wireview_end"
+
+# Serial port (CDC-ACM). wireviewd runs as root and needs nothing here. The
+# dialout group and the seat user get access so the GUI app can drive the port
+# directly without the daemon.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", GROUP="dialout", MODE="0660", TAG+="uaccess", RUN{builtin}+="uaccess"
+
+# STM32 DFU bootloader (the device after `wireviewctl bootloader`). Same
+# access policy as the serial port, so `wireviewctl flash` can run dfu-util
+# as the seat user instead of root.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0483", ATTR{idProduct}=="df11", GROUP="dialout", MODE="0660", TAG+="uaccess", RUN{builtin}+="uaccess"
+
+# /dev/wireview-hwmon needs no rule. Anything that can write to it can inject
+# fake sensor readings into hwmon, and the only writer is wireviewd, which
+# runs as root. The kernel's default mode for the node (0600 root:root) is
+# already the right one.
+
+LABEL="wireview_end"
