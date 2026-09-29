@@ -25,6 +25,11 @@
 #define WIREVIEW_VERSION 2
 #define WIREVIEW_STALE_MS 5000
 
+/* Package version, injected by the build (-DWIREVIEW_PKG_VERSION="x.y.z"). */
+#ifndef WIREVIEW_PKG_VERSION
+#define WIREVIEW_PKG_VERSION "unknown"
+#endif
+
 struct wireview_hwmon_data {
 	__u32 magic;
 	__u32 version;
@@ -472,5 +477,6 @@ module_init(wireview_init);
 module_exit(wireview_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_VERSION(WIREVIEW_PKG_VERSION);
 MODULE_AUTHOR("WireView Linux Project");
 MODULE_DESCRIPTION("Virtual hwmon driver for WireView Pro II power monitor");

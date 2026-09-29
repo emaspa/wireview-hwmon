@@ -4,6 +4,10 @@
 # defaults); dh_auto_build exports the resulting dpkg-buildflags and the
 # Makefile's userspace rules consume CPPFLAGS/CFLAGS/LDFLAGS.
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+WV_VERSION := $(strip $(shell cat VERSION))
+DKMS_SRC := debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-$(WV_VERSION)
+
 %:
 	dh $@
 
@@ -22,10 +26,10 @@ override_dh_auto_install:
 	# Reference daemon config (conffile via dh_installdeb; may hold the HMAC secret)
 	install -d -m 700 debian/wireview-hwmon/etc/wireview
 	install -m 600 wireview-config.sample debian/wireview-hwmon/etc/wireview/config
-	# DKMS package
-	install -D -m 644 wireview_hwmon.c debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.1/wireview_hwmon.c
-	install -D -m 644 dkms.conf debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.1/dkms.conf
-	install -D -m 644 Makefile.dkms debian/wireview-hwmon-dkms/usr/src/wireview-hwmon-1.5.1/Makefile
+	# DKMS package (version baked into dkms.conf and the module's MODULE_VERSION)
+	install -D -m 644 wireview_hwmon.c $(DKMS_SRC)/wireview_hwmon.c
+	sed 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="$(WV_VERSION)"/' dkms.conf > $(DKMS_SRC)/dkms.conf
+	sed 's/@VERSION@/$(WV_VERSION)/' Makefile.dkms > $(DKMS_SRC)/Makefile
 
 # dh_fixperms resets everything to go=rX; restore the private config perms.
 override_dh_fixperms:

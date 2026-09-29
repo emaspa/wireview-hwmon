@@ -1,7 +1,14 @@
-obj-m := wireview_hwmon.o
-
 KDIR ?= /lib/modules/$(shell uname -r)/build
 MDIR := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
+
+# Single source of truth for the package version. The literals that tools
+# require (dkms.conf, rpm Version:, PKGBUILD pkgver, debian/changelog) are
+# checked against it by "make check-version".
+VERSION := $(strip $(shell cat $(MDIR)/VERSION))
+
+# Kernel module (kbuild reads this file when invoked with M=).
+obj-m := wireview_hwmon.o
+ccflags-y += -DWIREVIEW_PKG_VERSION=\"$(VERSION)\"
 
 # Userspace: distro CFLAGS/CPPFLAGS/LDFLAGS (dpkg-buildflags, %set_build_flags,
 # makepkg) replace the -O2 default; the warnings are always added on top.
@@ -11,17 +18,18 @@ ifeq ($(KERNELRELEASE),)
 CFLAGS ?= -O2
 endif
 WARNINGS := -Wall -Wextra -Wno-format-truncation
+VERSION_DEF := -DWIREVIEW_PKG_VERSION=\"$(VERSION)\"
 
 all: module wireviewd wireviewctl
 
 module:
 	$(MAKE) -C $(KDIR) M=$(MDIR) modules
 
-wireviewd: wireviewd.c sha256.c sha256.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewd.c sha256.c $(LDLIBS)
+wireviewd: wireviewd.c sha256.c sha256.h VERSION
+	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewd.c sha256.c $(LDLIBS)
 
-wireviewctl: wireviewctl.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewctl.c $(LDLIBS)
+wireviewctl: wireviewctl.c VERSION
+	$(CC) $(CPPFLAGS) $(VERSION_DEF) $(CFLAGS) $(WARNINGS) $(LDFLAGS) -o $@ wireviewctl.c $(LDLIBS)
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(MDIR) clean
@@ -68,4 +76,14 @@ uninstall:
 	udevadm control --reload-rules
 	systemctl daemon-reload
 
-.PHONY: all module clean install uninstall
+# Fail if a version literal that packaging tools need has drifted from VERSION.
+check-version:
+	@v='$(VERSION)'; rc=0; \
+	grep -qx "PACKAGE_VERSION=\"$$v\"" dkms.conf || { echo "dkms.conf: PACKAGE_VERSION is not $$v"; rc=1; }; \
+	grep -Eqx "Version:[[:space:]]+$$v" rpm/wireview-hwmon.spec || { echo "rpm/wireview-hwmon.spec: Version is not $$v"; rc=1; }; \
+	grep -qx "pkgver=$$v" aur/PKGBUILD || { echo "aur/PKGBUILD: pkgver is not $$v"; rc=1; }; \
+	grep -qx "	pkgver = $$v" aur/.SRCINFO || { echo "aur/.SRCINFO: pkgver is not $$v"; rc=1; }; \
+	head -n1 debian/changelog | grep -Fq "($$v" || { echo "debian/changelog: top entry is not $$v"; rc=1; }; \
+	[ $$rc -eq 0 ] && echo "version $$v consistent"; exit $$rc
+
+.PHONY: all module clean install uninstall check-version

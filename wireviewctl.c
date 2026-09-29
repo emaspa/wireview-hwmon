@@ -29,6 +29,11 @@
 
 #define SOCK_PATH "/run/wireviewd.sock"
 
+/* Package version, injected by the Makefile (-DWIREVIEW_PKG_VERSION="x.y.z"). */
+#ifndef WIREVIEW_PKG_VERSION
+#define WIREVIEW_PKG_VERSION "unknown"
+#endif
+
 /* Socket protocol command types (must match wireviewd) */
 #define WCMD_GET_DEVICE_INFO   0x01
 #define WCMD_CLEAR_FAULTS      0x02
@@ -1217,6 +1222,9 @@ static void usage(void)
 		"                    Live dashboard: the local device plus remote hosts.\n"
 		"                    --host repeats and/or takes a comma/space list; hosts are\n"
 		"                    also read from /etc/wireview/hosts. Press q to quit.\n"
+		"\n"
+		"Other:\n"
+		"  -V, --version     Print the wireviewctl version\n"
 	);
 }
 
@@ -1229,6 +1237,10 @@ int main(int argc, char **argv)
 
 	const char *cmd = argv[1];
 
+	if (strcmp(cmd, "--version") == 0 || strcmp(cmd, "-V") == 0) {
+		printf("wireviewctl %s\n", WIREVIEW_PKG_VERSION);
+		return 0;
+	}
 	if (strcmp(cmd, "info") == 0)
 		return cmd_info();
 	if (strcmp(cmd, "clear-faults") == 0) {

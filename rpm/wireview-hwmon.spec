@@ -1,6 +1,7 @@
 %{!?_udevrulesdir: %global _udevrulesdir %{_prefix}/lib/udev/rules.d}
 
 Name:           wireview-hwmon
+# Must match the top-level VERSION file ("make check-version").
 Version:        1.5.1
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
@@ -53,10 +54,14 @@ install -Dm0644 99-wireview-hwmon.rules %{buildroot}%{_udevrulesdir}/99-wireview
 install -Dm0644 firmware/TG-WV-PRO2-FW.hex %{buildroot}%{_datadir}/wireview/TG-WV-PRO2-FW.hex
 install -Dm0600 wireview-config.sample %{buildroot}%{_sysconfdir}/wireview/config
 
-# DKMS module source
+# DKMS module source (version baked into dkms.conf and MODULE_VERSION)
 install -Dm0644 wireview_hwmon.c %{buildroot}%{_usrsrc}/%{name}-%{version}/wireview_hwmon.c
-install -Dm0644 dkms.conf       %{buildroot}%{_usrsrc}/%{name}-%{version}/dkms.conf
-install -Dm0644 Makefile.dkms   %{buildroot}%{_usrsrc}/%{name}-%{version}/Makefile
+sed 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="%{version}"/' dkms.conf \
+    > %{buildroot}%{_usrsrc}/%{name}-%{version}/dkms.conf
+sed 's/@VERSION@/%{version}/' Makefile.dkms \
+    > %{buildroot}%{_usrsrc}/%{name}-%{version}/Makefile
+chmod 0644 %{buildroot}%{_usrsrc}/%{name}-%{version}/dkms.conf \
+    %{buildroot}%{_usrsrc}/%{name}-%{version}/Makefile
 
 %files
 %doc README.md

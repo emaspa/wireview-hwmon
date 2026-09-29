@@ -1,6 +1,7 @@
 # Maintainer: Emanuele Sparvoli <sparvoli@gmail.com>
 pkgbase=wireview-hwmon
 pkgname=('wireview-hwmon' 'wireview-hwmon-dkms')
+# Must match the top-level VERSION file ("make check-version").
 pkgver=1.5.1
 pkgrel=1
 pkgdesc="WireView Pro II hwmon daemon, CLI and DKMS kernel module"
@@ -48,9 +49,12 @@ package_wireview-hwmon-dkms() {
   depends=('dkms')
   cd "$pkgbase-$pkgver"
   # DKMS module source. The dkms pacman hooks build/install it on the host.
+  # Version baked into dkms.conf and the module's MODULE_VERSION.
   install -Dm644 wireview_hwmon.c "$pkgdir/usr/src/$pkgbase-$pkgver/wireview_hwmon.c"
-  install -Dm644 dkms.conf       "$pkgdir/usr/src/$pkgbase-$pkgver/dkms.conf"
-  install -Dm644 Makefile.dkms   "$pkgdir/usr/src/$pkgbase-$pkgver/Makefile"
+  sed "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$pkgver\"/" dkms.conf \
+    > "$pkgdir/usr/src/$pkgbase-$pkgver/dkms.conf"
+  sed "s/@VERSION@/$pkgver/" Makefile.dkms > "$pkgdir/usr/src/$pkgbase-$pkgver/Makefile"
+  chmod 644 "$pkgdir/usr/src/$pkgbase-$pkgver/"{dkms.conf,Makefile}
   # Platform driver has no device-triggered autoload — pull it in on boot.
   install -d "$pkgdir/usr/lib/modules-load.d"
   printf 'wireview_hwmon\n' > "$pkgdir/usr/lib/modules-load.d/wireview-hwmon.conf"

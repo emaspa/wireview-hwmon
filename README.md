@@ -29,10 +29,10 @@ This installs the daemon, CLI tool, kernel module (via DKMS), systemd service, a
 
 ### Ubuntu / Debian (.deb packages)
 
-Pre-built `.deb` packages are available on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page. Download and install:
+Pre-built `.deb` packages are available on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page. Download both and install from the download directory:
 
 ```bash
-sudo apt install ./wireview-hwmon_1.5.1_amd64.deb ./wireview-hwmon-dkms_1.5.1_all.deb
+sudo apt install ./wireview-hwmon_*_amd64.deb ./wireview-hwmon-dkms_*_all.deb
 ```
 
 ### Fedora (COPR)
@@ -50,7 +50,7 @@ The same COPR repo also provides the [WireView GUI](https://github.com/emaspa/wi
 Pre-built `.rpm` packages are on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page (one set works on Fedora 43-44):
 
 ```bash
-sudo dnf install ./wireview-hwmon-1.5.1-1.x86_64.rpm ./wireview-hwmon-dkms-1.5.1-1.noarch.rpm
+sudo dnf install ./wireview-hwmon-*.x86_64.rpm ./wireview-hwmon-dkms-*.noarch.rpm
 sudo systemctl enable --now wireviewd
 ```
 
@@ -168,10 +168,11 @@ sudo make uninstall
 ## Daemon options
 
 ```
-wireviewd [-i interval_ms] [-d /dev/ttyACMx]
+wireviewd [-i interval_ms] [-d /dev/ttyACMx] [-V]
 
   -i  Poll interval in milliseconds (default: 1000)
   -d  Serial device path (default: auto-detect)
+  -V  Print the version and exit
 ```
 
 ## Exposed sensors
@@ -263,6 +264,9 @@ Commands (require wireview_hwmon module):
 Monitor:
   top [--host H[:port][,H2...]]... [--interval MS]
                     Live dashboard: local device + remote hosts (q to quit)
+
+Other:
+  -V, --version     Print the wireviewctl version
 ```
 
 `clear-faults` with no arguments clears every active fault and the whole fault
