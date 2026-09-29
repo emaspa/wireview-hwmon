@@ -2,8 +2,9 @@
  * Unit tests for wireviewctl: the Intel HEX firmware loader, the
  * clear-faults mask parser, the remote /sensors JSON reader, the sysfs
  * reader (against a fake hwmon directory via $WIREVIEW_HWMON_PATH), the
- * "sensors" / "sensors --json" output, and the device edition read from a
- * fake wireviewd socket.
+ * "sensors" / "sensors --json" output, the device edition read from a
+ * fake wireviewd socket, and the flash gates (build dates, the product
+ * alias, the verdict, and that a refused flash sends nothing).
  *
  * wireviewctl.c is one file of static functions, so it is compiled into
  * this test directly with its main() renamed out of the way.
@@ -1540,6 +1541,422 @@ static void test_device_edition(void)
 	unsetenv("WIREVIEW_HWMON_PATH");
 }
 
+/* ---- flash gates ---- */
+
+/* The command bytes the fake daemon received since the last call, one
+ * "xx\n" line each. */
+static void fake_daemon_log(char *out, size_t cap)
+{
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/daemon.log", g_tmpdir);
+	FILE *f = fopen(path, "r");
+	size_t n = f ? fread(out, 1, cap - 1, f) : 0;
+	out[n] = '\0';
+	if (f)
+		fclose(f);
+	unlink(path);
+}
+
+static void test_parse_build_time(void)
+{
+	long long t = -1;
+
+	/* Valid: the upstream build strings, and a date anywhere in the
+	 * string, with anything but a digit after it. */
+	CHECK_EQ_INT(parse_build_time("TG-WV-PRO2-FW_20260902_0741", &t), 1);
+	CHECK_EQ_INT(t, 202609020741LL);
+	CHECK_EQ_INT(parse_build_time("TG-WV-PRO2-FW_20260706_1047", &t), 1);
+	CHECK_EQ_INT(t, 202607061047LL);
+	CHECK_EQ_INT(parse_build_time("x_20260902_0741-rc1", &t), 1);
+	CHECK_EQ_INT(t, 202609020741LL);
+	CHECK_EQ_INT(parse_build_time("_20000101_0000", &t), 1);
+	CHECK_EQ_INT(t, 200001010000LL);
+	CHECK_EQ_INT(parse_build_time("a_12345_b_20241231_2359", &t), 1);
+	CHECK_EQ_INT(t, 202412312359LL);
+	/* Leap days: 2024 and 2000 have one, 2025 and 1900 do not. */
+	CHECK_EQ_INT(parse_build_time("_20240229_1200", &t), 1);
+	CHECK_EQ_INT(parse_build_time("_20000229_1200", &t), 1);
+
+	/* Missing. */
+	t = -1;
+	CHECK_EQ_INT(parse_build_time(NULL, &t), 0);
+	CHECK_EQ_INT(parse_build_time("", &t), 0);
+	CHECK_EQ_INT(parse_build_time("WV2 2025-06-01 build 42", &t), 0);
+	CHECK_EQ_INT(parse_build_time("20260902_0741", &t), 0);	/* no leading _ */
+	CHECK_EQ_INT(parse_build_time("FW_20260902-0741", &t), 0);
+	CHECK_EQ_INT(parse_build_time("FW_2026090_0741", &t), 0);	/* 7 digits */
+	CHECK_EQ_INT(parse_build_time("FW_20260902_074", &t), 0);	/* 3 digits */
+	CHECK_EQ_INT(parse_build_time("FW_20260902_07411", &t), 0);	/* a 5th digit */
+	CHECK_EQ_INT(parse_build_time("FW_202609021_0741", &t), 0);
+	CHECK_EQ_INT(t, -1);
+
+	/* Malformed dates and times. */
+	static const char *const bad[] = {
+		"_20261301_0000", "_20260001_0000", "_20260100_0000", "_20260132_0000",
+		"_20260431_0000", "_20250229_0000", "_19000229_0000", "_00000101_0000",
+		"_20260902_2400", "_20260902_0060", "_20260902_9999",
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		if (parse_build_time(bad[i], &t))
+			fprintf(stderr, "  accepted %s\n", bad[i]);
+		CHECK_EQ_INT(parse_build_time(bad[i], &t), 0);
+	}
+	/* The first match decides, as upstream's Regex.Match: a bad first
+	 * date is not rescued by a good second one. */
+	CHECK_EQ_INT(parse_build_time("_20261399_0000_20260902_0741", &t), 0);
+}
+
+static void test_fw_compare(void)
+{
+	static const char *const b0706 = "TG-WV-PRO2-FW_20260706_1047";
+	static const char *const b0902 = "TG-WV-PRO2-FW_20260902_0741";
+	static const struct {
+		int iv; const char *ib; int dv; const char *db; enum fw_cmp want;
+	} m[] = {
+		/* The version decides first, whatever the dates say. */
+		{ 6, b0706, 5, b0902, FW_NEWER },
+		{ 4, b0902, 5, b0706, FW_OLDER },
+		{ 6, "none", 5, "none", FW_NEWER },
+		{ 5, "none", 6, "", FW_OLDER },
+		/* Same version: the build time. */
+		{ 5, b0902, 5, b0706, FW_NEWER },
+		{ 5, b0706, 5, b0902, FW_OLDER },
+		{ 5, b0902, 5, b0902, FW_SAME },
+		{ 5, "A_20260902_0741", 5, b0902, FW_SAME },	/* by time, not text */
+		{ 5, "_20260902_0742", 5, b0902, FW_NEWER },	/* one minute */
+		/* Same version, a date missing on either side: unknown. */
+		{ 5, "custom", 5, b0706, FW_CMP_UNKNOWN },
+		{ 5, b0902, 5, "", FW_CMP_UNKNOWN },
+		{ 5, "", 5, "", FW_CMP_UNKNOWN },
+		{ 5, "_20261301_0000", 5, b0706, FW_CMP_UNKNOWN },
+		/* No image version. */
+		{ -1, b0902, 5, b0706, FW_CMP_UNKNOWN },
+	};
+	for (size_t i = 0; i < sizeof(m) / sizeof(m[0]); i++) {
+		enum fw_cmp got = fw_compare(m[i].iv, m[i].ib, m[i].dv, m[i].db);
+		if (got != m[i].want)
+			fprintf(stderr, "  case %zu: %d, want %d\n", i, got, m[i].want);
+		CHECK_EQ_INT(got, m[i].want);
+	}
+}
+
+static void test_fw_product_alias(void)
+{
+	CHECK_EQ_INT(fw_product_for(0xEF, 6), 5);	/* Noctua Edition -> Pro II */
+	CHECK_EQ_INT(fw_product_for(0xEF, 5), 5);
+	CHECK_EQ_INT(fw_product_for(0xEF, 7), 7);	/* no alias: itself */
+	CHECK_EQ_INT(fw_product_for(0xEF, 8), 8);
+	CHECK_EQ_INT(fw_product_for(0xEE, 6), 6);	/* the alias is per vendor */
+}
+
+static struct fw_ident mk_image(int vendor, int product, int ver, const char *build)
+{
+	struct fw_ident id;
+	memset(&id, 0, sizeof(id));
+	id.known = vendor >= 0;
+	id.vendor = (uint8_t)vendor;
+	id.product = (uint8_t)product;
+	id.version = id.known ? ver : -1;
+	snprintf(id.name, sizeof(id.name), "Thermal Grizzly WireView Pro II");
+	snprintf(id.build, sizeof(id.build), "%s", build);
+	return id;
+}
+
+static struct wv_devinfo mk_device(int vendor, int product, int fw, const char *build)
+{
+	struct wv_devinfo d;
+	memset(&d, 0, sizeof(d));
+	d.vendor = (uint8_t)vendor;
+	d.product = (uint8_t)product;
+	d.product_reported = 1;
+	d.fw = (uint8_t)fw;
+	snprintf(d.build, sizeof(d.build), "%s", build);
+	return d;
+}
+
+static void test_flash_verdict(void)
+{
+	static const char *const b0706 = "TG-WV-PRO2-FW_20260706_1047";
+	static const char *const b0902 = "TG-WV-PRO2-FW_20260902_0741";
+	static const struct {
+		int iv, ip, iver; const char *ib;	/* image vendor < 0: no ids */
+		int dv, dp, dver; const char *db;	/* device vendor < 0: unreachable */
+		enum flash_verdict want;
+	} m[] = {
+		/* Pro II device, Pro II image: the build comparison. */
+		{ 0xEF, 5, 5, b0902,  0xEF, 5, 5, b0706,  FV_NEWER },
+		{ 0xEF, 5, 5, b0706,  0xEF, 5, 5, b0706,  FV_SAME },
+		{ 0xEF, 5, 5, b0706,  0xEF, 5, 5, b0902,  FV_OLDER },
+		{ 0xEF, 5, 4, b0902,  0xEF, 5, 5, b0706,  FV_OLDER },	/* version first */
+		{ 0xEF, 5, 6, b0706,  0xEF, 5, 5, b0902,  FV_NEWER },
+		{ 0xEF, 5, 5, "mine", 0xEF, 5, 5, b0706,  FV_UNKNOWN },
+		{ 0xEF, 5, 5, b0902,  0xEF, 5, 5, "",     FV_UNKNOWN },
+		/* Product gate. */
+		{ 0xEF, 6, 5, b0902,  0xEF, 5, 5, b0706,  FV_WRONG_PRODUCT },	/* no reverse alias */
+		{ 0xEF, 5, 5, b0902,  0xEF, 7, 5, b0706,  FV_WRONG_PRODUCT },
+		{ 0xEF, 7, 5, b0902,  0xEF, 7, 5, b0706,  FV_NEWER },	/* no alias: same id */
+		{ 0xEE, 5, 5, b0902,  0xEF, 5, 5, b0706,  FV_WRONG_PRODUCT },
+		{ 0xFF, 0xFF, 0xFF, "", 0xEF, 5, 5, b0706, FV_WRONG_PRODUCT },	/* erased */
+		{ -1, 0, 0, "",       0xEF, 5, 5, b0706,  FV_WRONG_PRODUCT },	/* no ids */
+		/* Noctua Edition: the EF05 image through the alias, only from
+		 * 2026-09-02 on. */
+		{ 0xEF, 5, 5, b0902,  0xEF, 6, 5, b0706,  FV_NEWER },
+		{ 0xEF, 5, 5, b0902,  0xEF, 6, 5, b0902,  FV_SAME },
+		{ 0xEF, 5, 5, "_20260902_0000", 0xEF, 6, 5, b0902, FV_OLDER },
+		{ 0xEF, 5, 5, "_20261001_0000", 0xEF, 6, 5, b0902, FV_NEWER },
+		{ 0xEF, 5, 5, b0706,  0xEF, 6, 5, b0706,  FV_PRE_NOCTUA },
+		{ 0xEF, 5, 5, "_20260901_2359", 0xEF, 6, 5, "", FV_PRE_NOCTUA },
+		{ 0xEF, 5, 6, b0706,  0xEF, 6, 5, b0706,  FV_PRE_NOCTUA },	/* even v06 */
+		{ 0xEF, 5, 5, "mine", 0xEF, 6, 5, b0706,  FV_PRE_NOCTUA },	/* no date */
+		{ 0xEF, 6, 5, b0902,  0xEF, 6, 5, b0706,  FV_WRONG_PRODUCT },	/* EF06 image */
+		/* The product gate comes before the date rule. */
+		{ 0xEF, 7, 5, b0706,  0xEF, 6, 5, b0706,  FV_WRONG_PRODUCT },
+		/* Unreachable device: nothing to check against. */
+		{ 0xEF, 5, 5, b0902,  -1, 0, 0, "",       FV_NO_DEVICE },
+		{ -1, 0, 0, "",       -1, 0, 0, "",       FV_NO_DEVICE },
+	};
+	for (size_t i = 0; i < sizeof(m) / sizeof(m[0]); i++) {
+		struct fw_ident img = mk_image(m[i].iv, m[i].ip, m[i].iver, m[i].ib);
+		struct wv_devinfo dev = mk_device(m[i].dv, m[i].dp, m[i].dver, m[i].db);
+		enum flash_verdict got = flash_verdict(&img, m[i].dv < 0 ? NULL : &dev);
+		if (got != m[i].want)
+			fprintf(stderr, "  case %zu: verdict %d, want %d\n", i, got, m[i].want);
+		CHECK_EQ_INT(got, m[i].want);
+	}
+
+	/* Which verdicts refuse without --force. */
+	CHECK(!flash_refused(FV_NEWER));
+	CHECK(!flash_refused(FV_UNKNOWN));
+	CHECK(!flash_refused(FV_NO_DEVICE));
+	CHECK(flash_refused(FV_SAME));
+	CHECK(flash_refused(FV_OLDER));
+	CHECK(flash_refused(FV_WRONG_PRODUCT));
+	CHECK(flash_refused(FV_PRE_NOCTUA));
+
+	/* The BuildStruct as fw_image_ident() reads it from an image. */
+	uint8_t raw[300];
+	struct fw_ident id;
+	memset(raw, 0, sizeof(raw));
+	raw[192] = 0xEF;
+	raw[193] = 5;
+	raw[194] = 5;
+	memcpy(raw + 195, "Thermal Grizzly WireView Pro II", 31);
+	memcpy(raw + 227, b0902, strlen(b0902));
+	fw_image_ident(raw, sizeof(raw), &id);
+	CHECK(id.known && id.vendor == 0xEF && id.product == 5 && id.version == 5);
+	CHECK_EQ_STR(id.name, "Thermal Grizzly WireView Pro II");
+	CHECK_EQ_STR(id.build, b0902);
+	fw_image_ident(raw, 195, &id);		/* ids, but no name or build */
+	CHECK(id.known && id.version == 5);
+	CHECK_EQ_STR(id.build, "");
+	fw_image_ident(raw, 194, &id);		/* the version byte is missing */
+	CHECK(!id.known && id.version == -1);
+}
+
+/* flash_check(): the summary, the verdict line, and --force. */
+static void test_flash_check(void)
+{
+	static char out[4096];
+	struct fw_ident img = mk_image(0xEF, 5, 5, "TG-WV-PRO2-FW_20260706_1047");
+	struct wv_devinfo dev = mk_device(0xEF, 5, 5, "TG-WV-PRO2-FW_20260706_1047");
+	int rc = -1;
+
+	QUIET(CAPTURE(out, rc = flash_check(&img, 0, &dev, 0)));
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(out, "device:  WireView Pro II (EF05), firmware v05, "
+		      "build TG-WV-PRO2-FW_20260706_1047\n") != NULL);
+	CHECK(strstr(out, "image:   Thermal Grizzly WireView Pro II (EF05), firmware v05, "
+		      "build TG-WV-PRO2-FW_20260706_1047\n") != NULL);
+	CHECK(strstr(out, "verdict: same: the device already runs this build\n") != NULL);
+
+	/* --force goes on, and says so. */
+	CAPTURE(out, rc = flash_check(&img, 0, &dev, 1));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "--force: flashing anyway\n") != NULL);
+
+	/* An older daemon: the product is marked as assumed. */
+	dev.product_reported = 0;
+	snprintf(img.build, sizeof(img.build), "TG-WV-PRO2-FW_20260902_0741");
+	CAPTURE(out, rc = flash_check(&img, 0, &dev, 0));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "device:  WireView Pro II (EF05, assumed)") != NULL);
+	CHECK(strstr(out, "verdict: newer: ") != NULL);
+	CHECK(strstr(out, "--force") == NULL);
+
+	/* Undated builds: which one, and a warning. */
+	snprintf(dev.build, sizeof(dev.build), "custom build");
+	CAPTURE(out, rc = flash_check(&img, 0, &dev, 0));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "verdict: unknown: the builds cannot be compared\n") != NULL);
+	CHECK(strstr(out, "warning: the device build string has no _yyyyMMdd_HHmm date\n") != NULL);
+	CHECK(strstr(out, "warning: the image build string") == NULL);
+
+	/* Wrong product names both. */
+	dev = mk_device(0xEF, 7, 5, "TG-WV-PRO2-FW_20260706_1047");
+	QUIET(CAPTURE(out, rc = flash_check(&img, 0, &dev, 0)));
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(out, "device:  unknown edition (EF07)") != NULL);
+	CHECK(strstr(out, "verdict: wrong product: the image is for EF05, the device (EF07) "
+		      "takes EF07\n") != NULL);
+
+	/* Noctua Edition, an image from before its support. */
+	dev = mk_device(0xEF, 6, 5, "TG-WV-PRO2-FW_20260902_0741");
+	snprintf(img.build, sizeof(img.build), "TG-WV-PRO2-FW_20260706_1047");
+	QUIET(CAPTURE(out, rc = flash_check(&img, 0, &dev, 0)));
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(out, "device:  WireView Pro II Noctua Edition (EF06)") != NULL);
+	CHECK(strstr(out, "verdict: too old: the image was built before 2026-09-02") != NULL);
+	CAPTURE(out, rc = flash_check(&img, 0, &dev, 1));
+	CHECK_EQ_INT(rc, 0);
+
+	/* No device: the gates cannot run, flash goes on to the prompt. */
+	CAPTURE(out, rc = flash_check(&img, DEVINFO_NO_DAEMON, &dev, 0));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "device:  unknown: wireviewd is not reachable\n") != NULL);
+	CHECK(strstr(out, "cannot verify the image against the device") != NULL);
+	CAPTURE(out, rc = flash_check(&img, DEVINFO_NOT_CONNECTED, &dev, 0));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "wireviewd has no device connected") != NULL);
+}
+
+/* Write a 300-byte image at 0x08000000 with a BuildStruct as Intel HEX;
+ * its path goes to path (PATH_MAX bytes). */
+static void write_gate_image(char *path, const char *name, int vendor, int product,
+			     int ver, const char *build)
+{
+	static char hex[8192];
+	uint8_t img[300];
+
+	memset(img, 0, sizeof(img));
+	img[0] = 0x00; img[1] = 0x80; img[2] = 0x00; img[3] = 0x20;
+	img[192] = (uint8_t)vendor;
+	img[193] = (uint8_t)product;
+	img[194] = (uint8_t)ver;
+	memcpy(img + 195, "Thermal Grizzly WireView Pro II", 31);
+	memcpy(img + 227, build, strlen(build));
+	hex_image(hex, 0x08000000u, img, sizeof(img));
+	const char *p = write_file(name, hex, strlen(hex));
+	snprintf(path, PATH_MAX, "%s", p ? p : "/nonexistent");
+}
+
+/* cmd_flash() with stdin at EOF, so a prompt answers no; stdout into out
+ * (16 KiB), stderr discarded. */
+static int flash_no_stdin(const char *path, int yes, int force, char out[16384])
+{
+	static char big[16384];
+	int rc = -1;
+
+	int saved_in = dup(0);
+	int nullfd = open("/dev/null", O_RDONLY);
+	if (nullfd >= 0) { dup2(nullfd, 0); close(nullfd); }
+	clearerr(stdin);
+	QUIET(CAPTURE(big, rc = cmd_flash(path, yes, force)));
+	memcpy(out, big, sizeof(big));
+	if (saved_in >= 0) { dup2(saved_in, 0); close(saved_in); }
+	clearerr(stdin);
+	return rc;
+}
+
+/*
+ * A refused flash sends the daemon nothing but GET_DEVICE_INFO, even with
+ * -y: no ENTER_BOOTLOADER, no dfu-util. Cases that pass the gates are run
+ * without -y and with stdin at EOF, so they stop at the prompt.
+ */
+static void test_cmd_flash_gates(void)
+{
+	static char out[16384];
+	char log[256];
+	uint8_t buf[256];
+	size_t n;
+	pid_t pid;
+	int rc;
+	static char same_path[PATH_MAX], older_path[PATH_MAX], other_path[PATH_MAX];
+	static char pre_path[PATH_MAX], newer_path[PATH_MAX];
+
+	/* The same build as the device; a lower version with a later date
+	 * (the version decides); another product; and for the Noctua
+	 * Edition a build from before and one from 2026-09-02. */
+	write_gate_image(same_path, "gate-same.hex", 0xEF, 5, 5, "TG-WV-PRO2-FW_20260706_1047");
+	write_gate_image(older_path, "gate-older.hex", 0xEF, 5, 4, "TG-WV-PRO2-FW_20261231_2359");
+	write_gate_image(other_path, "gate-other.hex", 0xEF, 7, 5, "TG-WV-PRO2-FW_20261231_2359");
+	write_gate_image(pre_path, "gate-pre.hex", 0xEF, 5, 5, "TG-WV-PRO2-FW_20260706_1047");
+	write_gate_image(newer_path, "gate-newer.hex", 0xEF, 5, 5, "TG-WV-PRO2-FW_20260902_0741");
+
+	/* A Pro II on today's daemon (no product bytes), build 0706. */
+	n = devinfo_reply(buf, "TG-WV-PRO2-FW_20260706_1047", 0, -1);
+	pid = fake_daemon_start(RESP_OK, buf, n);
+	CHECK(pid > 0);
+
+	const struct { const char *path; const char *verdict; } refused[] = {
+		{ same_path,  "verdict: same: the device already runs this build\n" },
+		{ older_path, "verdict: older: " },
+		{ other_path, "verdict: wrong product: the image is for EF07" },
+	};
+	for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+		/* -y does not get past a gate. */
+		rc = flash_no_stdin(refused[i].path, 1, 0, out);
+		CHECK_EQ_INT(rc, 1);
+		CHECK(strstr(out, refused[i].verdict) != NULL);
+		CHECK(strstr(out, "Flash this image") == NULL);
+		CHECK(strstr(out, "entering bootloader") == NULL);
+		CHECK(strstr(out, "running: dfu-util") == NULL);
+		fake_daemon_log(log, sizeof(log));
+		CHECK_EQ_STR(log, "01\n");
+	}
+
+	/* A newer build passes the gates and stops at the prompt. */
+	rc = flash_no_stdin(newer_path, 0, 0, out);
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(out, "verdict: newer: ") != NULL);
+	CHECK(strstr(out, "entering bootloader") == NULL);
+	fake_daemon_log(log, sizeof(log));
+	CHECK_EQ_STR(log, "01\n");
+	/* --force passes a refused one on to the prompt the same way. */
+	rc = flash_no_stdin(same_path, 0, 1, out);
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(out, "--force: flashing anyway\n") != NULL);
+	CHECK(strstr(out, "entering bootloader") == NULL);
+	fake_daemon_log(log, sizeof(log));
+	CHECK_EQ_STR(log, "01\n");
+	fake_daemon_stop(pid);
+
+	/* A Noctua Edition on a daemon that reports it: the pre-0902 image
+	 * is refused even though its product matches through the alias. */
+	n = devinfo_reply(buf, "TG-WV-PRO2-FW_20260706_1047", 0xEF, 6);
+	pid = fake_daemon_start(RESP_OK, buf, n);
+	rc = flash_no_stdin(pre_path, 1, 0, out);
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(out, "device:  WireView Pro II Noctua Edition (EF06)") != NULL);
+	CHECK(strstr(out, "verdict: too old: ") != NULL);
+	CHECK(strstr(out, "entering bootloader") == NULL);
+	fake_daemon_log(log, sizeof(log));
+	CHECK_EQ_STR(log, "01\n");
+	/* ... and the 0902 image goes on to the prompt. */
+	rc = flash_no_stdin(newer_path, 0, 0, out);
+	CHECK(strstr(out, "verdict: newer: ") != NULL);
+	fake_daemon_log(log, sizeof(log));
+	CHECK_EQ_STR(log, "01\n");
+	fake_daemon_stop(pid);
+
+	/* No daemon: the gates cannot run; flash says so and asks. */
+	rc = flash_no_stdin(same_path, 0, 0, out);
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(out, "device:  unknown: wireviewd is not reachable\n") != NULL);
+	CHECK(strstr(out, "cannot verify the image against the device") != NULL);
+	CHECK(strstr(out, "entering bootloader") == NULL);
+
+	/* The real bundled image against the device's current build. */
+	n = devinfo_reply(buf, "TG-WV-PRO2-FW_20260706_1047", 0, -1);
+	pid = fake_daemon_start(RESP_OK, buf, n);
+	rc = flash_no_stdin(WV_SRCDIR "/firmware/TG-WV-PRO2-FW.hex", 0, 0, out);
+	CHECK(strstr(out, "image:   Thermal Grizzly WireView Pro II (EF05), firmware v05, "
+		      "build TG-WV-PRO2-FW_20260902_0741\n") != NULL);
+	CHECK(strstr(out, "verdict: newer: ") != NULL);
+	fake_daemon_log(log, sizeof(log));
+	CHECK_EQ_STR(log, "01\n");
+	fake_daemon_stop(pid);
+}
+
 int main(void)
 {
 	if (!mkdtemp(g_tmpdir)) {
@@ -1560,6 +1977,12 @@ int main(void)
 	test_sensors_output();
 	test_parse_device_info();
 	test_device_edition();
+	test_parse_build_time();
+	test_fw_compare();
+	test_fw_product_alias();
+	test_flash_verdict();
+	test_flash_check();
+	test_cmd_flash_gates();
 
 	char cmd[PATH_MAX + 16];
 	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);
