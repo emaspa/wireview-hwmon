@@ -9,6 +9,9 @@
  * serial and writes it to /dev/wireview-hwmon as a packed binary struct.
  * This module makes that data available via /sys/class/hwmon/ for tools
  * like lm-sensors, Grafana, conky, btop, etc.
+ *
+ * Needs Linux 5.10 or newer (sysfs_emit() appeared in 5.10), which includes
+ * the 5.14-based RHEL 9 kernels.
  */
 
 #include <linux/module.h>
