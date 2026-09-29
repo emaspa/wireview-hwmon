@@ -1813,6 +1813,18 @@ static void term_restore(void)
 	fflush(stdout);
 }
 
+/* Append a host unless it is already listed (hosts file, global --host and
+ * top's --host may name the same one). */
+static void add_top_host(char hosts[][80], int *nhost, const char *h)
+{
+	if (*nhost >= WV_MAXHOST || !h[0])
+		return;
+	for (int i = 0; i < *nhost; i++)
+		if (strcmp(hosts[i], h) == 0)
+			return;
+	snprintf(hosts[(*nhost)++], 80, "%s", h);
+}
+
 static int cmd_top(int argc, char **argv)
 {
 	char hosts[WV_MAXHOST][80];
@@ -1827,16 +1839,20 @@ static int cmd_top(int argc, char **argv)
 			while (l && (line[l-1] == '\n' || line[l-1] == '\r' || line[l-1] == ' ')) line[--l] = '\0';
 			char *t = line;
 			while (*t == ' ' || *t == '\t') t++;
-			if (*t && *t != '#') snprintf(hosts[nhost++], 80, "%s", t);
+			if (*t && *t != '#') add_top_host(hosts, &nhost, t);
 		}
 		fclose(f);
 	}
+	/* The global --host (before "top") adds one more host; top's own
+	 * --host after the command still works and may repeat. */
+	if (g_host)
+		add_top_host(hosts, &nhost, g_host);
 	for (int i = 2; i < argc; i++) {
 		if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
 			/* one flag may carry several hosts: --host a,b c */
 			char *tok = strtok(argv[++i], ", ");
-			while (tok && nhost < WV_MAXHOST) {
-				snprintf(hosts[nhost++], 80, "%s", tok);
+			while (tok) {
+				add_top_host(hosts, &nhost, tok);
 				tok = strtok(NULL, ", ");
 			}
 		} else if (strcmp(argv[i], "--interval") == 0 && i + 1 < argc)
@@ -1936,7 +1952,8 @@ static void usage(void)
 		"  top [--host H[:port][,H2...]]... [--interval MS]\n"
 		"                    Live dashboard: the local device plus remote hosts.\n"
 		"                    --host repeats and/or takes a comma/space list; hosts are\n"
-		"                    also read from /etc/wireview/hosts. Press q to quit.\n"
+		"                    also read from /etc/wireview/hosts, and the global\n"
+		"                    --host (before \"top\") adds one more. Press q to quit.\n"
 		"\n"
 		"Other:\n"
 		"  -V, --version     Print the wireviewctl version\n"
