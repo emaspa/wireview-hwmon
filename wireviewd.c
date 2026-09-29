@@ -180,6 +180,10 @@ static struct device_info dev_info;
 static struct sensor_struct g_last;
 static int g_have_last;
 
+/* UID (uppercase hex) of the last device that connected; kept across
+ * disconnects as the /metrics device label. Empty until the first. */
+static char g_dev_uid[25];
+
 /* Energy integrated from accepted frames since daemon start (never reset
  * on reconnect). g_energy_frac carries the sub-microjoule remainder in
  * uW*ns so no rounding accumulates; g_energy_ts is the CLOCK_MONOTONIC
@@ -1120,6 +1124,196 @@ static int build_sensors_json(char *out, size_t cap)
 		sum_c, sum_p, g_energy_uj / 1e6);
 }
 
+/* ---- HTTP /metrics (Prometheus text exposition format 0.0.4) ---- */
+
+/* Fixed-size output buffer; once a write does not fit, overflow is set
+ * and later writes are ignored, so the caller never sends a torn body. */
+struct outbuf {
+	char   *p;
+	size_t  cap;
+	size_t  len;
+	int     overflow;
+};
+
+static void __attribute__((format(printf, 2, 3)))
+ob_printf(struct outbuf *b, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (b->overflow)
+		return;
+	va_start(ap, fmt);
+	n = vsnprintf(b->p + b->len, b->cap - b->len, fmt, ap);
+	va_end(ap);
+	if (n < 0 || (size_t)n >= b->cap - b->len) {
+		b->overflow = 1;
+		return;
+	}
+	b->len += (size_t)n;
+}
+
+/*
+ * Escape a Prometheus label value: backslash, double quote and newline
+ * are escaped as the format requires; other control characters and every
+ * byte >= 0x80 become '?', as json_escape() does. Output is always
+ * NUL-terminated and never ends in a partial escape sequence.
+ */
+static void prom_escape(const char *in, char *out, size_t cap)
+{
+	size_t o = 0;
+
+	if (cap == 0)
+		return;
+	for (; *in; in++) {
+		unsigned char c = (unsigned char)*in;
+		char esc[2];
+		size_t n = 1;
+
+		if (c == '"' || c == '\\') {
+			esc[0] = '\\';
+			esc[1] = (char)c;
+			n = 2;
+		} else if (c == '\n') {
+			esc[0] = '\\';
+			esc[1] = 'n';
+			n = 2;
+		} else if (c < 0x20 || c >= 0x80) {
+			esc[0] = '?';
+		} else {
+			esc[0] = (char)c;
+		}
+		if (o + n >= cap)
+			break;
+		memcpy(out + o, esc, n);
+		o += n;
+	}
+	out[o] = '\0';
+}
+
+static void prom_family(struct outbuf *b, const char *name, const char *type,
+			const char *help)
+{
+	ob_printf(b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, type);
+}
+
+/* Fault bits 0..5 of fault_status, as wireview_fault_active{fault=...}. */
+static const char * const fault_names[] = {
+	"chip_over_temp", "sensor_over_temp", "over_current",
+	"wire_over_current", "over_power", "current_imbalance",
+};
+
+/* Build the GET /metrics body from the latest accepted frame. Returns 0,
+ * or -1 if the body did not fit. Without a device (or before its first
+ * frame) only wireview_up 0 is exposed, labelled with the last device
+ * seen if there was one, so the series stays the same across a blip. */
+static int build_metrics(struct outbuf *b)
+{
+	static const char * const temp_names[4] = {
+		"onboard_in", "onboard_out", "external_1", "external_2",
+	};
+	int up = g_serial_fd >= 0 && g_have_last && dev_info.valid;
+	char dev[40];
+	int i;
+
+	if (g_dev_uid[0])
+		snprintf(dev, sizeof(dev), "device=\"%s\"", g_dev_uid);
+	else
+		dev[0] = '\0';
+
+	prom_family(b, "wireview_up", "gauge",
+		    "1 if the device is connected and reporting, else 0.");
+	if (!up) {
+		if (dev[0])
+			ob_printf(b, "wireview_up{%s} 0\n", dev);
+		else
+			ob_printf(b, "wireview_up 0\n");
+		return b->overflow ? -1 : 0;
+	}
+	ob_printf(b, "wireview_up{%s} 1\n", dev);
+
+	prom_family(b, "wireview_pin_voltage_volts", "gauge",
+		    "Voltage per 12V-2x6 pin.");
+	for (i = 0; i < 6; i++)
+		ob_printf(b, "wireview_pin_voltage_volts{%s,pin=\"%d\"} %.3f\n",
+			  dev, i + 1, g_last.pins[i].voltage / 1000.0);
+	prom_family(b, "wireview_pin_current_amps", "gauge",
+		    "Current per 12V-2x6 pin.");
+	for (i = 0; i < 6; i++)
+		ob_printf(b, "wireview_pin_current_amps{%s,pin=\"%d\"} %.3f\n",
+			  dev, i + 1, g_last.pins[i].current / 1000.0);
+	prom_family(b, "wireview_pin_power_watts", "gauge",
+		    "Power per 12V-2x6 pin.");
+	for (i = 0; i < 6; i++)
+		ob_printf(b, "wireview_pin_power_watts{%s,pin=\"%d\"} %.3f\n",
+			  dev, i + 1,
+			  (double)g_last.pins[i].voltage *
+			  (double)g_last.pins[i].current / 1e6);
+
+	prom_family(b, "wireview_power_watts", "gauge",
+		    "Total power, sum of the pins.");
+	ob_printf(b, "wireview_power_watts{%s} %.3f\n",
+		  dev, (double)frame_power_uw(&g_last) / 1e6);
+	prom_family(b, "wireview_current_amps", "gauge",
+		    "Total current reported by the device.");
+	ob_printf(b, "wireview_current_amps{%s} %.3f\n",
+		  dev, g_last.total_current / 1000.0);
+	prom_family(b, "wireview_voltage_average_volts", "gauge",
+		    "Average pin voltage reported by the device.");
+	ob_printf(b, "wireview_voltage_average_volts{%s} %.3f\n",
+		  dev, g_last.avg_voltage / 1000.0);
+	prom_family(b, "wireview_vdd_volts", "gauge",
+		    "Device supply voltage.");
+	ob_printf(b, "wireview_vdd_volts{%s} %.3f\n", dev, g_last.vdd / 1000.0);
+
+	prom_family(b, "wireview_temperature_celsius", "gauge",
+		    "Temperatures; disconnected sensors are omitted.");
+	for (i = 0; i < 4; i++) {
+		int16_t raw = g_last.ts[i];
+
+		/* Disconnected sensors report out-of-range values */
+		if (raw < -400 || raw > 2000)
+			continue;
+		ob_printf(b, "wireview_temperature_celsius{%s,sensor=\"%s\"} %.1f\n",
+			  dev, temp_names[i], raw / 10.0);
+	}
+
+	prom_family(b, "wireview_fan_duty_ratio", "gauge",
+		    "Fan duty cycle, 0 to 1.");
+	ob_printf(b, "wireview_fan_duty_ratio{%s} %.2f\n",
+		  dev, g_last.fan_duty / 100.0);
+	prom_family(b, "wireview_psu_cap_watts", "gauge",
+		    "PSU power capability from the sideband pins (0 = unknown).");
+	ob_printf(b, "wireview_psu_cap_watts{%s} %d\n",
+		  dev, psu_cap_watts(g_last.hpwr_cap));
+
+	prom_family(b, "wireview_fault_status", "gauge",
+		    "Active fault bitmask (debounced).");
+	ob_printf(b, "wireview_fault_status{%s} %u\n", dev, g_last.fault_status);
+	prom_family(b, "wireview_fault_log", "gauge",
+		    "Latched fault bitmask (debounced).");
+	ob_printf(b, "wireview_fault_log{%s} %u\n", dev, g_last.fault_log);
+	prom_family(b, "wireview_fault_active", "gauge",
+		    "1 while the fault is active (fault_status bits 0-5).");
+	for (i = 0; i < 6; i++)
+		ob_printf(b, "wireview_fault_active{%s,fault=\"%s\"} %d\n",
+			  dev, fault_names[i], (g_last.fault_status >> i) & 1);
+
+	prom_family(b, "wireview_energy_joules_total", "counter",
+		    "Energy delivered since wireviewd started.");
+	ob_printf(b, "wireview_energy_joules_total{%s} %.6f\n",
+		  dev, (double)g_energy_uj / 1e6);
+
+	char build[33 * 2 + 1];
+	prom_escape(dev_info.build_string, build, sizeof(build));
+	prom_family(b, "wireview_firmware_info", "gauge",
+		    "Firmware version and build string.");
+	ob_printf(b, "wireview_firmware_info{%s,version=\"%d\",build=\"%s\"} 1\n",
+		  dev, dev_info.fw_version, build);
+
+	return b->overflow ? -1 : 0;
+}
+
 static int setup_http(void)
 {
 	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -1583,7 +1777,8 @@ static ssize_t recv_deadline(int fd, void *buf, size_t len,
 	}
 }
 
-/* Accept one HTTP connection, route GET /sensors and POST /command, close.
+/* Accept one HTTP connection, route GET /sensors, /metrics, /config and
+ * POST /command, close.
  * Reading the request is bounded by HTTP_DEADLINE_MS in total (not per
  * recv), so a slow client cannot stall sensor polling. */
 static void http_handle(int http_fd)
@@ -1638,6 +1833,29 @@ static void http_handle(int http_fd)
 			"Content-Length: %d\r\n\r\n", bn);
 		(void)!write(cfd, hdr, hn);
 		(void)!write(cfd, body, bn);
+		close(cfd);
+		return;
+	}
+
+	/* Prometheus scrapes: read-only, and not logged, like /sensors. */
+	if (strcmp(method, "GET") == 0 && strcmp(path, "/metrics") == 0) {
+		static char body[16384];
+		struct outbuf ob = { .p = body, .cap = sizeof(body) };
+
+		if (build_metrics(&ob) < 0) {
+			http_respond(cfd, 500, "Internal Server Error",
+				     "{\"error\":\"metrics overflow\"}");
+			close(cfd);
+			return;
+		}
+		char hdr[256];
+		int hn = snprintf(hdr, sizeof(hdr),
+			"HTTP/1.1 200 OK\r\n"
+			"Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+			"Connection: close\r\nContent-Length: %zu\r\n\r\n",
+			ob.len);
+		(void)!write(cfd, hdr, hn);
+		(void)!write(cfd, body, ob.len);
 		close(cfd);
 		return;
 	}
@@ -1873,6 +2091,9 @@ int main(int argc, char **argv)
 			} else {
 				/* Device is ready; allow HTTP command relay. */
 				g_serial_fd = serial_fd;
+				for (int i = 0; i < 12; i++)
+					snprintf(g_dev_uid + i * 2, 3, "%02X",
+						 dev_info.uid[i]);
 				prev_status = 0;
 				prev_log = 0;
 				g_hwmon_v2 = 0;
