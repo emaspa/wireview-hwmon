@@ -786,9 +786,10 @@ static int dfu_device_present(void)
 	return found;
 }
 
-/* Firmware image bundled with the wireview-hwmon package ("make install"
- * and all distro packages place it here). Used when "flash" is given no
- * file argument, so "wireviewctl flash -y" is a complete headless update. */
+/* Firmware image installed by "make install" and by the
+ * wireview-hwmon-firmware package (recommended by wireview-hwmon). Used when
+ * "flash" is given no file argument, so "wireviewctl flash -y" is a complete
+ * headless update. */
 #define DEFAULT_FIRMWARE_PATH "/usr/share/wireview/TG-WV-PRO2-FW.hex"
 
 static int cmd_flash(const char *path, int yes)
@@ -2440,7 +2441,7 @@ int main(int argc, char **argv)
 			if (access(DEFAULT_FIRMWARE_PATH, R_OK) != 0) {
 				fprintf(stderr, "wireviewctl: no firmware file given and the bundled image\n"
 					"is not installed at %s\n"
-					"(install/upgrade the wireview-hwmon package, or pass a file path)\n",
+					"(install the wireview-hwmon-firmware package, or pass a file path)\n",
 					DEFAULT_FIRMWARE_PATH);
 				return 1;
 			}
