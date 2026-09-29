@@ -112,8 +112,12 @@ for link in /var/lib/dkms/%{name}/kernel-*; do
 done
 # Register, build and install the module for the running kernel.
 dkms add -m %{name} -v %{version} --rpm_safe_upgrade 2>/dev/null || true
-dkms build -m %{name} -v %{version} 2>/dev/null || true
-dkms install -m %{name} -v %{version} --force 2>/dev/null || true
+# Build errors stay visible; || true keeps a failed build from aborting the
+# transaction.
+dkms build -m %{name} -v %{version} || true
+dkms install -m %{name} -v %{version} --force || true
+dkms status -m %{name} -v %{version} -k "$(uname -r)" 2>/dev/null | grep -q ': installed' || \
+    echo "wireview-hwmon-dkms: module not installed for kernel $(uname -r); install kernel-devel for it and run: dkms install -m %{name} -v %{version}" >&2
 
 %preun dkms
 # Run on erase AND upgrade: --rpm_safe_upgrade coordinates the remove/add
