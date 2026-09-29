@@ -89,10 +89,10 @@ This builds the kernel module (`wireview_hwmon.ko`), the daemon (`wireviewd`), a
 ## Quick start
 
 ```bash
-# Install udev rules (serial port access + hwmon device permissions)
+# Install udev rules (serial port and DFU bootloader access)
 sudo cp 99-wireview-hwmon.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
-sudo udevadm trigger
+sudo udevadm trigger   # or replug the device: new permissions apply on the next device event
 
 # Load the kernel module
 sudo insmod wireview_hwmon.ko
@@ -123,6 +123,20 @@ sensors wireview-isa-0000
 ```
 
 After rebooting, both the module and daemon will start automatically.
+
+### Upgrading a source install
+
+`make install` puts the udev rules and the systemd unit in `/etc/udev/rules.d/`
+and `/etc/systemd/system/`, and those copies override the packaged ones under
+`/usr/lib` (or `/lib`). After pulling a new version, re-run `sudo make install`,
+then `sudo systemctl restart wireviewd` and replug the device (or run
+`sudo udevadm trigger`). If you have switched to a distro package, delete the
+old copies instead:
+
+```bash
+sudo rm /etc/udev/rules.d/99-wireview-hwmon.rules /etc/systemd/system/wireviewd.service
+sudo udevadm control --reload-rules && sudo systemctl daemon-reload
+```
 
 ### Secure Boot
 
@@ -174,6 +188,20 @@ wireviewd [-i interval_ms] [-d /dev/ttyACMx] [-V]
   -d  Serial device path (default: auto-detect)
   -V  Print the version and exit
 ```
+
+### Service sandboxing
+
+The systemd unit runs `wireviewd` as root but sandboxed and with no
+capabilities. In practice:
+
+- It can write only to `/run` (the command socket) and `/var/log/wireview`;
+  audit logs are created mode `600`. `/etc/wireview` is read-only to it.
+- A `port=` below 1024 in `/etc/wireview/config` fails to bind, since that
+  needs `CAP_NET_BIND_SERVICE` and the unit drops all capabilities.
+- The device policy allows only CDC-ACM serial ports and `/dev/wireview-hwmon`,
+  so `-d` accepts only `/dev/ttyACM*` devices.
+
+Running `./wireviewd` by hand, as in the Quick start, is not sandboxed.
 
 ## Exposed sensors
 
@@ -291,8 +319,28 @@ yourself and log in again for it to take effect:
 sudo usermod -aG wireview $USER
 ```
 
-`flash` needs the group only to ask the daemon to enter the bootloader; with
-the device already in DFU mode it talks to `dfu-util` directly.
+`flash` needs the group only to ask the daemon to enter the bootloader. The
+flashing itself runs `dfu-util` as you, which needs the seat or `dialout`
+access described below; with the device already in DFU mode, that is all it
+needs.
+
+### Device access (udev)
+
+The udev rules give the serial port (`0483:5740`) and the STM32 DFU bootloader
+(`0483:df11`, the device after `wireviewctl bootloader`) mode `660`, group
+`dialout`, plus an ACL for the user logged in at the local seat (`uaccess`). In
+a local desktop session the GUI app's direct-serial mode, `wireviewctl flash`
+and `dfu-util` therefore work without sudo. SSH and other remote sessions get
+no seat ACL; join `dialout` and log in again:
+
+```bash
+sudo usermod -aG dialout $USER
+```
+
+`/dev/wireview-hwmon`, the node wireviewd feeds readings into, is root-only
+(`600`) on purpose: anything that can write to it can inject fake readings into
+hwmon, and wireviewd is its only writer. Monitoring tools read
+`/sys/class/hwmon/`, which stays world-readable.
 
 ### Examples
 
@@ -333,7 +381,7 @@ echo "Total power: $((POWER / 1000000)) W"
 
 ## Daemon socket
 
-The daemon listens on a Unix socket at `/run/wireviewd.sock`, allowing external programs (including the [wireview-linux](https://github.com/emaspa/wireview-linux) app) to send commands to the device without direct serial access. Commands marked * are privileged: the daemon checks the peer's credentials and accepts them only from root or members of the [`wireview` group](#permissions-the-wireview-group); anyone else gets status 3 (denied). Supported commands:
+The daemon listens on a Unix socket at `/run/wireviewd.sock` that any local user can connect to, allowing external programs (including the [wireview-linux](https://github.com/emaspa/wireview-linux) app) to send commands to the device without direct serial access. Commands marked * are privileged: the daemon checks the peer's credentials and accepts them only from root or members of the [`wireview` group](#permissions-the-wireview-group); anyone else gets status 3 (denied). Supported commands:
 
 | Command | Description |
 |---------|-------------|
@@ -348,7 +396,7 @@ The daemon listens on a Unix socket at `/run/wireviewd.sock`, allowing external 
 | SUSPEND_SERIAL * | Pause daemon polling and release the serial port for a client (1-300 s, re-armable) |
 | RESUME_SERIAL * | End a serial handover early and resume polling |
 
-The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`.
+The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`. Status is 0 (ok), 1 (error), 2 (device not connected) or 3 (denied: privileged command from a peer that is not root or in the `wireview` group).
 
 ## Notes
 
@@ -480,7 +528,7 @@ High-frequency `/sensors` polls are not logged.
 |------|---------|
 | `/etc/wireview/config` | Daemon settings: `remote_enabled`, `port`, `secret`, `log_days`. Mode `600`. Read at (re)start. A commented reference is installed by the packages and `make install`. |
 | `/etc/wireview/hosts` | Optional remote-host list for `wireviewctl top` (one `host[:port]` per line). Not installed; create it yourself if you want one. |
-| `/var/log/wireview/` | Daily-rotating audit logs (created by the daemon on its first log write). |
+| `/var/log/wireview/` | Daily-rotating audit logs, mode `600` (created by the daemon on its first log write). |
 | `/etc/avahi/services/wireview.service` | Optional mDNS advertisement of the listener. Installed by `make install` only; see [mDNS discovery](#mdns-discovery-optional). |
 
 ## License
