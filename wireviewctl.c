@@ -186,40 +186,153 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 	return 0;
 }
 
+/* ---------- Device identity (edition) ---------- */
+
+/* The device's vendor and product id (upstream's hardware revision, "EF05"
+ * as /sensors writes it). One vendor so far, and two products this tool
+ * knows. */
+#define WV_VENDOR_TG       0xEF
+#define WV_PRODUCT_PRO2    0x05
+#define WV_PRODUCT_NOCTUA  0x06
+
+/* What the fallbacks call a device whose edition is not known. */
+#define WV_DEFAULT_NAME "WireView Pro II"
+
+static const char *edition_name(uint8_t vendor, uint8_t product)
+{
+	if (vendor == WV_VENDOR_TG && product == WV_PRODUCT_PRO2)
+		return "WireView Pro II";
+	if (vendor == WV_VENDOR_TG && product == WV_PRODUCT_NOCTUA)
+		return "WireView Pro II Noctua Edition";
+	return NULL;
+}
+
+/* A GET_DEVICE_INFO reply. */
+struct wv_devinfo {
+	uint8_t fw, cfg_ver;
+	uint8_t uid[12];
+	char    build[72];		/* "" if the device sent none */
+	uint8_t vendor, product;
+	int     product_reported;	/* 0: older daemon, EF05 assumed */
+};
+
+/*
+ * [fw][cfg_ver][uid:12][build string, NUL-terminated][vendor][product].
+ * Daemons before the Noctua Edition end at the NUL (or, older still, send
+ * the build string without one); their device is a Pro II, since they
+ * accept no other product, so vendor/product default to EF05 then.
+ * Returns -1 if the reply is too short to hold the fixed part.
+ */
+static int parse_device_info(const uint8_t *d, size_t len, struct wv_devinfo *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (len < 14)
+		return -1;
+	out->fw = d[0];
+	out->cfg_ver = d[1];
+	memcpy(out->uid, d + 2, 12);
+
+	const uint8_t *b = d + 14;
+	size_t blen = len - 14, n = 0;
+	while (n < blen && b[n] != 0)
+		n++;
+	snprintf(out->build, sizeof(out->build), "%.*s", (int)n, (const char *)b);
+
+	out->vendor = WV_VENDOR_TG;
+	out->product = WV_PRODUCT_PRO2;
+	if (n < blen && blen - n - 1 >= 2) {
+		out->vendor = b[n + 1];
+		out->product = b[n + 2];
+		out->product_reported = 1;
+	}
+	return 0;
+}
+
+/* Results of local_device_info() other than 0. */
+#define DEVINFO_NO_DAEMON     (-1)
+#define DEVINFO_NOT_CONNECTED (-2)
+#define DEVINFO_ERROR         (-3)
+
+static int read_full(int fd, void *buf, size_t n)
+{
+	size_t off = 0;
+	while (off < n) {
+		ssize_t r = read(fd, (uint8_t *)buf + off, n - off);
+		if (r <= 0)
+			return -1;
+		off += (size_t)r;
+	}
+	return 0;
+}
+
+/* GET_DEVICE_INFO over the local socket without printing anything, for
+ * callers that decide themselves what a failure means. */
+static int local_device_info(struct wv_devinfo *out, int timeout_s)
+{
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return DEVINFO_NO_DAEMON;
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
+	struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+		close(fd);
+		return DEVINFO_NO_DAEMON;
+	}
+
+	int rc = DEVINFO_ERROR;
+	uint8_t hdr[3] = { WCMD_GET_DEVICE_INFO, 0, 0 };
+	uint8_t rh[3], d[512];
+	if (write(fd, hdr, 3) == 3 && read_full(fd, rh, 3) == 0) {
+		size_t len = (size_t)(rh[1] | (rh[2] << 8));
+		if (rh[0] == RESP_NOT_CONNECTED)
+			rc = DEVINFO_NOT_CONNECTED;
+		else if (rh[0] == RESP_OK && len <= sizeof(d) &&
+			 read_full(fd, d, len) == 0 &&
+			 parse_device_info(d, len, out) == 0)
+			rc = 0;
+	}
+	close(fd);
+	return rc;
+}
+
 /* ---------- Subcommands ---------- */
 
 static int cmd_info(void)
 {
 	uint8_t *data = NULL;
 	uint16_t len = 0;
+	struct wv_devinfo di;
 
 	if (g_host)
 		return remote_info(0);
 	if (sock_command(WCMD_GET_DEVICE_INFO, NULL, 0, &data, &len) < 0)
 		return 1;
 
-	if (len < 14) {
+	if (parse_device_info(data, len, &di) < 0) {
 		fprintf(stderr, "wireviewctl: unexpected response length %u\n", len);
 		free(data);
 		return 1;
 	}
+	free(data);
 
-	uint8_t fw = data[0];
-	uint8_t cfg_ver = data[1];
-	printf("firmware: %u\n", fw);
-	printf("config_version: %u\n", cfg_ver);
+	printf("firmware: %u\n", di.fw);
+	printf("config_version: %u\n", di.cfg_ver);
 
 	printf("uid: ");
 	for (int i = 0; i < 12; i++)
-		printf("%02x", data[2 + i]);
+		printf("%02x", di.uid[i]);
 	printf("\n");
 
-	if (len > 14) {
-		/* Build string follows UID, null-terminated */
-		printf("build: %.*s\n", len - 14, (char *)(data + 14));
-	}
+	if (len > 14)
+		printf("build: %s\n", di.build);
 
-	free(data);
+	const char *ed = edition_name(di.vendor, di.product);
+	printf("product: %02X%02X%s\n", di.vendor, di.product,
+	       di.product_reported ? "" : " (assumed: this wireviewd does not report it)");
+	printf("edition: %s\n", ed ? ed : "unknown");
 	return 0;
 }
 
@@ -978,7 +1091,8 @@ static int read_sysfs_int(const char *hwmon, const char *attr, long long *val)
  */
 struct wv_snap {
 	char      source[72];   /* "local" or "host[:port]" */
-	char      name[40];
+	char      name[40];     /* edition name, WV_DEFAULT_NAME if unknown */
+	char      hwrev[8];     /* vendor+product as hex, "EF06"; "" if unknown */
 	char      fw[12];       /* firmware version, "" if unknown */
 	char      uid[28];      /* device UID, uppercase hex, "" if unknown */
 	char      build[72];    /* firmware build string, "" if unknown */
@@ -1024,49 +1138,26 @@ static const struct { const char *attr, *name; } alarm_attrs[WV_NALARM] = {
 	{ "curr7_alarm", "total_current" },     { "power1_alarm", "total_power" },
 };
 
-static int read_full(int fd, void *buf, size_t n)
-{
-	size_t off = 0;
-	while (off < n) {
-		ssize_t r = read(fd, (uint8_t *)buf + off, n - off);
-		if (r <= 0)
-			return -1;
-		off += (size_t)r;
-	}
-	return 0;
-}
-
 /* Best-effort: ask the daemon (if running) for the local device's firmware
- * version, UID and build string; sysfs has none of these. Silent on any
- * failure so it never disturbs the TUI or the JSON output. */
+ * version, UID, build string and, from a daemon that reports it, the
+ * edition; sysfs has none of these. Silent on any failure so it never
+ * disturbs the TUI or the JSON output. */
 static void get_local_info(struct wv_snap *s)
 {
-	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (fd < 0)
+	struct wv_devinfo di;
+
+	if (local_device_info(&di, 1) != 0)
 		return;
-	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
-	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-		uint8_t hdr[3] = { WCMD_GET_DEVICE_INFO, 0, 0 };
-		uint8_t rh[3];
-		/* [fw][cfg_ver][uid:12][build string, NUL-terminated] */
-		uint8_t d[2 + 12 + 64 + 1];
-		if (write(fd, hdr, 3) == 3 && read_full(fd, rh, 3) == 0 &&
-		    rh[0] == RESP_OK) {
-			size_t len = (size_t)(rh[1] | (rh[2] << 8));
-			if (len >= 14 && len < sizeof(d) && read_full(fd, d, len) == 0) {
-				d[len] = '\0';
-				snprintf(s->fw, sizeof(s->fw), "%u", d[0]);
-				for (int i = 0; i < 12; i++)
-					snprintf(s->uid + i * 2, 3, "%02X", d[2 + i]);
-				snprintf(s->build, sizeof(s->build), "%s", (const char *)d + 14);
-			}
-		}
+	snprintf(s->fw, sizeof(s->fw), "%u", di.fw);
+	for (int i = 0; i < 12; i++)
+		snprintf(s->uid + i * 2, 3, "%02X", di.uid[i]);
+	snprintf(s->build, sizeof(s->build), "%s", di.build);
+	if (di.product_reported) {
+		const char *ed = edition_name(di.vendor, di.product);
+		snprintf(s->hwrev, sizeof(s->hwrev), "%02X%02X", di.vendor, di.product);
+		if (ed)
+			snprintf(s->name, sizeof(s->name), "%s", ed);
 	}
-	close(fd);
 }
 
 /* Read every attribute the module exposes. Newer modules publish pwm1,
@@ -1080,7 +1171,7 @@ static int read_local(struct wv_snap *s)
 
 	memset(s, 0, sizeof(*s));
 	snprintf(s->source, sizeof(s->source), "local");
-	snprintf(s->name, sizeof(s->name), "WireView Pro II");
+	snprintf(s->name, sizeof(s->name), WV_DEFAULT_NAME);
 
 	long long v;
 	char a[24];
@@ -1515,6 +1606,7 @@ static void parse_device(const char *hostport, const char *obj, struct wv_snap *
 	memset(s, 0, sizeof(*s));
 	snprintf(s->source, sizeof(s->source), "%s", hostport);
 	js_str(obj, "name", s->name, sizeof(s->name));
+	js_str(obj, "hwRev", s->hwrev, sizeof(s->hwrev));
 	js_str(obj, "fwVer", s->fw, sizeof(s->fw));
 	js_str(obj, "id", s->uid, sizeof(s->uid));
 	js_str(obj, "buildString", s->build, sizeof(s->build));
@@ -1578,7 +1670,7 @@ static void parse_device(const char *hostport, const char *obj, struct wv_snap *
 	}
 	for (int i = 0; i < WV_NALARM; i++)
 		s->alarm[i] = -1;	/* /sensors carries no per-channel alarms */
-	if (s->name[0] == '\0') snprintf(s->name, sizeof(s->name), "WireView");
+	if (s->name[0] == '\0') snprintf(s->name, sizeof(s->name), WV_DEFAULT_NAME);
 	const char *cp = js_member(obj, "connected");
 	s->ok = !(cp && strncmp(cp, "false", 5) == 0);
 }
@@ -1845,6 +1937,14 @@ static int remote_info(int build_only)
 	}
 	if (s.build[0])
 		printf("build: %s\n", s.build);
+	/* hwRev is "EF06" from a daemon that knows the editions, "" from an
+	 * older one, whose device is a Pro II (it accepts no other). */
+	if (s.hwrev[0])
+		printf("product: %s\n", s.hwrev);
+	else
+		printf("product: %02X%02X (assumed: this wireviewd does not report it)\n",
+		       WV_VENDOR_TG, WV_PRODUCT_PRO2);
+	printf("edition: %s\n", s.name);
 	return 0;
 }
 
@@ -1976,7 +2076,9 @@ static void print_sensors_json(const struct wv_snap *s)
 
 		char name_js[sizeof(s->name) * 6], uid_js[sizeof(s->uid) * 6];
 		char fw_js[sizeof(s->fw) * 6], build_js[sizeof(s->build) * 6];
+		char hwrev_js[sizeof(s->hwrev) * 6];
 		json_escape(s->name, name_js, sizeof(name_js));
+		json_escape(s->hwrev, hwrev_js, sizeof(hwrev_js));
 		json_escape(s->uid, uid_js, sizeof(uid_js));
 		json_escape(s->fw, fw_js, sizeof(fw_js));
 		json_escape(s->build, build_js, sizeof(build_js));
@@ -1992,14 +2094,14 @@ static void print_sensors_json(const struct wv_snap *s)
 			t[i] = (s->have_temp & (1u << i)) ? s->temp_mc[i] / 1000.0 : 0.0;
 
 		printf("{\"id\":\"%s\",\"name\":\"%s\",\"connected\":%s,"
-		       "\"hwRev\":\"\",\"fwVer\":\"%s\",\"buildString\":\"%s\",\"timestamp\":\"%s\","
+		       "\"hwRev\":\"%s\",\"fwVer\":\"%s\",\"buildString\":\"%s\",\"timestamp\":\"%s\","
 		       "\"pinVoltage\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
 		       "\"pinCurrent\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
 		       "\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
 		       "\"psuCapW\":%d,\"fan\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
 		       "\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f",
 		       uid_js, name_js, s->ok ? "true" : "false",
-		       fw_js, build_js, ts,
+		       hwrev_js, fw_js, build_js, ts,
 		       pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
 		       pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
 		       t[0], t[1], t[2], t[3],
@@ -2299,7 +2401,7 @@ static void usage(void)
 		"                    Without it, $WIREVIEW_SECRET is used.\n"
 		"\n"
 		"Commands (require wireviewd running):\n"
-		"  info              Show device firmware, UID, and build info\n"
+		"  info              Show device firmware, UID, build, product and edition\n"
 		"  clear-faults [STATUS_MASK [LOG_MASK]]\n"
 		"                    Clear faults. Masks are hex bits to clear (default FFFF,\n"
 		"                    i.e. all active faults and the whole fault log)\n"

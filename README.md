@@ -335,7 +335,7 @@ Global options:
                     Without it, $WIREVIEW_SECRET is used.
 
 Commands (require wireviewd running):
-  info              Show device firmware, UID, and build info
+  info              Show device firmware, UID, build, product and edition
   clear-faults [STATUS_MASK [LOG_MASK]]
                     Clear faults. Masks are hex bits to clear (default FFFF,
                     i.e. all active faults and the whole fault log)
@@ -364,6 +364,18 @@ Monitor:
 Other:
   -V, --version     Print the wireviewctl version
 ```
+
+`info` ends with the device's product and edition:
+
+```
+product: EF06
+edition: WireView Pro II Noctua Edition
+```
+
+A daemon that does not report the product yet (wireview-hwmon 1.6.0 and
+earlier) only runs Pro II devices, so `info` prints `product: EF05 (assumed:
+this wireviewd does not report it)` and `edition: WireView Pro II` for it.
+`top` and `sensors --json` show the edition name the same way.
 
 `clear-faults` with no arguments clears every active fault and the whole fault
 log (masks `FFFF FFFF`). `STATUS_MASK` and `LOG_MASK` are 16-bit hex bitmasks,
@@ -424,7 +436,7 @@ hwmon, and wireviewd is its only writer. Monitoring tools read
 ### Examples
 
 ```bash
-# Show device info
+# Show device info: firmware, UID, build, product and edition
 wireviewctl info
 
 # Read all sensors (scriptable key: value format)
@@ -497,7 +509,8 @@ alarm_total_power: 0
 ```json
 {"host": "gpu-box", "appVersion": "wireviewctl", "devices": [{
   "id": "0032001F3133510B37363235", "name": "WireView Pro II", "connected": true,
-  "hwRev": "", "fwVer": "3", "buildString": "...", "timestamp": "2026-09-29T14:22:07Z",
+  "hwRev": "EF05", "fwVer": "5", "buildString": "TG-WV-PRO2-FW_20260902_0741",
+  "timestamp": "2026-09-29T14:22:07Z",
   "pinVoltage": [12.120, 12.130, 12.110, 12.120, 12.110, 12.120],
   "pinCurrent": [5.230, 5.450, 5.120, 5.340, 5.560, 5.430],
   "tempInC": 45.3, "tempOutC": 42.1, "ext1C": 38.7, "ext2C": 0.0,
@@ -506,9 +519,11 @@ alarm_total_power: 0
 ```
 
 `id`, `fwVer` and `buildString` come from the daemon and are `""` when it is
-not running. A disconnected temperature sensor reads `0.0`, `psuCapW` is `0`
-when unknown, and `energyJ` is left out when the module has no
-`energy1_input`. `connected` is `false` when the module's readings are stale.
+not running. So do `name` and `hwRev` (`"EF06"`, `"WireView Pro II Noctua
+Edition"`) when the daemon reports the device's product; otherwise `name` is
+`"WireView Pro II"` and `hwRev` is `""`, as an older daemon writes them. A
+disconnected temperature sensor reads `0.0`, `psuCapW` is `0` when unknown,
+and `energyJ` is left out when the module has no `energy1_input`. `connected` is `false` when the module's readings are stale.
 Without the module the command prints `{"devices":[]}` (with `host` and
 `appVersion`) and exits 1.
 
@@ -529,7 +544,8 @@ addresses as `[addr]:port`). That daemon needs its
 - `GET /sensors` has fewer fields than the local sysfs. It has no average or
   Vdd voltage and no per-channel alarms, so remote `sensors` prints no
   `avg_voltage_mv`, `vdd_mv` or `alarm_*` lines, and remote `info` has no
-  `config_version` line. Any other field the document lacks is left out too
+  `config_version` line. Remote `info` takes the product and edition from
+  `hwRev` and `name`. Any other field the document lacks is left out too
   (`top` shows it as `--`), never printed as `0`: `psu_cap: unknown` means the
   device reported `psuCapW: 0`. When the document says `"connected": false`,
   `sensors` prints a note on stderr that the readings may be stale.

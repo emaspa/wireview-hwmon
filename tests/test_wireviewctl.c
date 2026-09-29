@@ -1,20 +1,29 @@
 /*
  * Unit tests for wireviewctl: the Intel HEX firmware loader, the
  * clear-faults mask parser, the remote /sensors JSON reader, the sysfs
- * reader (against a fake hwmon directory via $WIREVIEW_HWMON_PATH) and
- * the "sensors" / "sensors --json" output.
+ * reader (against a fake hwmon directory via $WIREVIEW_HWMON_PATH), the
+ * "sensors" / "sensors --json" output, and the device edition read from a
+ * fake wireviewd socket.
  *
  * wireviewctl.c is one file of static functions, so it is compiled into
  * this test directly with its main() renamed out of the way.
  *
  * SPDX-License-Identifier: GPL-2.0
  */
+/* The daemon socket is a variable here, so a test can point the CLI at a
+ * fake wireviewd; it starts out where no daemon listens. */
+#undef SOCK_PATH
+static char g_sock_path[108] = "/nonexistent/wireviewd.sock";
+#define SOCK_PATH g_sock_path
+
 #define main wireviewctl_main
 #include "../wireviewctl.c"
 #undef main
 
 #include <ctype.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include "check.h"
 
 #ifndef WV_SRCDIR
@@ -609,7 +618,7 @@ static void test_parse_remote(void)
 		CHECK_EQ_INT(s[0].alarm[i], -1);	/* /sensors has none */
 
 	CHECK_EQ_STR(s[1].source, "rig:9876");
-	CHECK_EQ_STR(s[1].name, "WireView");	/* default when absent */
+	CHECK_EQ_STR(s[1].name, "WireView Pro II");	/* default when absent */
 	CHECK_EQ_STR(s[1].fw, "9");
 	CHECK_EQ_STR(s[1].uid, "AA");
 	CHECK_EQ_STR(s[1].build, "");
@@ -777,7 +786,7 @@ static void test_parse_remote_tricky(void)
 	CHECK_EQ_INT(parse_remote("h", "{\"devices\":{\"id\":\"x\"}}", s, 4), 0);
 	CHECK_EQ_INT(parse_remote("h", "{\"x\":\"\\\"devices\\\":[{}]\"}", s, 4), 0);
 	CHECK_EQ_INT(parse_remote("h", "{\"devices\":[{}]}", s, 4), 1);
-	CHECK_EQ_STR(s[0].name, "WireView");
+	CHECK_EQ_STR(s[0].name, "WireView Pro II");
 
 	/* Every prefix of the body, each in a buffer of exactly its size so
 	 * ASan catches any read past the NUL: no crash, and the count only
@@ -1255,6 +1264,282 @@ static void test_sensors_output(void)
 	unsetenv("WIREVIEW_HWMON_PATH");
 }
 
+/* ---- a fake wireviewd on a Unix socket ---- */
+
+/*
+ * A child process that serves the command socket at g_sock_path: it answers
+ * GET_DEVICE_INFO with status and reply, and any other command with
+ * RESP_ERROR. Every command byte it receives is appended to the log file
+ * "daemon.log" in the temp dir, so a test can tell what reached the daemon.
+ */
+static pid_t fake_daemon_start(uint8_t status, const uint8_t *reply, size_t len)
+{
+	char logpath[PATH_MAX];
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+
+	snprintf(g_sock_path, sizeof(g_sock_path), "%s/wireviewd.sock", g_tmpdir);
+	snprintf(logpath, sizeof(logpath), "%s/daemon.log", g_tmpdir);
+	unlink(g_sock_path);
+	unlink(logpath);
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", g_sock_path);
+	int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (lfd < 0 || bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+	    listen(lfd, 8) != 0) {
+		perror("fake daemon");
+		if (lfd >= 0)
+			close(lfd);
+		return -1;
+	}
+	fflush(stdout);
+	fflush(stderr);
+	pid_t pid = fork();
+	if (pid != 0) {
+		close(lfd);
+		return pid;
+	}
+	for (;;) {
+		int c = accept(lfd, NULL, NULL);
+		if (c < 0)
+			continue;
+		uint8_t hdr[3], payload[1024];
+		if (read_full(c, hdr, 3) == 0) {
+			size_t plen = (size_t)(hdr[1] | hdr[2] << 8);
+			if (plen <= sizeof(payload) && read_full(c, payload, plen) == 0) {
+				int log = open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0600);
+				if (log >= 0) {
+					char line[8];
+					int n = snprintf(line, sizeof(line), "%02x\n", hdr[0]);
+					if (write(log, line, (size_t)n) < 0)
+						_exit(1);
+					close(log);
+				}
+				uint8_t rh[3] = { RESP_ERROR, 0, 0 };
+				if (hdr[0] == WCMD_GET_DEVICE_INFO) {
+					rh[0] = status;
+					rh[1] = (uint8_t)(len & 0xFF);
+					rh[2] = (uint8_t)(len >> 8);
+				}
+				if (write(c, rh, 3) == 3 && hdr[0] == WCMD_GET_DEVICE_INFO && len)
+					if (write(c, reply, len) < 0)
+						_exit(1);
+			}
+		}
+		close(c);
+	}
+}
+
+static void fake_daemon_stop(pid_t pid)
+{
+	if (pid > 0) {
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+	}
+	unlink(g_sock_path);
+	snprintf(g_sock_path, sizeof(g_sock_path), "/nonexistent/wireviewd.sock");
+}
+
+/* A GET_DEVICE_INFO reply: fw, config 2, UID 00..0B, build string with its
+ * NUL, then vendor and product unless product is negative (a daemon that
+ * predates the editions). Returns the length. */
+static size_t devinfo_reply_fw(uint8_t *buf, int fw, const char *build,
+			       int vendor, int product)
+{
+	size_t n = 0;
+	buf[n++] = (uint8_t)fw;
+	buf[n++] = 2;
+	for (int i = 0; i < 12; i++)
+		buf[n++] = (uint8_t)i;
+	memcpy(buf + n, build, strlen(build) + 1);
+	n += strlen(build) + 1;
+	if (product >= 0) {
+		buf[n++] = (uint8_t)vendor;
+		buf[n++] = (uint8_t)product;
+	}
+	return n;
+}
+
+static size_t devinfo_reply(uint8_t *buf, const char *build, int vendor, int product)
+{
+	return devinfo_reply_fw(buf, 5, build, vendor, product);
+}
+
+static void test_parse_device_info(void)
+{
+	uint8_t buf[256];
+	struct wv_devinfo di;
+	size_t n;
+
+	/* A daemon that reports the product. */
+	n = devinfo_reply(buf, "TG-WV-PRO2-FW_20260902_0741", 0xEF, 6);
+	CHECK_EQ_INT(parse_device_info(buf, n, &di), 0);
+	CHECK_EQ_INT(di.fw, 5);
+	CHECK_EQ_INT(di.cfg_ver, 2);
+	CHECK_EQ_INT(di.uid[11], 11);
+	CHECK_EQ_STR(di.build, "TG-WV-PRO2-FW_20260902_0741");
+	CHECK_EQ_INT(di.vendor, 0xEF);
+	CHECK_EQ_INT(di.product, 6);
+	CHECK_EQ_INT(di.product_reported, 1);
+
+	/* An older daemon ends at the NUL: EF05 is assumed. */
+	n = devinfo_reply(buf, "b", 0, -1);
+	memset(&di, 0xAB, sizeof(di));
+	CHECK_EQ_INT(parse_device_info(buf, n, &di), 0);
+	CHECK_EQ_STR(di.build, "b");
+	CHECK_EQ_INT(di.vendor, 0xEF);
+	CHECK_EQ_INT(di.product, 5);
+	CHECK_EQ_INT(di.product_reported, 0);
+
+	/* One byte after the NUL is not a vendor/product pair. */
+	buf[n] = 0xEF;
+	CHECK_EQ_INT(parse_device_info(buf, n + 1, &di), 0);
+	CHECK_EQ_INT(di.product_reported, 0);
+	CHECK_EQ_INT(di.product, 5);
+
+	/* Extra bytes past the pair are ignored. */
+	n = devinfo_reply(buf, "b", 0xEF, 5);
+	buf[n] = 0x77;
+	CHECK_EQ_INT(parse_device_info(buf, n + 1, &di), 0);
+	CHECK_EQ_INT(di.product_reported, 1);
+	CHECK_EQ_INT(di.product, 5);
+
+	/* No build string at all, and a build string without its NUL. */
+	CHECK_EQ_INT(parse_device_info(buf, 14, &di), 0);
+	CHECK_EQ_STR(di.build, "");
+	CHECK_EQ_INT(di.product_reported, 0);
+	n = devinfo_reply(buf, "abc", 0, -1);
+	CHECK_EQ_INT(parse_device_info(buf, n - 1, &di), 0);
+	CHECK_EQ_STR(di.build, "abc");
+	CHECK_EQ_INT(di.product_reported, 0);
+
+	/* Shorter than the fixed part. */
+	CHECK_EQ_INT(parse_device_info(buf, 13, &di), -1);
+	CHECK_EQ_INT(parse_device_info(buf, 0, &di), -1);
+
+	/* A build string longer than the field is cut, and the pair after
+	 * it is still found. */
+	char longb[100];
+	memset(longb, 'x', 99);
+	longb[99] = '\0';
+	n = devinfo_reply(buf, longb, 0xEF, 6);
+	CHECK_EQ_INT(parse_device_info(buf, n, &di), 0);
+	CHECK_EQ_INT(strlen(di.build), sizeof(di.build) - 1);
+	CHECK_EQ_INT(di.product, 6);
+
+	CHECK_EQ_STR(edition_name(0xEF, 5), "WireView Pro II");
+	CHECK_EQ_STR(edition_name(0xEF, 6), "WireView Pro II Noctua Edition");
+	CHECK(edition_name(0xEF, 7) == NULL);
+	CHECK(edition_name(0xEE, 5) == NULL);
+}
+
+/* info, sensors --json and the snapshot name against a fake daemon, new
+ * (vendor/product after the build string) and old (none). */
+static void test_device_edition(void)
+{
+	static char out[16384];
+	char keys[2048], want[2048];
+	uint8_t buf[256];
+	struct wv_snap s;
+	char *argv_json[] = { "wireviewctl", "sensors", "--json", NULL };
+	int rc = -1;
+	pid_t pid;
+
+	sysfs_populate();
+	setenv("WIREVIEW_HWMON_PATH", g_hwmon, 1);
+
+	/* A Noctua Edition behind a daemon that reports it. */
+	size_t n = devinfo_reply(buf, "TG-WV-PRO2-FW_20260902_0741", 0xEF, 6);
+	pid = fake_daemon_start(RESP_OK, buf, n);
+	CHECK(pid > 0);
+	CAPTURE(out, rc = cmd_info());
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "firmware: 5\nconfig_version: 2\n"
+		      "uid: 000102030405060708090a0b\n"
+		      "build: TG-WV-PRO2-FW_20260902_0741\n"
+		      "product: EF06\n"
+		      "edition: WireView Pro II Noctua Edition\n") != NULL);
+
+	CHECK_EQ_INT(read_local(&s), 0);
+	CHECK_EQ_STR(s.name, "WireView Pro II Noctua Edition");
+	CHECK_EQ_STR(s.hwrev, "EF06");
+	CHECK_EQ_STR(s.fw, "5");
+	CHECK_EQ_STR(s.uid, "000102030405060708090A0B");
+	CAPTURE(out, draw_panel(&s));
+	CHECK(strstr(out, "WireView Pro II Noctua Edition") != NULL);
+
+	CAPTURE(out, rc = cmd_sensors(3, argv_json));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "\"id\":\"000102030405060708090A0B\","
+		      "\"name\":\"WireView Pro II Noctua Edition\",\"connected\":true,"
+		      "\"hwRev\":\"EF06\",\"fwVer\":\"5\","
+		      "\"buildString\":\"TG-WV-PRO2-FW_20260902_0741\"") != NULL);
+	/* Still the daemon's key set and order. */
+	json_keys(out, keys, sizeof(keys));
+	CHECK_EQ_INT(daemon_sensors_keys(want, sizeof(want)), 0);
+	CHECK_EQ_STR(keys, want);
+	fake_daemon_stop(pid);
+
+	/* A Pro II behind a daemon that reports it. */
+	n = devinfo_reply(buf, "b", 0xEF, 5);
+	pid = fake_daemon_start(RESP_OK, buf, n);
+	CAPTURE(out, rc = cmd_info());
+	CHECK(strstr(out, "product: EF05\nedition: WireView Pro II\n") != NULL);
+	CHECK_EQ_INT(read_local(&s), 0);
+	CHECK_EQ_STR(s.name, "WireView Pro II");
+	CHECK_EQ_STR(s.hwrev, "EF05");
+	fake_daemon_stop(pid);
+
+	/* A product this tool does not know: the id, no edition name. */
+	n = devinfo_reply(buf, "b", 0xEF, 7);
+	pid = fake_daemon_start(RESP_OK, buf, n);
+	CAPTURE(out, rc = cmd_info());
+	CHECK(strstr(out, "product: EF07\nedition: unknown\n") != NULL);
+	CHECK_EQ_INT(read_local(&s), 0);
+	CHECK_EQ_STR(s.name, "WireView Pro II");
+	CHECK_EQ_STR(s.hwrev, "EF07");
+	fake_daemon_stop(pid);
+
+	/* Today's daemon: nothing after the build string. */
+	n = devinfo_reply(buf, "TG-WV-PRO2-FW_20260706_1047", 0, -1);
+	pid = fake_daemon_start(RESP_OK, buf, n);
+	CAPTURE(out, rc = cmd_info());
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "build: TG-WV-PRO2-FW_20260706_1047\n"
+		      "product: EF05 (assumed: this wireviewd does not report it)\n"
+		      "edition: WireView Pro II\n") != NULL);
+	CHECK_EQ_INT(read_local(&s), 0);
+	CHECK_EQ_STR(s.name, "WireView Pro II");
+	CHECK_EQ_STR(s.hwrev, "");
+	CHECK_EQ_STR(s.build, "TG-WV-PRO2-FW_20260706_1047");
+	CAPTURE(out, rc = cmd_sensors(3, argv_json));
+	CHECK(strstr(out, "\"name\":\"WireView Pro II\",\"connected\":true,"
+		      "\"hwRev\":\"\",\"fwVer\":\"5\"") != NULL);
+	fake_daemon_stop(pid);
+
+	/* Daemon up, device unplugged: info fails, the snapshot keeps the
+	 * defaults. */
+	pid = fake_daemon_start(RESP_NOT_CONNECTED, NULL, 0);
+	QUIET(CAPTURE(out, rc = cmd_info()));
+	CHECK_EQ_INT(rc, 1);
+	CHECK_EQ_STR(out, "");
+	CHECK_EQ_INT(read_local(&s), 0);
+	CHECK_EQ_STR(s.name, "WireView Pro II");
+	CHECK_EQ_STR(s.fw, "");
+	fake_daemon_stop(pid);
+
+	/* Remote: hwRev and name come from /sensors. */
+	static const char body[] =
+		"{\"devices\":[{\"id\":\"AA\",\"name\":\"WireView Pro II Noctua Edition\","
+		"\"hwRev\":\"EF06\"},{\"id\":\"BB\",\"hwRev\":\"\"}]}";
+	struct wv_snap r[2];
+	CHECK_EQ_INT(parse_remote("h", body, r, 2), 2);
+	CHECK_EQ_STR(r[0].name, "WireView Pro II Noctua Edition");
+	CHECK_EQ_STR(r[0].hwrev, "EF06");
+	CHECK_EQ_STR(r[1].name, "WireView Pro II");
+	CHECK_EQ_STR(r[1].hwrev, "");
+
+	unsetenv("WIREVIEW_HWMON_PATH");
+}
+
 int main(void)
 {
 	if (!mkdtemp(g_tmpdir)) {
@@ -1273,6 +1558,8 @@ int main(void)
 	test_remote_absent_fields();
 	test_read_local();
 	test_sensors_output();
+	test_parse_device_info();
+	test_device_edition();
 
 	char cmd[PATH_MAX + 16];
 	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);
