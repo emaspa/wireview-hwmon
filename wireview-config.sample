@@ -2,9 +2,11 @@
 #
 # Read once when wireviewd (re)starts. The LAN listener is OFF by default.
 # Values below are the defaults shown for reference - edit as needed.
+# Comments go on their own line: text after a value is part of the value.
 
-# Open the LAN listener so other instances can read this host's device(s),
-# and (with a secret set) write to them.  0 = off, 1 = on.
+# Open the LAN listener so other instances can read this host's device(s)
+# (GET /sensors, and GET /metrics for Prometheus) and, with a secret set,
+# write to them.  0 = off, 1 = on.
 remote_enabled=0
 
 # Listener port.
