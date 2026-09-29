@@ -133,12 +133,10 @@ static const struct file_operations wireview_misc_fops = {
  * Temps:     temp1-temp4 = Onboard In, Onboard Out, External 1, External 2;
  *            tempN_alarm on all
  * Energy:    energy1 = Total (from v3 frames only)
- * Fan:       pwm1 = fan duty 0-255;
- *            fan1_input = fan duty 0-100 (deprecated, use pwm1)
+ * Fan:       pwm1 = fan duty 0-255
  * Intrusion: intrusion0_alarm = any active fault,
  *            intrusion1_alarm = any logged fault
- * Extra:     fault_status_raw, fault_log_raw = raw fault bitmasks;
- *            psu_cap = raw PSU capability enum (deprecated, use power1_cap)
+ * Extra:     fault_status_raw, fault_log_raw = raw fault bitmasks
  */
 
 /*
@@ -212,7 +210,6 @@ static ssize_t intrusion1_label_show(struct device *dev,
 enum wireview_raw_attr {
 	WIREVIEW_RAW_FAULT_STATUS,
 	WIREVIEW_RAW_FAULT_LOG,
-	WIREVIEW_RAW_PSU_CAP,
 };
 
 static ssize_t wireview_raw_show(struct device *dev,
@@ -227,17 +224,10 @@ static ssize_t wireview_raw_show(struct device *dev,
 		return -ENODATA;
 	}
 
-	switch (to_sensor_dev_attr(attr)->index) {
-	case WIREVIEW_RAW_FAULT_STATUS:
+	if (to_sensor_dev_attr(attr)->index == WIREVIEW_RAW_FAULT_STATUS)
 		val = priv->data.fault_status;
-		break;
-	case WIREVIEW_RAW_FAULT_LOG:
+	else /* WIREVIEW_RAW_FAULT_LOG */
 		val = priv->data.fault_log;
-		break;
-	default: /* WIREVIEW_RAW_PSU_CAP */
-		val = priv->data.psu_cap;
-		break;
-	}
 	mutex_unlock(&priv->lock);
 
 	return sysfs_emit(buf, "%u\n", val);
@@ -248,15 +238,12 @@ static DEVICE_ATTR_RO(intrusion1_label);
 static SENSOR_DEVICE_ATTR_RO(fault_status_raw, wireview_raw,
 			     WIREVIEW_RAW_FAULT_STATUS);
 static SENSOR_DEVICE_ATTR_RO(fault_log_raw, wireview_raw, WIREVIEW_RAW_FAULT_LOG);
-/* Deprecated: raw enum, superseded by power1_cap. Drop after one release. */
-static SENSOR_DEVICE_ATTR_RO(psu_cap, wireview_raw, WIREVIEW_RAW_PSU_CAP);
 
 static struct attribute *wireview_extra_attrs[] = {
 	&dev_attr_intrusion0_label.attr,
 	&dev_attr_intrusion1_label.attr,
 	&sensor_dev_attr_fault_status_raw.dev_attr.attr,
 	&sensor_dev_attr_fault_log_raw.dev_attr.attr,
-	&sensor_dev_attr_psu_cap.dev_attr.attr,
 	NULL
 };
 
@@ -293,10 +280,6 @@ static umode_t wireview_is_visible(const void *drvdata,
 	case hwmon_temp:
 		if (attr == hwmon_temp_input || attr == hwmon_temp_label ||
 		    attr == hwmon_temp_alarm)
-			return 0444;
-		break;
-	case hwmon_fan:
-		if (attr == hwmon_fan_input)
 			return 0444;
 		break;
 	case hwmon_energy:
@@ -398,13 +381,6 @@ static int wireview_read(struct device *dev, enum hwmon_sensor_types type,
 		else
 			*val = min_t(s64, priv->data.energy_uj, LONG_MAX);
 		break;
-	case hwmon_fan:
-		/*
-		 * Deprecated, use pwm1: fan duty 0-100 reported as "RPM" so
-		 * it shows up in sensors. Drop after one release.
-		 */
-		*val = priv->data.fan_duty;
-		break;
 	case hwmon_pwm:
 		*val = DIV_ROUND_CLOSEST(min_t(unsigned int,
 					       priv->data.fan_duty, 100) * 255,
@@ -492,8 +468,6 @@ static const struct hwmon_channel_info * const wireview_info[] = {
 		HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_ALARM),  /* temp4: External 2 */
 	HWMON_CHANNEL_INFO(energy,
 		HWMON_E_INPUT | HWMON_E_LABEL),  /* energy1: Total */
-	HWMON_CHANNEL_INFO(fan,
-		HWMON_F_INPUT),                  /* fan1: duty %, deprecated */
 	HWMON_CHANNEL_INFO(pwm,
 		HWMON_PWM_INPUT),                /* pwm1: duty 0-255 */
 	HWMON_CHANNEL_INFO(intrusion,

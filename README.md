@@ -226,13 +226,8 @@ Running `./wireviewd` by hand, as in the Quick start, is not sandboxed.
 | Fault Log | `intrusion1_alarm` (`intrusion1_label`) | 0/1 |
 | Fault Status (raw) | `fault_status_raw` | bitmask |
 | Fault Log (raw) | `fault_log_raw` | bitmask |
-| Fan Duty (deprecated) | `fan1_input` | % (0-100) |
-| PSU Capability (deprecated) | `psu_cap` | enum (0-4) |
 
 All voltage, current, power, temperature, and energy channels also expose `_label` attributes for tool-friendly names.
-
-`fan1_input` and `psu_cap` are deprecated and will be removed after one more
-release; use `pwm1` and `power1_cap`. `wireviewctl` reads either.
 
 The alarms follow the active fault bits (`fault_status`, debounced by the
 daemon), not the fault log:
@@ -276,7 +271,6 @@ Pin 5:         12.11 V
 Pin 6:         12.12 V
 Average:       12.12 V
 Vdd:            3.30 V
-fan1:           75 RPM
 Onboard In:    +45.3°C
 Onboard Out:   +42.1°C
 External 1:    +38.7°C
@@ -296,12 +290,13 @@ Pin 4:          5.34 A
 Pin 5:          5.56 A
 Pin 6:          5.43 A
 Total:         32.13 A
+pwm1:              75%
 Fault Status: OK
 Fault Log:    ALARM
 ```
 
-`sensors` shows `fan1` (the deprecated duty in %, printed as RPM) but not
-`pwm1`. A channel whose alarm is set gets `ALARM` at the end of its line.
+`sensors` prints `pwm1` as a percentage (191 of 255 shows as 75%). A channel
+whose alarm is set gets `ALARM` at the end of its line.
 
 ## CLI tool
 
