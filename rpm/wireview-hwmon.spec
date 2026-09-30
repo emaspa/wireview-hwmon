@@ -2,7 +2,7 @@
 
 Name:           wireview-hwmon
 # Must match the top-level VERSION file ("make check-version").
-Version:        1.6.0
+Version:        1.7.0
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -149,6 +149,43 @@ dkms status -m %{name} -v %{version} -k "$(uname -r)" 2>/dev/null | grep -q ': i
 dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
 
 %changelog
+* Wed Sep 30 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.7.0-1
+- Fix: members of the "wireview" group were refused every privileged
+  command when wireviewd ran under systemd (1.6.0). The unit's
+  PrivateUsers=yes made every socket peer except root appear as uid 65534,
+  so the group check never matched. The option is removed.
+- WireView Pro II Noctua Edition (product EF06) is supported. wireviewd
+  reports the vendor and product id to clients (GET_DEVICE_INFO, /sensors
+  hwRev and name, /metrics labels); wireviewctl shows product and edition.
+  WireView II and its Phanteks Edition are refused with a clear message.
+- Bundled firmware updated to v05 build 20260902_0741 (upstream 1.0.8),
+  now shipped in its own package wireview-hwmon-firmware, recommended by
+  wireview-hwmon.
+- wireviewctl flash checks the image against the device before anything is
+  sent: product match (the Noctua Edition takes the Pro II image), no
+  downgrade by version or build date, every Intel HEX record validated.
+  New --force overrides a refusal; -y only skips the prompt.
+- hwmon: the deprecated fan1_input and psu_cap attributes are removed; use
+  pwm1 and power1_cap. Supported kernels start at Linux 6.8.
+- wireviewd: idle command-socket clients are closed after 60 s, 8 clients
+  are served and the longest-idle one is evicted when the table is full.
+  Use wireview-linux 1.2.5.0 or later, which reconnects and retries.
+- wireviewd: POST /command matches JSON keys only at the top level of the
+  request; config keys accept blanks around "=".
+- wireviewd: frames with physically impossible readings are discarded as
+  corrupt (a pin outside -1..20 V or above 60 A, Vdd above 6 V). This check
+  is preventive: no such frame has been observed, and the energy counter
+  was verified against a real load.
+- wireviewctl: remote /sensors and /config are read by structure, so braces
+  or key-like text in a string cannot break top or --host; readings the
+  remote does not send are left out instead of shown as zero.
+- sha256: ct_str_equal no longer treats strings whose lengths differ by a
+  multiple of 256 as equal.
+- udev: ModemManager is told to ignore the device; it used to probe the
+  serial port for about half a minute after every plug-in.
+- packaging: the systemd unit and udev rules are installed under /usr/lib;
+  the postinst no longer fails without udev.
+
 * Tue Sep 29 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.6.0-1
 - hwmon: standard attributes: pwm1 (fan duty), power1_cap (PSU capability),
   energy1_input (energy since daemon start), and temp/curr/power alarms
