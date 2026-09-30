@@ -220,6 +220,10 @@ capabilities. In practice:
 - The device policy allows only CDC-ACM serial ports and `/dev/wireview-hwmon`,
   so `-d` accepts only `/dev/ttyACM*` devices.
 
+The unit deliberately does not use a private user namespace: the daemon
+identifies command-socket clients by their real user id to check `wireview`
+group membership.
+
 Running `./wireviewd` by hand, as in the Quick start, is not sandboxed.
 
 ## Exposed sensors
@@ -471,6 +475,10 @@ sudo usermod -aG dialout $USER
 (`600`) on purpose: anything that can write to it can inject fake readings into
 hwmon, and wireviewd is its only writer. Monitoring tools read
 `/sys/class/hwmon/`, which stays world-readable.
+
+The rules also tell ModemManager to ignore the device. Without that it probes
+every new CDC-ACM port as a possible modem for about half a minute, which
+keeps the port busy and delays `wireviewd` after a plug-in or a restart.
 
 ### Examples
 
@@ -888,7 +896,6 @@ of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
 
 ### Known issues and small follow-ups
 
-- `wireviewd` sometimes logs "device info query failed" once right after a restart and succeeds on the retry two seconds later.
 - A raw `.bin` firmware must be under 4 MiB, while a `.hex` may fill exactly 4 MiB.
 - The deb postinst runs a bare `udevadm trigger`, which re-triggers every device; it should match only the WireView.
 - A system that once had a 1.6.0 deb installed keeps an empty `/lib.usr-is-merged` directory after purge.
