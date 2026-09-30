@@ -16,10 +16,11 @@ BuildRequires:  systemd-rpm-macros
 # %%pre creates the wireview group
 Requires(pre):  shadow-utils
 
-# wireviewctl flash updates the device firmware over DFU via dfu-util, with
-# the image from the firmware subpackage unless given a file
+# wireviewctl flash updates the device firmware over DFU via dfu-util
 Recommends:     dfu-util
-Recommends:     %{name}-firmware
+# 1.7.0 shipped the firmware image in a package of its own
+Obsoletes:      %{name}-firmware < 1.7.1
+Provides:       %{name}-firmware = %{version}-%{release}
 
 %description
 Userspace daemon and CLI tool for the Thermal Grizzly WireView Pro II GPU power
@@ -41,24 +42,6 @@ Supplements:    %{name}
 Linux hwmon kernel module for the Thermal Grizzly WireView Pro II GPU power
 monitor, exposing voltage, current, power and temperature through
 /sys/class/hwmon/. Built and rebuilt automatically via DKMS.
-
-%package firmware
-Summary:        WireView Pro II device firmware image (proprietary)
-# Thermal Grizzly's image ships with no license text, so no redistribution
-# terms are claimed beyond Thermal Grizzly's own (see firmware/README.md).
-License:        LicenseRef-Proprietary
-BuildArch:      noarch
-# The image moved here from the main package after 1.6.0. Conflicts (not
-# Obsoletes, which would replace the main package) makes an old main
-# package upgrade in the same transaction instead of clashing on the file.
-Conflicts:      %{name} < 1.7.0
-
-%description firmware
-Official firmware image for the Thermal Grizzly WireView Pro II GPU power
-monitor, redistributed unmodified from Thermal Grizzly's WireView2 Windows
-release. "wireviewctl flash" writes it to the device over USB DFU when no
-other image is given; it runs on the device, never on the host. The image is
-proprietary Thermal Grizzly software, not covered by the GPL.
 
 %prep
 %autosetup
@@ -91,6 +74,8 @@ chmod 0644 %{buildroot}%{_usrsrc}/%{name}-%{version}/dkms.conf \
 %{_bindir}/wireviewctl
 %{_unitdir}/wireviewd.service
 %{_udevrulesdir}/99-wireview-hwmon.rules
+%dir %{_datadir}/wireview
+%{_datadir}/wireview/TG-WV-PRO2-FW.hex
 %dir %attr(0700,root,root) %{_sysconfdir}/wireview
 %config(noreplace) %attr(0600,root,root) %{_sysconfdir}/wireview/config
 
@@ -108,11 +93,6 @@ exit 0
 
 %postun
 %systemd_postun_with_restart wireviewd.service
-
-%files firmware
-%doc firmware/README.md
-%dir %{_datadir}/wireview
-%{_datadir}/wireview/TG-WV-PRO2-FW.hex
 
 %files dkms
 %{_usrsrc}/%{name}-%{version}/

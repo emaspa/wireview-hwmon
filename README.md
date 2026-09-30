@@ -27,14 +27,14 @@ sudo apt update
 sudo apt install wireview-hwmon wireview-hwmon-dkms
 ```
 
-This installs the daemon, CLI tool, kernel module (via DKMS), systemd service, and udev rules, plus the device firmware image for `wireviewctl flash` (`wireview-hwmon-firmware`, pulled in as a recommended package; see [Firmware image](#firmware-image)). The module auto-rebuilds on kernel updates and the daemon starts automatically.
+This installs the daemon, CLI tool, kernel module (via DKMS), systemd service, and udev rules. The module auto-rebuilds on kernel updates and the daemon starts automatically.
 
 ### Ubuntu / Debian (.deb packages)
 
-Pre-built `.deb` packages are available on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page. Download all three and install from the download directory:
+Pre-built `.deb` packages are available on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page. Download both and install from the download directory:
 
 ```bash
-sudo apt install ./wireview-hwmon_*_amd64.deb ./wireview-hwmon-dkms_*_all.deb ./wireview-hwmon-firmware_*_all.deb
+sudo apt install ./wireview-hwmon_*_amd64.deb ./wireview-hwmon-dkms_*_all.deb
 ```
 
 ### Fedora (COPR)
@@ -45,26 +45,24 @@ sudo dnf install wireview-hwmon wireview-hwmon-dkms
 sudo systemctl enable --now wireviewd
 ```
 
-The same COPR repo also provides the [WireView GUI](https://github.com/emaspa/wireview-linux) (`wireview-linux`). The DKMS module pulls `kernel-devel` for your running kernel and rebuilds automatically on kernel updates. dnf also installs `wireview-hwmon-firmware`, the recommended [firmware image](#firmware-image) package.
+The same COPR repo also provides the [WireView GUI](https://github.com/emaspa/wireview-linux) (`wireview-linux`). The DKMS module pulls `kernel-devel` for your running kernel and rebuilds automatically on kernel updates.
 
 ### Fedora (.rpm packages)
 
 Pre-built `.rpm` packages are on the [Releases](https://github.com/emaspa/wireview-hwmon/releases) page (one set works on Fedora 43-44):
 
 ```bash
-sudo dnf install ./wireview-hwmon-*.x86_64.rpm ./wireview-hwmon-dkms-*.noarch.rpm ./wireview-hwmon-firmware-*.noarch.rpm
+sudo dnf install ./wireview-hwmon-*.x86_64.rpm ./wireview-hwmon-dkms-*.noarch.rpm
 sudo systemctl enable --now wireviewd
 ```
 
 ### Arch / CachyOS / EndeavourOS (AUR)
 
 ```bash
-paru -S wireview-hwmon wireview-hwmon-dkms wireview-hwmon-firmware   # or: yay -S
+paru -S wireview-hwmon wireview-hwmon-dkms   # or: yay -S
 sudo modprobe wireview_hwmon
 sudo systemctl enable --now wireviewd
 ```
-
-`wireview-hwmon-firmware` is optional here: leave it out if you do not want the [firmware image](#firmware-image). If you are upgrading from 1.6.0 or older, add it by hand: the image used to be part of `wireview-hwmon`, and AUR helpers only upgrade the packages already installed.
 
 Verify with `sensors` (or `wireviewctl info`); a `wireview`-named hwmon device should appear. From the next boot onward everything comes up automatically: the dkms package registers the module in `modules-load.d` and the service also modprobes it on start.
 
@@ -78,14 +76,9 @@ DKMS needs the matching kernel headers (`linux-headers`, `linux-cachyos-headers`
 firmware image from `/usr/share/wireview/TG-WV-PRO2-FW.hex`: v05, build
 `TG-WV-PRO2-FW_20260902_0741`, from the upstream WireView2 1.0.8 Windows
 release. The one image serves both the WireView Pro II and the Noctua Edition.
-The image is proprietary and not covered by the GPL (see
-[firmware/README.md](firmware/README.md)), so the packages ship it on its own
-as `wireview-hwmon-firmware`: apt and dnf install it by default as a
-recommended package, the AUR lists it as optional, and `make install` installs
-it too. Everything else works without it; `wireviewctl flash FILE` flashes an
-image you supply. To leave it out, use `apt install --no-install-recommends`
-or `dnf install --setopt=install_weak_deps=False`, or remove
-`wireview-hwmon-firmware` afterwards.
+It comes with the `wireview-hwmon` package and with `make install`. The image
+is proprietary and not covered by the GPL, see
+[firmware/README.md](firmware/README.md).
 
 ### Build from source
 
@@ -495,8 +488,7 @@ wireviewctl top --host 192.168.1.50
 # Switch to simple display
 wireviewctl screen simple
 
-# Update the device firmware to the bundled image (no download needed; it
-# comes from the wireview-hwmon-firmware package, see "Firmware image");
+# Update the device firmware to the bundled image (no download needed);
 # add -y to skip the confirmation prompt for headless updates. The same or
 # an older build, or an image for another product, is refused (--force
 # overrides).

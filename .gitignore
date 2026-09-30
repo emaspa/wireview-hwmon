@@ -26,7 +26,6 @@ debian/*.substvars
 debian/*.debhelper
 debian/wireview-hwmon/
 debian/wireview-hwmon-dkms/
-debian/wireview-hwmon-firmware/
 
 # Draft posts
 reddit-post.md

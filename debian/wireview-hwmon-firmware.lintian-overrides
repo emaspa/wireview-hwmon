@@ -1,6 +1,0 @@
-# multiverse is Ubuntu's archive area for non-free software (the PPA
-# publishes every package in main regardless); lintian only knows Debian's.
-wireview-hwmon-firmware: unknown-section multiverse/misc
-# The image is flashed onto the USB device by wireviewctl; it is not kernel
-# firmware loaded by the host.
-wireview-hwmon-firmware: wrong-section-according-to-package-name multiverse/misc => multiverse/kernel
