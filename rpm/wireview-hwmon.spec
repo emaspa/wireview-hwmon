@@ -2,7 +2,7 @@
 
 Name:           wireview-hwmon
 # Must match the top-level VERSION file ("make check-version").
-Version:        1.7.0
+Version:        1.7.1
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -129,6 +129,11 @@ dkms status -m %{name} -v %{version} -k "$(uname -r)" 2>/dev/null | grep -q ': i
 dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
 
 %changelog
+* Wed Sep 30 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.7.1-1
+- The firmware image is back in the wireview-hwmon package. 1.7.0 had moved
+  it to wireview-hwmon-firmware; upgrading removes that package and keeps
+  the image.
+
 * Wed Sep 30 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.7.0-1
 - Fix: members of the "wireview" group were refused every privileged
   command when wireviewd ran under systemd (1.6.0). The unit's

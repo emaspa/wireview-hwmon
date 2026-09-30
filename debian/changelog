@@ -1,3 +1,19 @@
+wireview-hwmon (1.7.1~26.04.1) resolute; urgency=medium
+
+  * The firmware image is back in the wireview-hwmon package. 1.7.0 had
+    moved it to wireview-hwmon-firmware; upgrading removes that package and
+    keeps /usr/share/wireview/TG-WV-PRO2-FW.hex.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 30 Sep 2026 02:12:22 +0100
+
+wireview-hwmon (1.7.1~24.04.1) noble; urgency=medium
+
+  * The firmware image is back in the wireview-hwmon package. 1.7.0 had
+    moved it to wireview-hwmon-firmware; upgrading removes that package and
+    keeps /usr/share/wireview/TG-WV-PRO2-FW.hex.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 30 Sep 2026 02:12:22 +0100
+
 wireview-hwmon (1.7.0~26.04.1) resolute; urgency=medium
 
   * Fix: members of the "wireview" group were refused every privileged
