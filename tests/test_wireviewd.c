@@ -769,6 +769,37 @@ static void test_frame(void)
 	CHECK_EQ_INT(ss._pad1, 122);
 	CHECK_EQ_INT(ss.fault_status, 0x0607);
 	CHECK(!frame_is_sane(&ss));
+
+	/* Readings must be physically possible: a frame with clean padding
+	 * but garbage in a pin would otherwise reach hwmon and add tens of
+	 * kilojoules to the energy counter in one step. */
+	memset(&ss, 0, sizeof(ss));
+	for (int i = 0; i < 6; i++) {
+		ss.pins[i].voltage = 12100;
+		ss.pins[i].current = 9500;
+	}
+	ss.vdd = 3300;
+	CHECK(frame_is_sane(&ss));		/* 690 W, a real full load */
+	ss.pins[0].current = 60000;
+	CHECK(frame_is_sane(&ss));		/* at the limit */
+	ss.pins[0].current = 60001;
+	CHECK(!frame_is_sane(&ss));
+	ss.pins[0].current = 0x00FF1234;	/* 16.7 kA: desynced bytes */
+	CHECK(!frame_is_sane(&ss));
+	ss.pins[0].current = 9500;
+	ss.pins[5].voltage = 20000;
+	CHECK(frame_is_sane(&ss));
+	ss.pins[5].voltage = 20001;
+	CHECK(!frame_is_sane(&ss));
+	ss.pins[5].voltage = -1000;
+	CHECK(frame_is_sane(&ss));		/* small negative offset, idle pin */
+	ss.pins[5].voltage = -1001;
+	CHECK(!frame_is_sane(&ss));
+	ss.pins[5].voltage = 12100;
+	ss.vdd = 6000;
+	CHECK(frame_is_sane(&ss));
+	ss.vdd = 6001;
+	CHECK(!frame_is_sane(&ss));
 }
 
 /* ---- write_hwmon conversion ---- */

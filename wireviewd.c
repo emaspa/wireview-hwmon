@@ -491,10 +491,32 @@ static int read_sensors(int fd, struct sensor_struct *ss)
  * arbitrary fields for one poll (a real corrupt frame in the field carried
  * fan=105, pad1=122, status=0x0607). Real frames always have zero padding
  * and a fan duty <= 100; anything else is discarded, and the next poll's
- * tcflush realigns the stream. */
+ * tcflush realigns the stream.
+ *
+ * Padding and fan duty alone let through a frame whose readings are
+ * garbage, and one such frame is enough to spoil the energy counter for
+ * good: 60 kW for a second adds 60 kJ. So the readings must also be
+ * physically possible for a 12V-2x6 connector, with a wide margin: each
+ * pin between -1 V and 20 V and at most 60 A (the connector is rated 9.5 A
+ * per pin), and the 3.3 V rail at most 6 V. */
+#define FRAME_PIN_MV_MIN   (-1000)
+#define FRAME_PIN_MV_MAX   20000
+#define FRAME_PIN_MA_MAX   60000u
+#define FRAME_VDD_MV_MAX   6000
+
 static int frame_is_sane(const struct sensor_struct *ss)
 {
-	return ss->fan_duty <= 100 && !ss->_pad1 && !ss->_pad2;
+	if (ss->fan_duty > 100 || ss->_pad1 || ss->_pad2)
+		return 0;
+	if (ss->vdd > FRAME_VDD_MV_MAX)
+		return 0;
+	for (int i = 0; i < 6; i++) {
+		if (ss->pins[i].voltage < FRAME_PIN_MV_MIN ||
+		    ss->pins[i].voltage > FRAME_PIN_MV_MAX ||
+		    ss->pins[i].current > FRAME_PIN_MA_MAX)
+			return 0;
+	}
+	return 1;
 }
 
 /* Total power of a frame in uW: sum of the pins' mV * mA, as published
@@ -2718,8 +2740,9 @@ int main(int argc, char **argv)
 			 *    status word (or vice versa) through. */
 			if (!frame_is_sane(&ss)) {
 				wlog("WARN",
-				     "discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u status=0x%04x log=0x%04x)",
-				     ss.fan_duty, ss._pad1, ss._pad2,
+				     "discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u vdd=%u mV power=%lld W status=0x%04x log=0x%04x)",
+				     ss.fan_duty, ss._pad1, ss._pad2, ss.vdd,
+				     (long long)(frame_power_uw(&ss) / 1000000),
 				     ss.fault_status, ss.fault_log);
 			} else {
 				uint16_t raw_status = ss.fault_status;
