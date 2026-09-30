@@ -28,7 +28,10 @@ endif
 
 UNIT := test_wireviewd test_wireviewctl
 
-all: unit e2e
+all: units unit e2e
+
+units:
+	./check-units.sh
 
 unit: $(UNIT)
 	@rc=0; for t in $(UNIT); do ./$$t || rc=1; done; exit $$rc
@@ -53,4 +56,4 @@ e2e:
 clean:
 	rm -f $(UNIT)
 
-.PHONY: all unit e2e clean
+.PHONY: all units unit e2e clean

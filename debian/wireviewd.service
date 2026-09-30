@@ -39,7 +39,9 @@ LogsDirectoryMode=0750
 ConfigurationDirectory=wireview
 ConfigurationDirectoryMode=0700
 ProtectHome=yes
-PrivateUsers=yes
+# No PrivateUsers=: in a private user namespace every peer of the command
+# socket except root shows up as uid 65534, so the wireview group check
+# could never match and group members were refused privileged commands.
 PrivateTmp=yes
 UMask=0077
 DevicePolicy=closed
