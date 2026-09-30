@@ -896,6 +896,7 @@ of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
 
 ### Known issues and small follow-ups
 
+- `wireviewd` logs "device info query failed" once right after a restart and succeeds on the retry two seconds later. ModemManager probing the port was ruled out as the cause.
 - A raw `.bin` firmware must be under 4 MiB, while a `.hex` may fill exactly 4 MiB.
 - The deb postinst runs a bare `udevadm trigger`, which re-triggers every device; it should match only the WireView.
 - A system that once had a 1.6.0 deb installed keeps an empty `/lib.usr-is-merged` directory after purge.
