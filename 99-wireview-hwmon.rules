@@ -13,6 +13,13 @@ ACTION=="remove", GOTO="wireview_end"
 # directly without the daemon.
 SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", GROUP="dialout", MODE="0660", TAG+="uaccess", RUN{builtin}+="uaccess"
 
+# Keep ModemManager away. It treats every new CDC-ACM port as a possible
+# modem and probes it with AT and QCDM commands for about half a minute,
+# holding the port (wireviewd gets "Device or resource busy") and sending
+# the device bytes it does not expect.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0483", ATTR{idProduct}=="5740", ENV{ID_MM_DEVICE_IGNORE}="1"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", ENV{ID_MM_PORT_IGNORE}="1"
+
 # STM32 DFU bootloader (the device after `wireviewctl bootloader`). Same
 # access policy as the serial port, so `wireviewctl flash` can run dfu-util
 # as the seat user instead of root.
