@@ -103,6 +103,8 @@ This builds the kernel module (`wireview_hwmon.ko`), the daemon (`wireviewd`), a
 ```bash
 # Install udev rules (serial port and DFU bootloader access)
 sudo cp 99-wireview-hwmon.rules /etc/udev/rules.d/
+# Arch-based distros only: there is no dialout group, the serial group is uucp
+# sudo sed -i 's/GROUP="dialout"/GROUP="uucp"/g' /etc/udev/rules.d/99-wireview-hwmon.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger   # or replug the device: new permissions apply on the next device event
 
@@ -464,8 +466,8 @@ no seat ACL; join `dialout` and log in again:
 sudo usermod -aG dialout $USER
 ```
 
-Arch-based distros have no `dialout` group. The AUR package installs the rules
-with their serial group `uucp` instead, so join `uucp` there.
+Arch-based distros have no `dialout` group. The AUR package and `make install`
+write the rules with their serial group `uucp` instead, so join `uucp` there.
 
 `/dev/wireview-hwmon`, the node wireviewd feeds readings into, is root-only
 (`600`) on purpose: anything that can write to it can inject fake readings into

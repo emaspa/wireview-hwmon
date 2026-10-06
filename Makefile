@@ -35,6 +35,9 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(MDIR) clean
 	rm -f wireviewd wireviewctl
 
+# Arch-based distros have no dialout group, their serial group is uucp. udev
+# drops a rule line whose group it cannot resolve, so the installed rules name
+# uucp there.
 install: all
 	$(MAKE) -C $(KDIR) M=$(MDIR) modules_install
 	depmod -a
@@ -44,6 +47,9 @@ install: all
 	install -D -m 644 firmware/TG-WV-PRO2-FW.hex /usr/share/wireview/TG-WV-PRO2-FW.hex
 	install -m 644 wireviewd.service /etc/systemd/system/wireviewd.service
 	install -m 644 99-wireview-hwmon.rules /etc/udev/rules.d/99-wireview-hwmon.rules
+	if ! getent group dialout >/dev/null && getent group uucp >/dev/null; then \
+		sed -i 's/GROUP="dialout"/GROUP="uucp"/g' /etc/udev/rules.d/99-wireview-hwmon.rules; \
+	fi
 	install -d /etc/modules-load.d
 	echo wireview_hwmon > /etc/modules-load.d/wireview-hwmon.conf
 	install -d /etc/avahi/services
