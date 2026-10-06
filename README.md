@@ -464,6 +464,9 @@ no seat ACL; join `dialout` and log in again:
 sudo usermod -aG dialout $USER
 ```
 
+Arch-based distros have no `dialout` group. The AUR package installs the rules
+with their serial group `uucp` instead, so join `uucp` there.
+
 `/dev/wireview-hwmon`, the node wireviewd feeds readings into, is root-only
 (`600`) on purpose: anything that can write to it can inject fake readings into
 hwmon, and wireviewd is its only writer. Monitoring tools read
