@@ -905,7 +905,7 @@ of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
 
 ## Thanks
 
-Thanks to Thermal Grizzly for providing a WireView Pro II Noctua Edition unit for development.
+Thanks to [Thermal Grizzly](https://www.thermal-grizzly.com/) for providing a WireView Pro II Noctua Edition unit for development.
 
 ## License
 
