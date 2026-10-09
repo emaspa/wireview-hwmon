@@ -2,7 +2,7 @@
 
 Name:           wireview-hwmon
 # Must match the top-level VERSION file ("make check-version").
-Version:        1.7.1
+Version:        1.7.2
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -129,6 +129,17 @@ dkms status -m %{name} -v %{version} -k "$(uname -r)" 2>/dev/null | grep -q ': i
 dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
 
 %changelog
+* Fri Oct 09 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.7.2-1
+- wireviewd locks the serial port (TIOCEXCL) while it runs, so another
+  program can no longer open it and split the device's replies. A
+  SUSPEND_SERIAL handover lifts the lock and polling takes it back.
+- A disconnected temperature sensor is published as -100.0, the value the
+  device reports, instead of 0.0 in /sensors and wireviewctl sensors --json.
+  LAN viewers showed 0.0 as a real reading. wireviewctl reads any sensor
+  below -40 as absent.
+- Noctua Edition support is now tested on a real unit, provided by Thermal
+  Grizzly.
+
 * Wed Sep 30 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.7.1-1
 - The firmware image is back in the wireview-hwmon package. 1.7.0 had moved
   it to wireview-hwmon-firmware; upgrading removes that package and keeps

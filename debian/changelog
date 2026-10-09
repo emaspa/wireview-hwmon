@@ -1,3 +1,31 @@
+wireview-hwmon (1.7.2~26.04.1) resolute; urgency=medium
+
+  * wireviewd locks the serial port (TIOCEXCL) while it runs, so another
+    program can no longer open it and split the device's replies. A
+    SUSPEND_SERIAL handover lifts the lock and polling takes it back.
+  * A disconnected temperature sensor is published as -100.0, the value the
+    device reports, instead of 0.0 in /sensors and wireviewctl sensors
+    --json. LAN viewers showed 0.0 as a real reading. wireviewctl reads any
+    sensor below -40 as absent.
+  * Noctua Edition support is now tested on a real unit, provided by Thermal
+    Grizzly.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Fri, 09 Oct 2026 19:23:49 +0100
+
+wireview-hwmon (1.7.2~24.04.1) noble; urgency=medium
+
+  * wireviewd locks the serial port (TIOCEXCL) while it runs, so another
+    program can no longer open it and split the device's replies. A
+    SUSPEND_SERIAL handover lifts the lock and polling takes it back.
+  * A disconnected temperature sensor is published as -100.0, the value the
+    device reports, instead of 0.0 in /sensors and wireviewctl sensors
+    --json. LAN viewers showed 0.0 as a real reading. wireviewctl reads any
+    sensor below -40 as absent.
+  * Noctua Edition support is now tested on a real unit, provided by Thermal
+    Grizzly.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Fri, 09 Oct 2026 19:23:49 +0100
+
 wireview-hwmon (1.7.1~26.04.1) resolute; urgency=medium
 
   * The firmware image is back in the wireview-hwmon package. 1.7.0 had

@@ -897,11 +897,15 @@ of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
 
 ### Known issues and small follow-ups
 
-- `wireviewd` logs "device info query failed" once right after a restart and succeeds on the retry two seconds later. ModemManager probing the port was ruled out as the cause.
+- `wireviewd` can log "device info query failed" once right after a restart and succeeds on the retry two seconds later. It happens when the desktop app is running: while the daemon is stopped, the app opens the port itself, and the daemon's first query collides with the app's traffic. From then on the daemon holds the port locked, so the retry gets a clean line.
 - A raw `.bin` firmware must be under 4 MiB, while a `.hex` may fill exactly 4 MiB.
 - The deb postinst runs a bare `udevadm trigger`, which re-triggers every device; it should match only the WireView.
 - A system that once had a 1.6.0 deb installed keeps an empty `/lib.usr-is-merged` directory after purge.
 - In the GUI ([wireview-linux](https://github.com/emaspa/wireview-linux)): the deb and rpm ship the single-file binary and the unused loose libraries side by side, doubling the download; the deb declares no `Depends`; and a second launch while the app sits in the tray exits without raising the window.
+
+## Thanks
+
+Thanks to Thermal Grizzly for providing a WireView Pro II Noctua Edition unit for development.
 
 ## License
 
