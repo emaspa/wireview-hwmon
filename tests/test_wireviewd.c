@@ -1305,7 +1305,7 @@ static void test_sensors_json(void)
 	CHECK(strstr(out, "\"name\":\"WireView Pro II\",\"connected\":true,"
 		     "\"hwRev\":\"EF05\",\"fwVer\":\"7\"") != NULL);
 	CHECK(strstr(out, "\"fwVer\":\"7\",\"buildString\":\"say \\\"hi\\\"\"") != NULL);
-	CHECK(strstr(out, "\"tempInC\":35.5,\"tempOutC\":-40.0,\"ext1C\":0.0,\"ext2C\":0.0") != NULL);
+	CHECK(strstr(out, "\"tempInC\":35.5,\"tempOutC\":-40.0,\"ext1C\":-100.0,\"ext2C\":-100.0") != NULL);
 	CHECK(strstr(out, "\"psuCapW\":450,\"fan\":42,\"faultStatus\":3,\"faultLog\":256") != NULL);
 	CHECK(strstr(out, "\"sumCurrentA\":48.000,\"sumPowerW\":576.000") != NULL);
 	/* Energy in joules, the last key. */

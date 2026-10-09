@@ -902,7 +902,7 @@ def exercise_ctl_json(tmp, port):
           "sensors --json says who wrote it and that the device is live")
     check(d.get("pinVoltage") == [mv / 1000 for mv, _ in PINS] and
           d.get("pinCurrent") == [ma / 1000 for _, ma in PINS] and
-          d.get("tempInC") == 35.5 and d.get("ext1C") == 0.0,
+          d.get("tempInC") == 35.5 and d.get("ext1C") == -100.0,
           "sensors --json converts sysfs units back to V, A and degC",
           json.dumps(d)[:300])
     check(d.get("fan") == 42 and d.get("psuCapW") == 600 and

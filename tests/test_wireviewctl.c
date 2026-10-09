@@ -665,6 +665,16 @@ static void test_parse_remote(void)
 	CHECK_EQ_INT(s[0].fan, 0);
 	CHECK_EQ_INT(s[0].fault_status, 0xFFFF);
 
+	/* A disconnected onboard sensor reads -100.0 like an external one. */
+	static const char body4[] =
+		"{\"devices\":[{\"id\":\"CC\",\"tempInC\":-100.0,\"tempOutC\":31.5,"
+		"\"ext1C\":-100.0,\"ext2C\":0.5}]}";
+	memset(s, 0xAB, sizeof(s));
+	CHECK_EQ_INT(parse_remote("h:1", body4, s, 4), 1);
+	CHECK_EQ_INT(s[0].have_temp, 0xA);
+	CHECK_EQ_INT(s[0].temp_mc[1], 31500);
+	CHECK_EQ_INT(s[0].temp_mc[3], 500);
+
 	/* max caps the number of devices written. */
 	memset(s, 0, sizeof(s));
 	CHECK_EQ_INT(parse_remote("h", body, s, 1), 1);
@@ -1222,8 +1232,8 @@ static void test_sensors_output(void)
 	CHECK(strstr(out, "\"connected\":true") != NULL);
 	CHECK(strstr(out, "\"pinVoltage\":[12.000,12.100,12.200,12.300,12.400,12.500]") != NULL);
 	CHECK(strstr(out, "\"pinCurrent\":[8.000,8.100,8.200,8.300,8.400,8.500]") != NULL);
-	/* An absent temperature is 0.0, as the daemon sends it. */
-	CHECK(strstr(out, "\"tempInC\":35.5,\"tempOutC\":-40.0,\"ext1C\":0.0,\"ext2C\":25.0") != NULL);
+	/* An absent temperature is -100.0, as the daemon sends it. */
+	CHECK(strstr(out, "\"tempInC\":35.5,\"tempOutC\":-40.0,\"ext1C\":-100.0,\"ext2C\":25.0") != NULL);
 	CHECK(strstr(out, "\"psuCapW\":450,\"fan\":42,\"faultStatus\":513,\"faultLog\":65535") != NULL);
 	/* Sums from the pins: 49.5 A and the sum of (12 + 0.1i) * (8 + 0.1i). */
 	CHECK(strstr(out, "\"sumCurrentA\":49.500,\"sumPowerW\":606.550") != NULL);

@@ -1337,14 +1337,16 @@ static int build_sensors_json(char *out, size_t cap)
 		sum_p += pv[i] * pc[i];
 		sum_c += pc[i];
 	}
-	/* Out-of-range readings (sensor disconnected) are sent as 0.0, not
-	 * null: the consumer's WireViewSensorDto declares TempInC/TempOutC/
-	 * Ext1C/Ext2C as plain (non-nullable) double, so null would fail
-	 * deserialization there. */
+	/* Out-of-range readings (sensor disconnected) are sent as -100.0,
+	 * what the device itself reports and the desktop app publishes, not
+	 * null: the app's WireViewSensorDto declares TempInC/TempOutC/Ext1C/
+	 * Ext2C as plain (non-nullable) double, so null would fail
+	 * deserialization there. The app and wireviewctl top read anything
+	 * at or below -100 / -40 as absent. */
 	double t[4];
 	for (int i = 0; i < 4; i++) {
 		int16_t raw = g_last.ts[i];
-		t[i] = (raw < -400 || raw > 2000) ? 0.0 : raw / 10.0;
+		t[i] = (raw < -400 || raw > 2000) ? -100.0 : raw / 10.0;
 	}
 
 	return snprintf(out, cap,

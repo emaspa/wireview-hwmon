@@ -563,7 +563,7 @@ alarm_total_power: 0
   "timestamp": "2026-09-29T14:22:07Z",
   "pinVoltage": [12.120, 12.130, 12.110, 12.120, 12.110, 12.120],
   "pinCurrent": [5.230, 5.450, 5.120, 5.340, 5.560, 5.430],
-  "tempInC": 45.3, "tempOutC": 42.1, "ext1C": 38.7, "ext2C": 0.0,
+  "tempInC": 45.3, "tempOutC": 42.1, "ext1C": 38.7, "ext2C": -100.0,
   "psuCapW": 600, "fan": 75, "faultStatus": 0, "faultLog": 4,
   "sumCurrentA": 32.130, "sumPowerW": 389.363, "energyJ": 1372480.512}]}
 ```
@@ -572,8 +572,8 @@ alarm_total_power: 0
 not running. So do `name` and `hwRev` (`"EF06"`, `"WireView Pro II Noctua
 Edition"`) when the daemon reports the device's product; otherwise `name` is
 `"WireView Pro II"` and `hwRev` is `""`, as an older daemon writes them. A
-disconnected temperature sensor reads `0.0`, `psuCapW` is `0` when unknown,
-and `energyJ` is left out when the module has no `energy1_input`. `connected` is `false` when the module's readings are stale.
+disconnected temperature sensor reads `-100.0`, the value the device reports
+for it. `psuCapW` is `0` when unknown, and `energyJ` is left out when the module has no `energy1_input`. `connected` is `false` when the module's readings are stale.
 Without the module the command prints `{"devices":[]}` (with `host` and
 `appVersion`) and exits 1.
 

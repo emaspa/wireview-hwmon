@@ -1912,15 +1912,15 @@ static void parse_device(const char *hostport, const char *obj, struct wv_snap *
 		s->have_power |= 1u;
 	}
 
-	/* Onboard sensors count as present at 0.0. Disconnected externals
-	 * read 0.0 (daemon clamp) or a deeply negative sentinel (~-100, app
-	 * publisher) — treat both as "not present". -40.0 is the lowest
-	 * reading the daemon publishes, so keep it. */
+	/* A disconnected sensor reads -100.0 (wireviewd after 1.7.1, the
+	 * desktop app); older daemons sent 0.0, so an external at 0.0 is
+	 * also "not present". Onboard sensors count as present at 0.0.
+	 * -40.0 is the lowest real reading published, so keep it. */
 	static const char *const tkeys[4] = { "tempInC", "tempOutC", "ext1C", "ext2C" };
 	for (int i = 0; i < 4; i++) {
 		if (!js_num(obj, tkeys[i], &d))
 			continue;
-		if (i >= 2 && (d == 0.0 || d < -40.0))
+		if (d < -40.0 || (i >= 2 && d == 0.0))
 			continue;
 		s->temp_mc[i] = to_ll(d * 1000.0);
 		s->have_temp |= 1u << i;
@@ -2364,7 +2364,7 @@ static void print_sensors_json(const struct wv_snap *s)
 			sum_c += pc[i];
 		}
 		for (int i = 0; i < 4; i++)
-			t[i] = (s->have_temp & (1u << i)) ? s->temp_mc[i] / 1000.0 : 0.0;
+			t[i] = (s->have_temp & (1u << i)) ? s->temp_mc[i] / 1000.0 : -100.0;
 
 		printf("{\"id\":\"%s\",\"name\":\"%s\",\"connected\":%s,"
 		       "\"hwRev\":\"%s\",\"fwVer\":\"%s\",\"buildString\":\"%s\",\"timestamp\":\"%s\","
