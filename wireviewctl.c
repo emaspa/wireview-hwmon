@@ -1163,9 +1163,12 @@ static int dfu_device_present(void)
 }
 
 /* Firmware image bundled with the wireview-hwmon package ("make install"
- * and all distro packages place it here). Used when "flash" is given no
- * file argument, so "wireviewctl flash -y" is a complete headless update. */
+ * and all distro packages place it here; the Nix package passes its store
+ * path with -D). Used when "flash" is given no file argument, so
+ * "wireviewctl flash -y" is a complete headless update. */
+#ifndef DEFAULT_FIRMWARE_PATH
 #define DEFAULT_FIRMWARE_PATH "/usr/share/wireview/TG-WV-PRO2-FW.hex"
+#endif
 
 /*
  * yes skips the confirmation prompt; force overrides the product and build

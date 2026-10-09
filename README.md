@@ -68,12 +68,48 @@ Verify with `sensors` (or `wireviewctl info`); a `wireview`-named hwmon device s
 
 DKMS needs the matching kernel headers (`linux-headers`, `linux-cachyos-headers`, …) installed; the module then rebuilds automatically on kernel updates.
 
+### NixOS (flake)
+
+The repository is a flake with a NixOS module. It builds the kernel module for
+the kernel in `boot.kernelPackages`, loads it at boot, installs the udev rules
+and runs `wireviewd`:
+
+```nix
+{
+  inputs.wireview-hwmon.url = "github:emaspa/wireview-hwmon";
+
+  outputs = { nixpkgs, wireview-hwmon, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        wireview-hwmon.nixosModules.default
+        {
+          services.wireview-hwmon.enable = true;
+          # Privileged daemon commands: config writes, flashing, the GUI's log reads
+          users.users.alice.extraGroups = [ "wireview" ];
+        }
+      ];
+    };
+  };
+}
+```
+
+`wireviewctl flash` finds the bundled firmware in the Nix store and has
+`dfu-util` on its path. The optional daemon config goes in
+`/etc/wireview/config`, which the module does not generate because it may hold
+the LAN secret. `nix build github:emaspa/wireview-hwmon` builds the daemon and
+CLI alone. The package is marked unfree because it bundles Thermal Grizzly's
+firmware image. The flake allows it on its own, so no `allowUnfree` setting is
+needed.
+
 > **Immutable / atomic distros** (Bazzite, Silverblue, Kinoite) are not supported for the kernel module - DKMS doesn't fit rpm-ostree. On those, run the [WireView GUI Flatpak](https://github.com/emaspa/wireview-linux) in direct-serial mode, which doesn't need this module.
 
 ### Firmware image
 
 `wireviewctl flash` with no file argument flashes Thermal Grizzly's official
-firmware image from `/usr/share/wireview/TG-WV-PRO2-FW.hex`: v05, build
+firmware image from `/usr/share/wireview/TG-WV-PRO2-FW.hex`, or from the
+package in the Nix store on NixOS: v05, build
 `TG-WV-PRO2-FW_20260902_0741`, from the upstream WireView2 1.0.8 Windows
 release. The one image serves both the WireView Pro II and the Noctua Edition.
 It comes with the `wireview-hwmon` package and with `make install`. The image
