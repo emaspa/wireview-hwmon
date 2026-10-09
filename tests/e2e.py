@@ -20,6 +20,7 @@ Environment: CC (default cc), SAN_FLAGS (extra compiler flags, e.g. ASan),
 WIREVIEW_E2E_KEEP=1 keeps the temp dir.
 """
 
+import errno
 import glob
 import grp
 import http.client
@@ -505,6 +506,27 @@ def exercise(tmp, dev, daemon, hwmon, sock):
           lambda: dev.writes_of(fd.CMD_NVM_CONFIG)) ==
           [b"\x55\xaa\x55\xaa\x02"],
           "privileged NVM store reaches the device", f"status {status}")
+
+    # The daemon locks the port (TIOCEXCL); a handover lifts the lock.
+    def open_errno():
+        try:
+            os.close(os.open(dev.path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK))
+            return 0
+        except OSError as e:
+            return e.errno
+    err = open_errno()
+    check(err == errno.EBUSY, "a second open of the port is refused while "
+          "the daemon polls", os.strerror(err) if err else "opened")
+    status, _ = request(sock, WCMD_SUSPEND_SERIAL, struct.pack("<H", 5))
+    err = open_errno()
+    check(status == RESP_OK and err == 0,
+          "the port opens during a SUSPEND_SERIAL handover",
+          f"status {status}, {os.strerror(err) if err else 'opened'}")
+    status, _ = request(sock, WCMD_RESUME_SERIAL)
+    err = open_errno()
+    check(status == RESP_OK and err == errno.EBUSY,
+          "the port is locked again after RESUME_SERIAL",
+          f"status {status}, {os.strerror(err) if err else 'opened'}")
 
     # A corrupt frame is dropped and audited; polling carries on.
     polls = dev.polls

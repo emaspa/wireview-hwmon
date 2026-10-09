@@ -436,6 +436,27 @@ static int find_device(char *path, size_t path_len)
 	return -1;
 }
 
+/* Exclusive use of the tty (TIOCEXCL): other non-root openers get EBUSY
+ * instead of sharing the byte stream. A second reader splits the device's
+ * replies between the two processes, and opening the port makes the device
+ * send its welcome string into ours. The flag belongs to the tty, not to
+ * this fd, so a serial handover clears it for the GUI (whose .NET runtime
+ * sets and clears it on each open/close) and the poll loop takes it back. */
+static void serial_set_exclusive(int fd, int on)
+{
+	if (fd >= 0)
+		ioctl(fd, on ? TIOCEXCL : TIOCNXCL);
+}
+
+/* Close the port, releasing the lock first: the tty can outlive this fd
+ * (a pty while its master is open), and a non-root daemon could not
+ * reopen a port it left locked. */
+static void close_serial(int fd)
+{
+	serial_set_exclusive(fd, 0);
+	close(fd);
+}
+
 /* Open serial port with WireView settings: 115200 8N1 */
 static int open_serial(const char *path)
 {
@@ -468,6 +489,7 @@ static int open_serial(const char *path)
 	}
 
 	tcflush(fd, TCIOFLUSH);
+	serial_set_exclusive(fd, 1);
 	return fd;
 }
 
@@ -939,6 +961,9 @@ static void handle_client_request(const struct client *c, int serial_fd)
 		/* This connection is not idle-closed until the handover
 		 * ends (see client_idle_left()). */
 		g_suspend_owner = c->id;
+		/* Before the reply: the GUI opens the port as soon as it
+		 * reads RESP_OK. */
+		serial_set_exclusive(serial_fd, 0);
 		wlog("INFO", "serial suspended for %d s (GUI direct access)", secs);
 		send_response(client_fd, RESP_OK, NULL, 0);
 		return;
@@ -948,6 +973,7 @@ static void handle_client_request(const struct client *c, int serial_fd)
 		g_suspend_until.tv_nsec = 0;
 		g_suspend_owner = 0;
 		tcflush(serial_fd, TCIFLUSH);
+		serial_set_exclusive(serial_fd, 1);
 		wlog("INFO", "serial resumed");
 		send_response(client_fd, RESP_OK, NULL, 0);
 		return;
@@ -2406,7 +2432,7 @@ static long device_connect(const char *user_dev_path, char *dev_path,
 	if (hfd < 0) {
 		fprintf(stderr, "wireviewd: failed to open %s: %s\n",
 			HWMON_DEV, strerror(errno));
-		close(sfd);
+		close_serial(sfd);
 		return 5000;
 	}
 
@@ -2420,7 +2446,7 @@ static long device_connect(const char *user_dev_path, char *dev_path,
 		else
 			fprintf(stderr, "wireviewd: device info query failed\n");
 		close(hfd);
-		close(sfd);
+		close_serial(sfd);
 		dev_path[0] = '\0';
 		return 2000;
 	}
@@ -2718,6 +2744,10 @@ int main(int argc, char **argv)
 				tcflush(serial_fd, TCIFLUSH);
 				was_suspended = 0;
 			}
+			/* Every poll, not only after a handover: an expired
+			 * handover never sends RESUME, and the GUI's close
+			 * clears the flag whenever it happens. */
+			serial_set_exclusive(serial_fd, 1);
 
 			struct sensor_struct ss;
 			if (read_sensors(serial_fd, &ss) < 0) {
@@ -2789,7 +2819,7 @@ disconnect:
 		 * clients, and retry from the poll loop in 2 s. */
 		g_serial_fd = -1;
 		close(hwmon_fd);
-		close(serial_fd);
+		close_serial(serial_fd);
 		hwmon_fd = -1;
 		serial_fd = -1;
 		dev_path[0] = '\0';
@@ -2814,7 +2844,7 @@ disconnect:
 	if (serial_fd >= 0) {
 		g_serial_fd = -1;
 		close(hwmon_fd);
-		close(serial_fd);
+		close_serial(serial_fd);
 	}
 
 	if (http_fd >= 0)

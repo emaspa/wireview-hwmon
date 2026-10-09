@@ -670,7 +670,7 @@ handover. Idle disconnects and replacements are logged in the
 ## Notes
 
 - When used with the wireview-linux app, the daemon handles the serial port and the app communicates through hwmon (sensors) and the daemon socket (commands). Both can run simultaneously.
-- When used standalone (without the app), the daemon owns the serial port exclusively.
+- The daemon locks the serial port while it runs: other programs that do not run as root get "Device or resource busy" instead of sharing the device's replies. The app's log reads and theme uploads borrow the port through SUSPEND_SERIAL, which lifts the lock until the handover ends.
 - If the device is disconnected, the daemon will wait and reconnect automatically. The command socket and the LAN listener keep serving meanwhile.
 - Sensor readings become stale (report N/A) if no data is received for 5 seconds.
 
