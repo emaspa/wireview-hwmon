@@ -2,7 +2,7 @@
 
 Linux hwmon driver and daemon for the [Thermal Grizzly WireView Pro II](https://www.thermal-grizzly.com/en/wireview-pro-ii-gpu/s-tg-wv-p2) power monitor. Exposes voltage, current, power, and temperature sensor data through the standard Linux hwmon subsystem.
 
-Both editions of the WireView Pro II are supported: the original and the WireView Pro II Noctua Edition, which speaks the same protocol. The WireView II and its Phanteks Edition are different devices and are not supported yet; the daemon says so once in its log and does not drive them.
+Both editions of the WireView Pro II are supported: the original and the WireView Pro II Noctua Edition, which speaks the same protocol.
 
 Works standalone or alongside the [wireview-linux](https://github.com/emaspa/wireview-linux) GUI application. When both are used together, the app reads sensor data from hwmon and sends commands through the daemon's Unix socket - giving you full app functionality plus system-wide sensor integration.
 
@@ -885,11 +885,6 @@ of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
   `/sensors` schema already has a `devices[]` array, but the daemon handles one
   device: this needs a misc node per device or a device id in the record, and a
   decision on how the hwmon devices are named.
-- **WireView II and its Phanteks Edition** (deferred, products `EF07` and
-  `EF08`). They are a different device: a 104-byte sensor frame with a fan
-  tachometer, two temperature sensors, their own config layout and no display
-  commands. `wireviewd` refuses them with a clear message until hardware or
-  captures are available to test against.
 - **Remote readings on a par with local ones**: carry average voltage, Vdd and
   the alarms in `GET /sensors`, so `wireviewctl --host h sensors` prints what
   the local command does.
