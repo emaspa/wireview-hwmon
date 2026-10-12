@@ -35,9 +35,10 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(MDIR) clean
 	rm -f wireviewd wireviewctl
 
-# Arch-based distros have no dialout group, their serial group is uucp. udev
-# drops a rule line whose group it cannot resolve, so the installed rules name
-# uucp there.
+# Arch-based distros have no dialout group, their serial group is uucp. The
+# serial port gets it from the distro's default rules; the DFU bootloader's
+# line names dialout, which udev drops where that group does not exist, so the
+# installed rules name uucp there.
 install: all
 	$(MAKE) -C $(KDIR) M=$(MDIR) modules_install
 	depmod -a

@@ -6,17 +6,21 @@
 # the uaccess builtin itself. The tag is still needed: logind uses it to move
 # the ACL to the new active session on a user switch.
 #
-# Arch-based distros have no dialout group (their serial group is uucp), and
-# udev drops a whole rule line whose GROUP it cannot resolve. The AUR package
-# and "make install" replace dialout with uucp there. Do the same in the two
-# GROUP keys below when installing this file by hand.
+# The serial port keeps the distro's own serial group from
+# 50-udev-default.rules (dialout on Debian, Ubuntu and Fedora, uucp on
+# Arch-based distros), so this file sets no group on it and installs unchanged
+# everywhere. The DFU bootloader is a USB device, which has no serial group by
+# default. Its GROUP sits on a line of its own because udev drops a whole rule
+# line whose group it cannot resolve: on a distro without dialout only that
+# line goes, and the seat ACL still works. The AUR package and "make install"
+# replace dialout with uucp on Arch-based distros.
 
 ACTION=="remove", GOTO="wireview_end"
 
 # Serial port (CDC-ACM). wireviewd runs as root and needs nothing here. The
-# dialout group and the seat user get access so the GUI app can drive the port
+# serial group and the seat user get access so the GUI app can drive the port
 # directly without the daemon.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", GROUP="dialout", MODE="0660", TAG+="uaccess", RUN{builtin}+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", MODE="0660", TAG+="uaccess", RUN{builtin}+="uaccess"
 
 # Keep ModemManager away. It treats every new CDC-ACM port as a possible
 # modem and probes it with AT and QCDM commands for about half a minute,
@@ -28,7 +32,8 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", ENV{ID_MM_P
 # STM32 DFU bootloader (the device after `wireviewctl bootloader`). Same
 # access policy as the serial port, so `wireviewctl flash` can run dfu-util
 # as the seat user instead of root.
-SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0483", ATTR{idProduct}=="df11", GROUP="dialout", MODE="0660", TAG+="uaccess", RUN{builtin}+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0483", ATTR{idProduct}=="df11", MODE="0660", TAG+="uaccess", RUN{builtin}+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0483", ATTR{idProduct}=="df11", GROUP="dialout"
 
 # /dev/wireview-hwmon needs no rule. Anything that can write to it can inject
 # fake sensor readings into hwmon, and the only writer is wireviewd, which

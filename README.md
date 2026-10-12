@@ -492,8 +492,8 @@ needs.
 ### Device access (udev)
 
 The udev rules give the serial port (`0483:5740`) and the STM32 DFU bootloader
-(`0483:df11`, the device after `wireviewctl bootloader`) mode `660`, group
-`dialout`, plus an ACL for the user logged in at the local seat (`uaccess`). In
+(`0483:df11`, the device after `wireviewctl bootloader`) mode `660` in the
+serial group, plus an ACL for the user logged in at the local seat (`uaccess`). In
 a local desktop session the GUI app's direct-serial mode, `wireviewctl flash`
 and `dfu-util` therefore work without sudo. SSH and other remote sessions get
 no seat ACL; join the serial group and log in again:
@@ -506,8 +506,10 @@ sudo usermod -aG dialout $USER
 sudo usermod -aG uucp $USER
 ```
 
-Arch-based distros have no `dialout` group. The AUR package and `make install`
-write the rules with their serial group `uucp` instead.
+The serial group is `dialout`, or `uucp` on Arch-based distros. The serial port
+gets it from the distro's own udev rules, so the rules file works unchanged
+everywhere. The DFU bootloader line names `dialout`, and the AUR package and
+`make install` change it to `uucp` on Arch.
 
 `/dev/wireview-hwmon`, the node wireviewd feeds readings into, is root-only
 (`600`) on purpose: anything that can write to it can inject fake readings into
