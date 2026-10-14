@@ -26,6 +26,10 @@
 #include <sys/un.h>
 #include <sys/time.h>
 #include <sys/random.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <strings.h>
+#include <grp.h>
 #include <linux/limits.h>
 
 #include "sha256.h"
@@ -48,6 +52,7 @@
 #define WCMD_NVM_CMD           0x06
 #define WCMD_READ_BUILD        0x07
 #define WCMD_ENTER_BOOTLOADER  0x08
+#define WCMD_RELOAD_CONFIG     0x0B	/* re-read /etc/wireview/config */
 
 /* Response status */
 #define RESP_OK            0
@@ -56,8 +61,9 @@
 #define RESP_DENIED        3	/* privileged command, peer not root or in "wireview" */
 
 /* sock_command() return values other than 0 */
-#define SOCK_FAIL   (-1)
-#define SOCK_DENIED (-2)
+#define SOCK_FAIL     (-1)
+#define SOCK_DENIED   (-2)
+#define SOCK_NODAEMON (-3)	/* no daemon listening on the socket */
 
 /* Global options. With --host, commands go to that host's wireviewd over
  * HTTP (writes signed with the shared secret) instead of the local socket. */
@@ -70,25 +76,33 @@ static int remote_info(int build_only);
 static int remote_read_config(void);
 static void b64_encode(const uint8_t *in, size_t len, char *out);
 
-static int sock_connect(void)
+/* Connect to the daemon socket. Returns the fd, SOCK_NODAEMON when no
+ * daemon listens there (no socket, or nothing accepting on it), or
+ * SOCK_FAIL. Prints why unless quiet, which only silences SOCK_NODAEMON. */
+static int sock_open(int quiet)
 {
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
 		perror("socket");
-		return -1;
+		return SOCK_FAIL;
 	}
 
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
 	strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
 
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		if (errno == ENOENT || errno == ECONNREFUSED)
-			fprintf(stderr, "wireviewctl: cannot connect to daemon at %s\n"
-				"Is wireviewd running?\n", SOCK_PATH);
-		else
+		int rc = SOCK_FAIL;
+
+		if (errno == ENOENT || errno == ECONNREFUSED) {
+			rc = SOCK_NODAEMON;
+			if (!quiet)
+				fprintf(stderr, "wireviewctl: cannot connect to daemon at %s\n"
+					"Is wireviewd running?\n", SOCK_PATH);
+		} else {
 			perror("connect");
+		}
 		close(fd);
-		return -1;
+		return rc;
 	}
 
 	/* Set 3 second timeout */
@@ -99,17 +113,20 @@ static int sock_connect(void)
 	return fd;
 }
 
-/* Send request and receive response. Returns 0 on success, SOCK_DENIED if
- * the daemon refused a privileged command, SOCK_FAIL on any other failure
- * (both negative, so callers can test "< 0").
- * On success, *resp_buf is malloc'd and must be freed, *resp_len is set.
- * On failure, *resp_buf is NULL. */
-static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
-			uint8_t **resp_buf, uint16_t *resp_len)
+/* One request and its response, whatever the status. Returns 0 with
+ * *status set and *resp_buf malloc'd (NUL-terminated past *resp_len, so a
+ * text reply can be printed as is; free it), or SOCK_NODAEMON / SOCK_FAIL
+ * from sock_open() (quiet as there) or a failed transfer (printed). */
+static int sock_exchange(uint8_t cmd, const void *payload, uint16_t payload_len,
+			 int quiet, uint8_t *status,
+			 uint8_t **resp_buf, uint16_t *resp_len)
 {
-	int fd = sock_connect();
+	*resp_buf = NULL;
+	*resp_len = 0;
+
+	int fd = sock_open(quiet);
 	if (fd < 0)
-		return SOCK_FAIL;
+		return fd;
 
 	/* Send: [cmd:1][len:2 LE][payload] */
 	uint8_t hdr[3] = { cmd, payload_len & 0xFF, payload_len >> 8 };
@@ -133,30 +150,55 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 		off += n;
 	}
 
-	uint8_t status = rhdr[0];
 	uint16_t rlen = rhdr[1] | (rhdr[2] << 8);
 
-	uint8_t *data = NULL;
-	if (rlen > 0) {
-		data = calloc(1, rlen);
-		if (!data) {
+	uint8_t *data = calloc(1, (size_t)rlen + 1);
+	if (!data) {
+		close(fd);
+		return SOCK_FAIL;
+	}
+	off = 0;
+	while (off < rlen) {
+		n = read(fd, data + off, rlen - off);
+		if (n <= 0) {
+			perror("read data");
+			free(data);
 			close(fd);
 			return SOCK_FAIL;
 		}
-		off = 0;
-		while (off < rlen) {
-			n = read(fd, data + off, rlen - off);
-			if (n <= 0) {
-				perror("read data");
-				free(data);
-				close(fd);
-				return SOCK_FAIL;
-			}
-			off += n;
-		}
+		off += n;
 	}
 
 	close(fd);
+	*status = rhdr[0];
+	*resp_buf = data;
+	*resp_len = rlen;
+	return 0;
+}
+
+/* Print why the daemon refused a privileged command. */
+static void denied_message(void)
+{
+	fprintf(stderr, "wireviewctl: permission denied: this command needs root "
+			"or membership of the 'wireview' group\n"
+			"(sudo usermod -aG wireview $USER, no re-login needed, membership is checked per connection)\n");
+}
+
+/* Send request and receive response. Returns 0 on success, SOCK_DENIED if
+ * the daemon refused a privileged command, SOCK_FAIL on any other failure
+ * (both negative, so callers can test "< 0").
+ * On success, *resp_buf is malloc'd and must be freed, *resp_len is set
+ * (*resp_buf is NULL for an empty reply).
+ * On failure, *resp_buf is NULL. */
+static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
+			uint8_t **resp_buf, uint16_t *resp_len)
+{
+	uint8_t status, *data;
+	uint16_t rlen;
+
+	*resp_buf = NULL;
+	if (sock_exchange(cmd, payload, payload_len, 0, &status, &data, &rlen) < 0)
+		return SOCK_FAIL;
 
 	if (status == RESP_NOT_CONNECTED) {
 		fprintf(stderr, "wireviewctl: device not connected\n");
@@ -169,9 +211,7 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 		return SOCK_FAIL;
 	}
 	if (status == RESP_DENIED) {
-		fprintf(stderr, "wireviewctl: permission denied: this command needs root "
-				"or membership of the 'wireview' group\n"
-				"(sudo usermod -aG wireview $USER, no re-login needed, membership is checked per connection)\n");
+		denied_message();
 		free(data);
 		return SOCK_DENIED;
 	}
@@ -181,6 +221,10 @@ static int sock_command(uint8_t cmd, const void *payload, uint16_t payload_len,
 		return SOCK_FAIL;
 	}
 
+	if (rlen == 0) {
+		free(data);
+		data = NULL;
+	}
 	*resp_buf = data;
 	*resp_len = rlen;
 	return 0;
@@ -2661,6 +2705,688 @@ static int cmd_top(int argc, char **argv)
 	return 0;
 }
 
+/* ---------- Daemon settings (config) ---------- */
+
+/*
+ * "wireviewctl config" shows and edits wireviewd's settings file and asks
+ * the daemon to apply it (WCMD_RELOAD_CONFIG). The packages make the file
+ * root:wireview 0660 in a root:wireview 0750 directory: group members can
+ * rewrite it in place but not create or rename files next to it, so it is
+ * never replaced through a temporary file. Local only: the daemon's LAN
+ * listener has no settings endpoint.
+ */
+#ifndef CONFIG_PATH
+#define CONFIG_PATH "/etc/wireview/config"
+#endif
+
+static const char *g_config_path = CONFIG_PATH;	/* a variable for the tests */
+
+/* The keys wireviewd reads, in the order of the installed sample. */
+static const char *const cfg_keys[] = {
+	"remote_enabled", "port", "bind", "secret", "log_days",
+};
+#define CFG_NKEYS   5
+#define CFG_REMOTE  0	/* indexes into cfg_keys */
+#define CFG_PORT    1
+#define CFG_BIND    2
+#define CFG_SECRET  3
+#define CFG_LOGDAYS 4
+#define CFG_VALMAX 192		/* wireviewd reads lines of up to 191 bytes */
+#define CFG_SECRET_MAX 127	/* wireviewd keeps this much of a secret */
+#define CFG_FILE_MAX (64 * 1024)
+
+static const char *const cfg_defaults[CFG_NKEYS] = { "0", "9876", "", "", "14" };
+
+static int cfg_key_index(const char *k)
+{
+	for (int i = 0; i < CFG_NKEYS; i++)
+		if (strcmp(k, cfg_keys[i]) == 0)
+			return i;
+	return -1;
+}
+
+/* wireviewd's truthy(): only the first character counts. */
+static int cfg_truthy(const char *s)
+{
+	return s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y';
+}
+
+enum { CFG_LINE_NONE, CFG_LINE_KV, CFG_LINE_BARE };
+
+/*
+ * Split one line (no newline) the way wireviewd's config_read() does:
+ * blank and '#' lines are CFG_LINE_NONE, "key = value" is CFG_LINE_KV with
+ * blanks trimmed around the key and the value, and anything else is
+ * CFG_LINE_BARE (a secret, in the old one-line format), its text in val.
+ */
+static int cfg_split(const char *line, size_t len, char *key, size_t kcap,
+		     char *val, size_t vcap)
+{
+	while (len && (line[len - 1] == '\r' || line[len - 1] == ' ' ||
+		       line[len - 1] == '\t'))
+		len--;
+	while (len && (*line == ' ' || *line == '\t')) {
+		line++;
+		len--;
+	}
+	key[0] = val[0] = '\0';
+	if (len == 0 || *line == '#')
+		return CFG_LINE_NONE;
+
+	const char *eq = memchr(line, '=', len);
+	if (!eq) {
+		snprintf(val, vcap, "%.*s", (int)len, line);
+		return CFG_LINE_BARE;
+	}
+	const char *kend = eq;
+	while (kend > line && (kend[-1] == ' ' || kend[-1] == '\t'))
+		kend--;
+	snprintf(key, kcap, "%.*s", (int)(kend - line), line);
+	const char *v = eq + 1, *end = line + len;
+	while (v < end && (*v == ' ' || *v == '\t'))
+		v++;
+	snprintf(val, vcap, "%.*s", (int)(end - v), v);
+	return CFG_LINE_KV;
+}
+
+/* The index of the known key a commented-out line sets ("#bind=",
+ * "# secret = x", as the sample has them), or -1. */
+static int cfg_commented_key(const char *line, size_t len)
+{
+	char key[64], val[8];
+
+	while (len && (*line == ' ' || *line == '\t')) {
+		line++;
+		len--;
+	}
+	if (len == 0 || *line != '#')
+		return -1;
+	line++;
+	len--;
+	if (cfg_split(line, len, key, sizeof(key), val, sizeof(val)) != CFG_LINE_KV)
+		return -1;
+	return cfg_key_index(key);
+}
+
+/* Which known key line (index) an active line sets, -1 for none. A bare
+ * line counts as a secret line. */
+static int cfg_line_key(const char *line, size_t len)
+{
+	char key[64], val[8];
+
+	switch (cfg_split(line, len, key, sizeof(key), val, sizeof(val))) {
+	case CFG_LINE_KV:
+		return cfg_key_index(key);
+	case CFG_LINE_BARE:
+		return CFG_SECRET;
+	default:
+		return -1;
+	}
+}
+
+/* The next line of text from *pos: its start and length without the
+ * newline. Returns 0 at the end. */
+static int cfg_next_line(const char *text, size_t *pos, const char **line, size_t *len)
+{
+	const char *s = text + *pos;
+
+	if (!*s)
+		return 0;
+	const char *nl = strchr(s, '\n');
+	*line = s;
+	*len = nl ? (size_t)(nl - s) : strlen(s);
+	*pos += *len + (nl ? 1 : 0);
+	return 1;
+}
+
+/*
+ * Print the settings wireviewd takes from text as key=value lines: the
+ * known keys in the sample's order with the value the daemon would use
+ * (the default when the file leaves a key out or has an unusable value,
+ * the last line of a key, except the secret, where the first non-empty
+ * one wins, as wireviewd reads it), then key=value lines with other keys
+ * as they are. The secret is masked unless show_secret.
+ */
+static void cfg_show(const char *text, int show_secret, FILE *out)
+{
+	char eff[CFG_NKEYS][CFG_VALMAX];
+	char key[CFG_VALMAX], val[CFG_VALMAX];
+	const char *line;
+	size_t len, pos = 0;
+
+	for (int i = 0; i < CFG_NKEYS; i++)
+		snprintf(eff[i], sizeof(eff[i]), "%s", cfg_defaults[i]);
+
+	while (cfg_next_line(text, &pos, &line, &len)) {
+		int t = cfg_split(line, len, key, sizeof(key), val, sizeof(val));
+		int k = t == CFG_LINE_KV ? cfg_key_index(key) :
+			t == CFG_LINE_BARE ? CFG_SECRET : -1;
+
+		if (k < 0)
+			continue;
+		if (k == CFG_REMOTE) {
+			snprintf(eff[k], sizeof(eff[k]), "%d", cfg_truthy(val));
+		} else if (k == CFG_PORT) {
+			int p = atoi(val);
+			if (p > 0 && p < 65536)
+				snprintf(eff[k], sizeof(eff[k]), "%d", p);
+		} else if (k == CFG_BIND) {
+			snprintf(eff[k], sizeof(eff[k]), "%s", val);
+		} else if (k == CFG_SECRET) {
+			if (!eff[k][0])
+				snprintf(eff[k], sizeof(eff[k]), "%.*s", CFG_SECRET_MAX, val);
+		} else {
+			snprintf(eff[k], sizeof(eff[k]), "%d", atoi(val));
+		}
+	}
+
+	for (int i = 0; i < CFG_NKEYS; i++) {
+		if (i == CFG_SECRET && !show_secret && eff[i][0])
+			fprintf(out, "%s=********\n", cfg_keys[i]);
+		else
+			fprintf(out, "%s=%s\n", cfg_keys[i], eff[i]);
+	}
+
+	pos = 0;
+	while (cfg_next_line(text, &pos, &line, &len))
+		if (cfg_split(line, len, key, sizeof(key), val, sizeof(val)) == CFG_LINE_KV &&
+		    cfg_key_index(key) < 0)
+			fprintf(out, "%s=%s\n", key, val);
+	explicit_bzero(eff, sizeof(eff));
+	explicit_bzero(val, sizeof(val));
+}
+
+static int cfg_digits(const char *s)
+{
+	if (!*s)
+		return 0;
+	for (; *s; s++)
+		if (*s < '0' || *s > '9')
+			return 0;
+	return 1;
+}
+
+/*
+ * Check the value for cfg_keys[k] and write its normalised form to out
+ * (CFG_VALMAX bytes). Returns 0, or -1 after printing why. The limits are
+ * what wireviewd accepts and runs with: a port below 1024 needs a
+ * capability the service does not have, and a bind= that is not numeric
+ * would leave the listener off.
+ */
+static int cfg_validate(int k, const char *v, char *out)
+{
+	switch (k) {
+	case CFG_REMOTE: {
+		static const char *const on[] = { "1", "on", "true" };
+		static const char *const off[] = { "0", "off", "false" };
+
+		for (int i = 0; i < 3; i++) {
+			if (strcasecmp(v, on[i]) == 0) {
+				snprintf(out, CFG_VALMAX, "1");
+				return 0;
+			}
+			if (strcasecmp(v, off[i]) == 0) {
+				snprintf(out, CFG_VALMAX, "0");
+				return 0;
+			}
+		}
+		fprintf(stderr, "wireviewctl: remote_enabled must be 0 or 1 (or on/off, true/false), not '%s'\n", v);
+		return -1;
+	}
+	case CFG_PORT: {
+		long p = cfg_digits(v) && strlen(v) <= 5 ? strtol(v, NULL, 10) : -1;
+
+		if (p < 1024 || p > 65535) {
+			fprintf(stderr, "wireviewctl: port must be a number from 1024 to 65535, not '%s'\n", v);
+			return -1;
+		}
+		snprintf(out, CFG_VALMAX, "%ld", p);
+		return 0;
+	}
+	case CFG_BIND: {
+		struct addrinfo hints, *res;
+
+		if (!*v) {
+			out[0] = '\0';
+			return 0;
+		}
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_flags = AI_NUMERICHOST;
+		if (strlen(v) >= CFG_VALMAX || getaddrinfo(v, NULL, &hints, &res) != 0) {
+			fprintf(stderr, "wireviewctl: bind must be empty (all addresses) or a numeric "
+				"IPv4 or IPv6 address such as 127.0.0.1 or ::1, not '%s'\n", v);
+			return -1;
+		}
+		freeaddrinfo(res);
+		snprintf(out, CFG_VALMAX, "%s", v);
+		return 0;
+	}
+	case CFG_SECRET: {
+		size_t n = strlen(v);
+
+		for (const char *p = v; *p; p++) {
+			if ((unsigned char)*p < 0x20 || *p == 0x7f) {
+				fprintf(stderr, "wireviewctl: secret must be one line of text, "
+					"without control characters\n");
+				return -1;
+			}
+		}
+		/* wireviewd trims these, so the daemon and the clients that
+		 * sign with the secret would disagree. */
+		if (n && (v[0] == ' ' || v[n - 1] == ' ')) {
+			fprintf(stderr, "wireviewctl: secret must not start or end with a space\n");
+			return -1;
+		}
+		if (n > CFG_SECRET_MAX) {
+			fprintf(stderr, "wireviewctl: secret is %zu bytes; wireviewd uses at most %d\n",
+				n, CFG_SECRET_MAX);
+			return -1;
+		}
+		snprintf(out, CFG_VALMAX, "%s", v);
+		return 0;
+	}
+	default: {	/* CFG_LOGDAYS */
+		long d = cfg_digits(v) && strlen(v) <= 4 ? strtol(v, NULL, 10) : -1;
+
+		if (d < 0 || d > 3650) {
+			fprintf(stderr, "wireviewctl: log_days must be a number from 0 (keep all) "
+				"to 3650, not '%s'\n", v);
+			return -1;
+		}
+		snprintf(out, CFG_VALMAX, "%ld", d);
+		return 0;
+	}
+	}
+}
+
+/*
+ * text with each key that has a vals[k] set to it. A key's line replaces
+ * its first active line (for the secret, also a bare-line secret), or
+ * else its first commented-out line ("#secret=" in the sample); further
+ * active lines of that key are dropped, since wireviewd would otherwise
+ * read one of them instead (a later port= wins, an earlier secret does).
+ * A key the file has no line for is appended. Everything else (comments,
+ * blank lines, unknown keys, the order) stays as it is. Returns a malloc'd
+ * string, or NULL when out of memory.
+ */
+static char *cfg_rewrite(const char *text, const char *const vals[CFG_NKEYS])
+{
+	size_t first_active[CFG_NKEYS], first_commented[CFG_NKEYS], target[CFG_NKEYS];
+	const size_t none = (size_t)-1;
+	const char *line;
+	size_t len, pos = 0, ln = 0, cap = strlen(text) + 1;
+
+	for (int k = 0; k < CFG_NKEYS; k++) {
+		first_active[k] = first_commented[k] = none;
+		if (vals[k])
+			cap += strlen(cfg_keys[k]) + strlen(vals[k]) + 3;
+	}
+	while (cfg_next_line(text, &pos, &line, &len)) {
+		int k = cfg_line_key(line, len);
+		int c = cfg_commented_key(line, len);
+
+		if (k >= 0 && first_active[k] == none)
+			first_active[k] = ln;
+		if (c >= 0 && first_commented[c] == none)
+			first_commented[c] = ln;
+		ln++;
+	}
+	for (int k = 0; k < CFG_NKEYS; k++)
+		target[k] = first_active[k] != none ? first_active[k] : first_commented[k];
+
+	char *out = malloc(cap + 1);
+	if (!out)
+		return NULL;
+	size_t o = 0;
+
+	pos = ln = 0;
+	while (cfg_next_line(text, &pos, &line, &len)) {
+		int k = cfg_line_key(line, len), keep = 1;
+
+		for (int j = 0; j < CFG_NKEYS; j++) {
+			if (!vals[j])
+				continue;
+			if (target[j] == ln) {
+				o += (size_t)sprintf(out + o, "%s=%s\n", cfg_keys[j], vals[j]);
+				keep = 0;
+				break;
+			}
+			if (k == j)
+				keep = 0;	/* a later active line of a key being set */
+		}
+		if (keep) {
+			memcpy(out + o, line, len);
+			o += len;
+			out[o++] = '\n';
+		}
+		ln++;
+	}
+	for (int k = 0; k < CFG_NKEYS; k++)
+		if (vals[k] && target[k] == none)
+			o += (size_t)sprintf(out + o, "%s=%s\n", cfg_keys[k], vals[k]);
+	out[o] = '\0';
+	return out;
+}
+
+/* Read all of fd (at most CFG_FILE_MAX bytes) into a malloc'd string. */
+static char *cfg_slurp(int fd)
+{
+	char *buf = malloc(CFG_FILE_MAX + 1);
+	size_t n = 0;
+
+	if (!buf)
+		return NULL;
+	for (;;) {
+		ssize_t r = read(fd, buf + n, CFG_FILE_MAX + 1 - n);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r < 0) {
+			free(buf);
+			return NULL;
+		}
+		if (r == 0)
+			break;
+		n += (size_t)r;
+		if (n > CFG_FILE_MAX) {
+			free(buf);
+			errno = EFBIG;
+			return NULL;
+		}
+	}
+	buf[n] = '\0';
+	return buf;
+}
+
+/* Why the file could not be opened. A member of the group whose login
+ * session already carries it is on a daemon installed before 1.8, which
+ * left /etc/wireview root-only; anyone else needs the group. */
+static void cfg_access_hint(void)
+{
+	struct group *gr = getgrnam("wireview");
+	if (gr) {
+		gid_t gids[256];
+		int n = getgroups((int)(sizeof(gids) / sizeof(gids[0])), gids);
+		for (int i = 0; i < n; i++) {
+			if (gids[i] == gr->gr_gid) {
+				fprintf(stderr, "You are in the 'wireview' group, but /etc/wireview still has the root-only\n"
+					"permissions of an older install. Upgrade the package, or as root run:\n"
+					"  chgrp wireview /etc/wireview /etc/wireview/config\n"
+					"  chmod 0750 /etc/wireview; chmod 0660 /etc/wireview/config\n");
+				return;
+			}
+		}
+	}
+	fprintf(stderr, "Changing the daemon settings needs root or membership of the 'wireview' group:\n"
+		"  sudo usermod -aG wireview $USER\n"
+		"then log out and back in: file access goes by the groups of your login session.\n");
+}
+
+/* Ask wireviewd to re-read the file and print its answer. nodaemon_ok:
+ * a daemon that is not running is fine (the file was just written), and
+ * the message says when the change applies. Returns the exit status. */
+static int cfg_reload(int nodaemon_ok)
+{
+	uint8_t status, *data;
+	uint16_t len;
+	int rc = sock_exchange(WCMD_RELOAD_CONFIG, NULL, 0, nodaemon_ok,
+			       &status, &data, &len);
+
+	if (rc == SOCK_NODAEMON && nodaemon_ok) {
+		printf("%s written; wireviewd is not running: the change applies "
+		       "when it starts\n", g_config_path);
+		return 0;
+	}
+	if (rc < 0)
+		return 1;
+
+	int ret = 1;
+	if (status == RESP_OK) {
+		printf("config reloaded: %s\n", (char *)data);
+		ret = 0;
+	} else if (status == RESP_DENIED) {
+		denied_message();
+	} else if (status == RESP_ERROR && len > 0) {
+		fprintf(stderr, "wireviewctl: config reload: %s\n", (char *)data);
+	} else if (status == RESP_ERROR || status == RESP_NOT_CONNECTED) {
+		/* No reply text: a wireviewd from before 0x0B, which does
+		 * not know the command. */
+		fprintf(stderr, "wireviewctl: this wireviewd cannot reload its settings; restart it:\n"
+			"  sudo systemctl restart wireviewd\n");
+	} else {
+		fprintf(stderr, "wireviewctl: unexpected status %u from wireviewd\n", status);
+	}
+	free(data);
+	return ret;
+}
+
+static int cfg_cmd_show(int show_secret)
+{
+	int fd = open(g_config_path, O_RDONLY | O_CLOEXEC);
+	char *text;
+
+	if (fd < 0 && errno == ENOENT) {
+		fprintf(stderr, "wireviewctl: %s does not exist: these are the defaults\n",
+			g_config_path);
+		cfg_show("", show_secret, stdout);
+		return 0;
+	}
+	if (fd < 0 || !(text = cfg_slurp(fd))) {
+		int e = errno;
+
+		fprintf(stderr, "wireviewctl: cannot read %s: %s\n", g_config_path, strerror(e));
+		if (fd >= 0)
+			close(fd);
+		if (e == EACCES || e == EPERM)
+			cfg_access_hint();
+		return 1;
+	}
+	close(fd);
+	cfg_show(text, show_secret, stdout);
+	explicit_bzero(text, strlen(text));
+	free(text);
+	return 0;
+}
+
+/* "secret=-": the secret from the first line of stdin, which keeps it out
+ * of ps and the shell history. */
+static int cfg_secret_stdin(char *out, size_t cap)
+{
+	char line[CFG_VALMAX + 2];
+
+	if (!fgets(line, sizeof(line), stdin)) {
+		fprintf(stderr, "wireviewctl: secret=-: no line on standard input\n");
+		return -1;
+	}
+	size_t n = strcspn(line, "\r\n");
+	if (line[n] == '\0' && n == sizeof(line) - 1) {
+		fprintf(stderr, "wireviewctl: secret=-: line too long\n");
+		explicit_bzero(line, sizeof(line));
+		return -1;
+	}
+	line[n] = '\0';
+	snprintf(out, cap, "%s", line);
+	explicit_bzero(line, sizeof(line));
+	return 0;
+}
+
+/* Parse and check "key=value" arguments into vals (CFG_VALMAX each; NULL
+ * in set[] for keys not given). Returns 0, or -1 after printing why. */
+static int cfg_parse_args(int n, char **args, char vals[CFG_NKEYS][CFG_VALMAX],
+			  const char *set[CFG_NKEYS])
+{
+	for (int k = 0; k < CFG_NKEYS; k++)
+		set[k] = NULL;
+	if (n == 0) {
+		fprintf(stderr, "wireviewctl: config set needs at least one key=value "
+			"(keys: remote_enabled, port, bind, secret, log_days)\n");
+		return -1;
+	}
+	for (int i = 0; i < n; i++) {
+		char key[64], raw[CFG_VALMAX];
+		const char *eq = strchr(args[i], '=');
+		const char *v;
+		int k;
+
+		if (!eq || (size_t)(eq - args[i]) >= sizeof(key)) {
+			fprintf(stderr, "wireviewctl: config set: '%s' is not key=value\n", args[i]);
+			return -1;
+		}
+		snprintf(key, sizeof(key), "%.*s", (int)(eq - args[i]), args[i]);
+		k = cfg_key_index(key);
+		if (k < 0) {
+			fprintf(stderr, "wireviewctl: config set: unknown key '%s' "
+				"(keys: remote_enabled, port, bind, secret, log_days)\n", key);
+			return -1;
+		}
+		v = eq + 1;
+		if (k == CFG_SECRET && strcmp(v, "-") == 0) {
+			if (cfg_secret_stdin(raw, sizeof(raw)) < 0)
+				return -1;
+			v = raw;
+		}
+		int bad = cfg_validate(k, v, vals[k]);
+		explicit_bzero(raw, sizeof(raw));
+		if (bad)
+			return -1;
+		set[k] = vals[k];
+	}
+	return 0;
+}
+
+static int cfg_cmd_set(int n, char **args)
+{
+	char vals[CFG_NKEYS][CFG_VALMAX];
+	const char *set[CFG_NKEYS];
+	int created = 0;
+
+	if (cfg_parse_args(n, args, vals, set) < 0) {
+		explicit_bzero(vals, sizeof(vals));
+		return 2;
+	}
+
+	/* One fd to read and rewrite, so owner and mode stay; the lock keeps
+	 * two writers (this tool, the desktop agent) from interleaving. */
+	int fd = open(g_config_path, O_RDWR | O_CLOEXEC);
+	if (fd < 0 && errno == ENOENT) {
+		/* Only root can create it (the directory is not group
+		 * writable): give it the packages' mode and group. */
+		fd = open(g_config_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0660);
+		created = fd >= 0;
+	}
+	if (fd < 0) {
+		int e = errno;
+
+		fprintf(stderr, "wireviewctl: cannot write %s: %s\n", g_config_path, strerror(e));
+		if (e == EACCES || e == EPERM || e == EROFS)
+			cfg_access_hint();
+		explicit_bzero(vals, sizeof(vals));
+		return 1;
+	}
+	if (created) {
+		struct group *g = getgrnam("wireview");
+
+		if (fchmod(fd, 0660) < 0 || (g && fchown(fd, (uid_t)-1, g->gr_gid) < 0))
+			fprintf(stderr, "wireviewctl: warning: %s: could not set mode 0660 "
+				"root:wireview: %s\n", g_config_path, strerror(errno));
+	}
+	while (flock(fd, LOCK_EX) < 0 && errno == EINTR)
+		;
+
+	char *text = cfg_slurp(fd);
+	char *out = text ? cfg_rewrite(text, set) : NULL;
+	explicit_bzero(vals, sizeof(vals));
+	if (text) {
+		explicit_bzero(text, strlen(text));
+		free(text);
+	}
+	if (!out) {
+		fprintf(stderr, "wireviewctl: cannot read %s: %s\n", g_config_path,
+			strerror(errno));
+		close(fd);
+		return 1;
+	}
+
+	/* In place: truncate, write, fsync. */
+	size_t len = strlen(out), off = 0;
+	int ok = lseek(fd, 0, SEEK_SET) == 0 && ftruncate(fd, 0) == 0;
+	while (ok && off < len) {
+		ssize_t w = write(fd, out + off, len - off);
+		if (w < 0 && errno == EINTR)
+			continue;
+		if (w <= 0)
+			ok = 0;
+		else
+			off += (size_t)w;
+	}
+	if (ok && fsync(fd) < 0)
+		ok = 0;
+	int e = errno;
+	explicit_bzero(out, len);
+	free(out);
+	if (close(fd) < 0 && ok) {
+		ok = 0;
+		e = errno;
+	}
+	if (!ok) {
+		fprintf(stderr, "wireviewctl: writing %s failed: %s\n", g_config_path, strerror(e));
+		return 1;
+	}
+	return cfg_reload(1);
+}
+
+static int cmd_config(int argc, char **argv)
+{
+	const char *sub = NULL;
+	int show_secret = 0, first = 0, nargs = 0;
+
+	if (g_host) {
+		fprintf(stderr, "wireviewctl: config is local only: it edits this machine's %s.\n"
+			"Run it on the host whose daemon you want to change.\n", g_config_path);
+		return 1;
+	}
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--show-secret") == 0) {
+			show_secret = 1;
+		} else if (!sub) {
+			sub = argv[i];
+			first = i + 1;
+		} else {
+			nargs++;
+		}
+	}
+	if (!sub || strcmp(sub, "show") == 0) {
+		if (nargs) {
+			fprintf(stderr, "wireviewctl: config show takes no arguments\n");
+			return 1;
+		}
+		return cfg_cmd_show(show_secret);
+	}
+	if (strcmp(sub, "reload") == 0) {
+		if (nargs || show_secret) {
+			fprintf(stderr, "wireviewctl: config reload takes no arguments\n");
+			return 1;
+		}
+		return cfg_reload(0);
+	}
+	if (strcmp(sub, "set") == 0) {
+		char *args[64];
+		int n = 0;
+
+		if (show_secret) {
+			fprintf(stderr, "wireviewctl: --show-secret goes with config show\n");
+			return 2;
+		}
+		for (int i = first; i < argc && n < 64; i++)
+			if (strcmp(argv[i], "--show-secret") != 0)
+				args[n++] = argv[i];
+		return cfg_cmd_set(n, args);
+	}
+	fprintf(stderr, "wireviewctl: unknown config command '%s' (show, set, reload)\n", sub);
+	return 1;
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
@@ -2707,6 +3433,23 @@ static void usage(void)
 		"                    --host repeats and/or takes a comma/space list; hosts are\n"
 		"                    also read from /etc/wireview/hosts, and the global\n"
 		"                    --host (before \"top\") adds one more. Press q to quit.\n"
+		"\n"
+		"Daemon settings (" CONFIG_PATH ", local only):\n"
+		"  config [show] [--show-secret]\n"
+		"                    Print the settings wireviewd uses, as key=value lines\n"
+		"                    (remote_enabled, port, bind, secret, log_days, then\n"
+		"                    any other keys); the secret is masked unless\n"
+		"                    --show-secret is given.\n"
+		"  config set KEY=VALUE...\n"
+		"                    Change settings and have wireviewd apply them, no\n"
+		"                    restart: remote_enabled=0|1 (on/off, true/false),\n"
+		"                    port=1024-65535, bind= (all) or a numeric IPv4/IPv6\n"
+		"                    address, secret=TEXT (secret=- reads it from stdin,\n"
+		"                    out of ps and the shell history), log_days=0-3650.\n"
+		"                    Comments and other lines are kept. Needs root or the\n"
+		"                    wireview group (log in again after joining it).\n"
+		"  config reload     Have wireviewd re-read the file after a manual edit\n"
+		"                    (same as systemctl reload wireviewd)\n"
 		"\n"
 		"Other:\n"
 		"  -V, --version     Print the wireviewctl version\n"
@@ -2844,6 +3587,8 @@ int main(int argc, char **argv)
 		return cmd_sensors(argc, argv);
 	if (strcmp(cmd, "top") == 0)
 		return cmd_top(argc, argv);
+	if (strcmp(cmd, "config") == 0)
+		return cmd_config(argc, argv);
 	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
 		usage();
 		return 0;

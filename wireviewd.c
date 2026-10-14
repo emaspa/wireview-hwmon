@@ -12,8 +12,12 @@
  *
  * The command socket (/run/wireviewd.sock) is world-connectable, but commands
  * that can alter or brick the device (bootloader, NVM, config write, serial
- * handover) are only accepted from root or members of the "wireview" group
- * (see WIREVIEW_GROUP); other peers get RESP_DENIED.
+ * handover) or change the daemon's settings (config reload) are only accepted
+ * from root or members of the "wireview" group (see WIREVIEW_GROUP); other
+ * peers get RESP_DENIED.
+ *
+ * The settings file (/etc/wireview/config, root:wireview 0660) is read at
+ * start and again on SIGHUP or WCMD_RELOAD_CONFIG, see reload_config().
  *
  * SPDX-License-Identifier: GPL-2.0
  */
@@ -124,6 +128,11 @@
  * polling resumes automatically at the deadline or on RESUME. */
 #define WCMD_SUSPEND_SERIAL    0x09	/* [priv] */
 #define WCMD_RESUME_SERIAL     0x0A	/* [priv] */
+/* Re-read CONFIG_PATH and apply it (secret, log retention, LAN listener)
+ * without a restart; the reply payload is the outcome as text. Works with
+ * or without a device. Privileged because it can open a port; the file
+ * itself is writable by the same group. */
+#define WCMD_RELOAD_CONFIG     0x0B	/* [priv] */
 
 /* Response status */
 #define RESP_OK            0
@@ -132,6 +141,8 @@
 #define RESP_DENIED        3	/* privileged command from unprivileged peer */
 
 static volatile int running = 1;
+/* Set by SIGHUP; the main loop runs reload_config() and clears it. */
+static volatile sig_atomic_t g_reload_requested;
 
 /* Binary struct written to /dev/wireview-hwmon (must match kernel module) */
 struct __attribute__((packed)) hwmon_data {
@@ -269,6 +280,7 @@ static struct timespec g_suspend_until; /* CLOCK_MONOTONIC deadline; 0 = active 
 static unsigned long g_suspend_owner;   /* client id that asked for it; 0 = none */
 
 static void wlog(const char *level, const char *fmt, ...);
+static int reload_config(const char *who, char *msg, size_t cap);
 
 static int serial_suspended(void)
 {
@@ -289,6 +301,12 @@ static int  g_http_enabled = 0; /* network listener off unless config enables it
 static int  g_http_port = HTTP_PORT; /* listener port (config: port=) */
 static char g_bind_addr[192];   /* numeric listen address (config: bind=); empty = all */
 static int  g_log_retain_days = 14; /* days of audit logs to keep (config: log_days=) */
+/* The LAN listener, opened from g_http_port and g_bind_addr as they were
+ * when it was set up; -1 = none. Global because a reload (SIGHUP, or
+ * WCMD_RELOAD_CONFIG from a socket client) may close or replace it in the
+ * middle of the run. g_listen_desc names its address for messages. */
+static int  g_http_fd = -1;
+static char g_listen_desc[256];
 
 #define HTTP_MAX_BODY    8192
 #define HTTP_MAX_HEADER  8192   /* request line + headers, before the blank line */
@@ -299,6 +317,16 @@ static void sig_handler(int sig)
 {
 	(void)sig;
 	running = 0;
+}
+
+/* Only a flag: reloading opens sockets and writes the log, which a signal
+ * handler must not do. A signal during poll() ends it with EINTR, so the
+ * loop sees the flag at once; one that lands just before the poll() is
+ * seen when that poll times out (the poll interval at most). */
+static void sighup_handler(int sig)
+{
+	(void)sig;
+	g_reload_requested = 1;
 }
 
 /* Set *deadline to CLOCK_MONOTONIC now + ms. */
@@ -876,6 +904,7 @@ static int cmd_is_privileged(uint8_t cmd_type)
 	case WCMD_WRITE_CONFIG:
 	case WCMD_SUSPEND_SERIAL:
 	case WCMD_RESUME_SERIAL:
+	case WCMD_RELOAD_CONFIG:
 		return 1;
 	default:
 		return 0;
@@ -942,6 +971,18 @@ static void handle_client_request(const struct client *c, int serial_fd)
 		wlog("WARN", "socket cmd 0x%02x from uid %ld denied: not root or in group '%s'",
 		     cmd_type, client_uid(c), WIREVIEW_GROUP);
 		send_response(client_fd, RESP_DENIED, NULL, 0);
+		return;
+	}
+
+	/* Before the device check: settings do not need the device. */
+	if (cmd_type == WCMD_RELOAD_CONFIG) {
+		char who[48], msg[320];
+		int rc;
+
+		snprintf(who, sizeof(who), "uid %ld", client_uid(c));
+		rc = reload_config(who, msg, sizeof(msg));
+		send_response(client_fd, rc == 0 ? RESP_OK : RESP_ERROR,
+			      msg, (uint16_t)strlen(msg));
 		return;
 	}
 
@@ -1736,19 +1777,39 @@ static int truthy(const char *s)
 	return s && (s[0] == '1' || s[0] == 't' || s[0] == 'T' || s[0] == 'y' || s[0] == 'Y');
 }
 
-/* Load the network-listener flag and shared HMAC secret from CONFIG_PATH
- * (/etc/wireview/config). The file holds "key=value" lines: "remote_enabled=0|1" gates
- * the listener (default OFF, so no port is opened unless explicitly enabled),
- * "port=" and "bind=" (numeric address, default all) place it, and "secret=<passphrase>"
- * sets the write secret; a bare line is taken as the secret (backward compatible).
- * $WIREVIEW_LISTEN and $WIREVIEW_SECRET override the file. An empty secret leaves
- * writes refused (403) even when the listener is on. */
-static void load_config(void)
-{
-	g_secret[0] = '\0';
-	g_http_enabled = 0;
+/* The daemon settings in CONFIG_PATH (/etc/wireview/config). */
+struct wv_config {
+	int  remote_enabled;	/* LAN listener on */
+	int  port;		/* listener port */
+	char bind[192];		/* numeric listen address; empty = all */
+	char secret[128];	/* HMAC secret; empty = remote writes refused */
+	int  log_days;		/* audit-log retention; 0 = keep all */
+};
 
-	FILE *f = fopen(CONFIG_PATH, "r");
+/*
+ * Parse path into *c. The file holds "key=value" lines: "remote_enabled=0|1"
+ * gates the listener (default OFF, so no port is opened unless explicitly
+ * enabled), "port=" and "bind=" (numeric address, default all) place it,
+ * "secret=<passphrase>" sets the write secret and "log_days=" the audit-log
+ * retention; a bare line is taken as the secret (backward compatible). The
+ * first non-empty secret wins, a later line of any other key replaces an
+ * earlier one, and a key the file does not set keeps its default (so a
+ * reload after deleting a line goes back to the default). $WIREVIEW_LISTEN
+ * and $WIREVIEW_SECRET override the file. An empty secret leaves writes
+ * refused (403) even when the listener is on.
+ *
+ * Returns 0, or -1 with errno set when the file could not be opened; *c
+ * then holds the defaults plus the environment overrides.
+ */
+static int config_read(const char *path, struct wv_config *c)
+{
+	int rc = 0;
+
+	memset(c, 0, sizeof(*c));
+	c->port = HTTP_PORT;
+	c->log_days = 14;
+
+	FILE *f = fopen(path, "r");
 	if (f) {
 		char line[192];
 		while (fgets(line, sizeof(line), f)) {
@@ -1771,31 +1832,138 @@ static void load_config(void)
 				char *val = eq + 1;
 				while (*val == ' ' || *val == '\t') val++;
 				if (strcmp(p, "remote_enabled") == 0)
-					g_http_enabled = truthy(val);
-				else if (strcmp(p, "secret") == 0 && !g_secret[0])
-					snprintf(g_secret, sizeof(g_secret), "%s", val);
+					c->remote_enabled = truthy(val);
+				else if (strcmp(p, "secret") == 0 && !c->secret[0])
+					snprintf(c->secret, sizeof(c->secret), "%s", val);
 				else if (strcmp(p, "bind") == 0)
-					snprintf(g_bind_addr, sizeof(g_bind_addr), "%s", val);
+					snprintf(c->bind, sizeof(c->bind), "%s", val);
 				else if (strcmp(p, "log_days") == 0)
-					g_log_retain_days = atoi(val);
+					c->log_days = atoi(val);
 				else if (strcmp(p, "port") == 0) {
 					int pp = atoi(val);
-					if (pp > 0 && pp < 65536) g_http_port = pp;
+					if (pp > 0 && pp < 65536) c->port = pp;
 				}
-			} else if (!g_secret[0]) {
-				snprintf(g_secret, sizeof(g_secret), "%s", p);
+			} else if (!c->secret[0]) {
+				snprintf(c->secret, sizeof(c->secret), "%s", p);
 			}
 		}
+		explicit_bzero(line, sizeof(line));
 		fclose(f);
+	} else {
+		rc = -1;
 	}
 
 	/* Environment overrides win over the file. */
+	int e = errno;
 	const char *env = getenv("WIREVIEW_SECRET");
 	if (env && env[0])
-		snprintf(g_secret, sizeof(g_secret), "%s", env);
+		snprintf(c->secret, sizeof(c->secret), "%s", env);
 	const char *listen = getenv("WIREVIEW_LISTEN");
 	if (listen)
-		g_http_enabled = truthy(listen);
+		c->remote_enabled = truthy(listen);
+	errno = e;
+	return rc;
+}
+
+/* Make *c the running settings. The listener is not touched here: main()
+ * opens it at start, reload_config() reconciles it. */
+static void config_apply(const struct wv_config *c)
+{
+	g_http_enabled = c->remote_enabled;
+	g_http_port = c->port;
+	snprintf(g_bind_addr, sizeof(g_bind_addr), "%s", c->bind);
+	snprintf(g_secret, sizeof(g_secret), "%s", c->secret);
+	/* wlog() prunes with the current value at every day rotation, so a
+	 * new retention needs no restart either. */
+	g_log_retain_days = c->log_days;
+}
+
+/* Start-up read of CONFIG_PATH. A missing file means the defaults, as it
+ * always has. */
+static void load_config(void)
+{
+	struct wv_config c;
+
+	if (config_read(CONFIG_PATH, &c) < 0 && errno != ENOENT)
+		fprintf(stderr, "wireviewd: warning: cannot read %s: %s; using the defaults\n",
+			CONFIG_PATH, strerror(errno));
+	config_apply(&c);
+	explicit_bzero(&c, sizeof(c));
+}
+
+/* What a reload does with the LAN listener. */
+enum {
+	LISTENER_KEEP,		/* leave it as it is (open or closed) */
+	LISTENER_OPEN,		/* close the old one, if any, and open anew */
+	LISTENER_CLOSE,		/* close it */
+};
+
+/* listening: a listener is open, on cur_port and cur_bind. It is reopened
+ * only when its address changes or it is not open (a listener that failed
+ * to open is retried), so a reload that leaves the listener settings alone
+ * never drops it. Connections already accepted are sockets of their own
+ * and are not affected either way. */
+static int listener_plan(int listening, int cur_port, const char *cur_bind,
+			 const struct wv_config *c)
+{
+	if (!c->remote_enabled)
+		return listening ? LISTENER_CLOSE : LISTENER_KEEP;
+	if (!listening || c->port != cur_port || strcmp(c->bind, cur_bind) != 0)
+		return LISTENER_OPEN;
+	return LISTENER_KEEP;
+}
+
+/*
+ * Re-read CONFIG_PATH and apply it to the running daemon (SIGHUP and
+ * WCMD_RELOAD_CONFIG; who names the requester for the log). The secret and
+ * log_days take effect at once and the listener is reconciled through
+ * listener_plan(). The outcome goes to msg ("listener on [::]:9876",
+ * "listener off", "listener on X failed: ...") and to one INFO line in
+ * the log. A file that cannot be read changes nothing: the previous
+ * settings stay. Returns 0, or -1 when the file could not be read or the
+ * listener could not be opened.
+ */
+static int reload_config(const char *who, char *msg, size_t cap)
+{
+	struct wv_config c;
+	int rc = 0;
+
+	if (config_read(CONFIG_PATH, &c) < 0) {
+		snprintf(msg, cap, "cannot read %s: %s; previous settings kept",
+			 CONFIG_PATH, strerror(errno));
+		explicit_bzero(&c, sizeof(c));
+		wlog("WARN", "config reload (%s): %s", who, msg);
+		fprintf(stderr, "wireviewd: config reload: %s\n", msg);
+		return -1;
+	}
+
+	int plan = listener_plan(g_http_fd >= 0, g_http_port, g_bind_addr, &c);
+
+	config_apply(&c);
+	explicit_bzero(&c, sizeof(c));
+
+	if (plan != LISTENER_KEEP && g_http_fd >= 0) {
+		close(g_http_fd);
+		g_http_fd = -1;
+	}
+	if (plan == LISTENER_OPEN) {
+		g_http_fd = setup_http(g_listen_desc, sizeof(g_listen_desc));
+		if (g_http_fd < 0) {
+			snprintf(msg, cap, "listener on %s failed: %s",
+				 g_listen_desc, strerror(errno));
+			rc = -1;
+		}
+	}
+	if (rc == 0) {
+		if (g_http_fd >= 0)
+			snprintf(msg, cap, "listener on %s", g_listen_desc);
+		else
+			snprintf(msg, cap, "listener off");
+	}
+	wlog("INFO", "config reloaded: %s (%s)", msg, who);
+	printf("wireviewd: config reloaded: %s; remote writes %s\n", msg,
+	       g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
+	return rc;
 }
 
 /* Case-insensitive HTTP header value extraction. Returns 1 if found. */
@@ -2501,6 +2669,8 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
+	/* systemctl reload (ExecReload=) sends SIGHUP: re-read the config. */
+	signal(SIGHUP, sighup_handler);
 	/* A peer that hangs up before its reply must not kill the daemon
 	 * (systemd already ignores SIGPIPE; this covers manual runs). */
 	signal(SIGPIPE, SIG_IGN);
@@ -2508,28 +2678,26 @@ int main(int argc, char **argv)
 	load_config();
 	resolve_wireview_group();
 
-	int http_fd = -1;
-	char listen_desc[256] = "";
 	if (g_http_enabled) {
-		http_fd = setup_http(listen_desc, sizeof(listen_desc));
-		if (http_fd < 0) {
+		g_http_fd = setup_http(g_listen_desc, sizeof(g_listen_desc));
+		if (g_http_fd < 0) {
 			fprintf(stderr, "wireviewd: warning: network listener on %s failed: %s\n",
-				listen_desc, strerror(errno));
+				g_listen_desc, strerror(errno));
 			wlog("WARN", "network listener on %s failed: %s",
-			     listen_desc, strerror(errno));
+			     g_listen_desc, strerror(errno));
 		} else {
 			printf("wireviewd: network listener ENABLED on %s; remote writes %s\n",
-			       listen_desc, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
+			       g_listen_desc, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
 		}
 	} else {
-		printf("wireviewd: network listener disabled (set remote_enabled=1 in %s to publish)\n",
-		       CONFIG_PATH);
+		printf("wireviewd: network listener disabled (to publish: wireviewctl config set "
+		       "remote_enabled=1, or remote_enabled=1 in %s)\n", CONFIG_PATH);
 	}
 
 	wlog("INFO", "wireviewd %s started; listener %s%s%s, remote writes %s, log retention %d days",
 	     WIREVIEW_PKG_VERSION,
-	     !g_http_enabled ? "disabled" : http_fd >= 0 ? "enabled" : "failed",
-	     http_fd >= 0 ? " on " : "", http_fd >= 0 ? listen_desc : "",
+	     !g_http_enabled ? "disabled" : g_http_fd >= 0 ? "enabled" : "failed",
+	     g_http_fd >= 0 ? " on " : "", g_http_fd >= 0 ? g_listen_desc : "",
 	     g_secret[0] ? "enabled" : "disabled", g_log_retain_days);
 
 	printf("wireviewd %s: starting\n", WIREVIEW_PKG_VERSION);
@@ -2561,6 +2729,15 @@ int main(int argc, char **argv)
 
 	/* Single event loop with poll(), device present or not */
 	while (running) {
+		/* SIGHUP: before the poll set is built, so a replaced
+		 * listener is polled from this iteration on. */
+		if (g_reload_requested) {
+			char msg[320];
+
+			g_reload_requested = 0;
+			reload_config("SIGHUP", msg, sizeof(msg));
+		}
+
 		if (serial_fd < 0 && ms_until(&next_reconnect) <= 0) {
 			long retry = device_connect(user_dev_path, dev_path,
 						    sizeof(dev_path),
@@ -2595,11 +2772,13 @@ int main(int argc, char **argv)
 			nfds++;
 		}
 
-		/* HTTP /sensors listener */
+		/* HTTP /sensors listener. Rebuilt every iteration like the
+		 * rest of the set, so a reload that replaced or closed
+		 * g_http_fd takes effect from the next poll. */
 		int http_pfd_idx = -1;
-		if (http_fd >= 0) {
+		if (g_http_fd >= 0) {
 			http_pfd_idx = nfds;
-			pfds[nfds].fd = http_fd;
+			pfds[nfds].fd = g_http_fd;
 			pfds[nfds].events = POLLIN;
 			nfds++;
 		}
@@ -2641,10 +2820,12 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		/* Serve an HTTP /sensors request */
+		/* Serve an HTTP /sensors request. The listener is still the
+		 * polled one here: only the client requests below (and the
+		 * SIGHUP check above) can replace it. */
 		if (http_pfd_idx >= 0 &&
 		    (pfds[http_pfd_idx].revents & POLLIN))
-			http_handle(http_fd);
+			http_handle(g_http_fd);
 
 		/* Handle client requests (serial_fd is -1 while the device
 		 * is absent, and requests get RESP_NOT_CONNECTED). Walk
@@ -2849,8 +3030,8 @@ disconnect:
 		close_serial(serial_fd);
 	}
 
-	if (http_fd >= 0)
-		close(http_fd);
+	if (g_http_fd >= 0)
+		close(g_http_fd);
 
 	printf("wireviewd: stopped\n");
 	return 0;

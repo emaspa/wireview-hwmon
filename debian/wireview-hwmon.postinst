@@ -2,10 +2,23 @@
 set -e
 if [ "$1" = "configure" ]; then
     # Members of this group may send wireviewd's privileged socket commands
-    # (bootloader, NVM, config write, serial handover). Created before the
-    # debhelper snippet below (re)starts the daemon, which resolves the group
-    # at startup.
+    # (bootloader, NVM, config write, serial handover, settings reload).
+    # Created before the debhelper snippet below (re)starts the daemon, which
+    # resolves the group at startup.
     addgroup --system --quiet wireview 2>/dev/null || true
+    # The group may also edit the daemon settings (wireviewctl config set),
+    # so /etc/wireview is root:wireview 0750 and the config 0660. The
+    # package can only ship them root:root, since the group is created just
+    # above. On every configure, so upgrades from the root-only 0700/0600
+    # layout and a kept, locally modified conffile get it too.
+    if getent group wireview >/dev/null; then
+        chgrp wireview /etc/wireview
+        chmod 0750 /etc/wireview
+        if [ -e /etc/wireview/config ]; then
+            chgrp wireview /etc/wireview/config
+            chmod 0660 /etc/wireview/config
+        fi
+    fi
     # udev is absent in containers and minimal chroots; nothing to reload.
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules || true

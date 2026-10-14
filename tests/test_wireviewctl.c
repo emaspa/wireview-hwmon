@@ -3,8 +3,9 @@
  * clear-faults mask parser, the remote /sensors JSON reader, the sysfs
  * reader (against a fake hwmon directory via $WIREVIEW_HWMON_PATH), the
  * "sensors" / "sensors --json" output, the device edition read from a
- * fake wireviewd socket, and the flash gates (build dates, the product
- * alias, the verdict, and that a refused flash sends nothing).
+ * fake wireviewd socket, the flash gates (build dates, the product
+ * alias, the verdict, and that a refused flash sends nothing), and the
+ * "config" command (show, the in-place rewrite, validation).
  *
  * wireviewctl.c is one file of static functions, so it is compiled into
  * this test directly with its main() renamed out of the way.
@@ -1967,6 +1968,389 @@ static void test_cmd_flash_gates(void)
 	fake_daemon_stop(pid);
 }
 
+/* ---- config: the daemon settings file ---- */
+
+/* cfg_show(text) as a string. */
+static void show_text(const char *text, int show_secret, char *out, size_t cap)
+{
+	char *buf = NULL;
+	size_t len = 0;
+	FILE *f = open_memstream(&buf, &len);
+
+	out[0] = '\0';
+	if (!f)
+		return;
+	cfg_show(text, show_secret, f);
+	fclose(f);
+	snprintf(out, cap, "%s", buf ? buf : "");
+	free(buf);
+}
+
+/* cfg_rewrite() with vals given as "key=value" strings (NULL-terminated
+ * list), compared with want. */
+static int rewrite_is(const char *text, const char *const *kv, const char *want)
+{
+	char vals[CFG_NKEYS][CFG_VALMAX];
+	const char *set[CFG_NKEYS] = { 0 };
+
+	for (; *kv; kv++) {
+		const char *eq = strchr(*kv, '=');
+		char key[32];
+		snprintf(key, sizeof(key), "%.*s", (int)(eq - *kv), *kv);
+		int k = cfg_key_index(key);
+		snprintf(vals[k], sizeof(vals[k]), "%s", eq + 1);
+		set[k] = vals[k];
+	}
+	char *got = cfg_rewrite(text, set);
+	int ok = got && strcmp(got, want) == 0;
+	if (!ok)
+		fprintf(stderr, "cfg_rewrite gave:\n%s\n-- want:\n%s\n", got ? got : "(null)", want);
+	free(got);
+	return ok;
+}
+
+static void test_config_show(void)
+{
+	char out[1024];
+
+	/* Nothing set: the defaults, in the sample's order. */
+	show_text("", 0, out, sizeof(out));
+	CHECK_EQ_STR(out, "remote_enabled=0\nport=9876\nbind=\nsecret=\nlog_days=14\n");
+
+	/* Masked unless asked; the effective values as wireviewd reads
+	 * them (last line wins, the first non-empty secret, port out of
+	 * range ignored, truthy forms); unknown keys after, as they are. */
+	static const char text[] =
+		"# comment\n\n"
+		"zeta = 1\n"
+		"remote_enabled=yes\n"
+		"port=12000\nport=99999\n"
+		"bind = ::1 \n"
+		"secret=\nsecret= first \nsecret=second\n"
+		"log_days=7\nlog_days=30\n"
+		"#commented=x\n"
+		"alpha=two words\n";
+	show_text(text, 0, out, sizeof(out));
+	CHECK_EQ_STR(out, "remote_enabled=1\nport=12000\nbind=::1\nsecret=********\n"
+		     "log_days=30\nzeta=1\nalpha=two words\n");
+	show_text(text, 1, out, sizeof(out));
+	CHECK(strstr(out, "\nsecret=first\n") != NULL);
+
+	/* The bare-line secret of old files, with no trailing newline. */
+	show_text("legacy pass", 1, out, sizeof(out));
+	CHECK(strstr(out, "\nsecret=legacy pass\n") != NULL);
+	show_text("legacy pass", 0, out, sizeof(out));
+	CHECK(strstr(out, "\nsecret=********\n") != NULL);
+
+	/* The installed sample: defaults, nothing extra. */
+	char sample[4096];
+	FILE *f = fopen(WV_SRCDIR "/wireview-config.sample", "r");
+	size_t n = f ? fread(sample, 1, sizeof(sample) - 1, f) : 0;
+	sample[n] = '\0';
+	if (f)
+		fclose(f);
+	CHECK(n > 0);
+	show_text(sample, 1, out, sizeof(out));
+	CHECK_EQ_STR(out, "remote_enabled=0\nport=9876\nbind=\nsecret=\nlog_days=14\n");
+}
+
+static void test_config_validate(void)
+{
+	char out[CFG_VALMAX];
+	char longsecret[CFG_SECRET_MAX + 2];
+
+	static const struct { const char *v, *norm; } re[] = {
+		{ "1", "1" }, { "0", "0" }, { "on", "1" }, { "OFF", "0" },
+		{ "true", "1" }, { "False", "0" },
+	};
+	for (size_t i = 0; i < sizeof(re) / sizeof(re[0]); i++) {
+		CHECK_EQ_INT(cfg_validate(CFG_REMOTE, re[i].v, out), 0);
+		CHECK_EQ_STR(out, re[i].norm);
+	}
+	static const char *const re_bad[] = { "", "2", "yes", "enable", "1 " };
+	for (size_t i = 0; i < sizeof(re_bad) / sizeof(re_bad[0]); i++)
+		QUIET(CHECK_EQ_INT(cfg_validate(CFG_REMOTE, re_bad[i], out), -1));
+
+	CHECK_EQ_INT(cfg_validate(CFG_PORT, "1024", out), 0);
+	CHECK_EQ_STR(out, "1024");
+	CHECK_EQ_INT(cfg_validate(CFG_PORT, "65535", out), 0);
+	CHECK_EQ_INT(cfg_validate(CFG_PORT, "09876", out), 0);
+	CHECK_EQ_STR(out, "9876");
+	static const char *const port_bad[] = { "", "80", "1023", "65536", "0", "-1",
+						"9876x", " 9876", "123456" };
+	for (size_t i = 0; i < sizeof(port_bad) / sizeof(port_bad[0]); i++)
+		QUIET(CHECK_EQ_INT(cfg_validate(CFG_PORT, port_bad[i], out), -1));
+
+	static const char *const bind_ok[] = { "", "127.0.0.1", "0.0.0.0", "::1", "::",
+					       "192.168.1.10", "fe80::1" };
+	for (size_t i = 0; i < sizeof(bind_ok) / sizeof(bind_ok[0]); i++) {
+		CHECK_EQ_INT(cfg_validate(CFG_BIND, bind_ok[i], out), 0);
+		CHECK_EQ_STR(out, bind_ok[i]);
+	}
+	static const char *const bind_bad[] = { "localhost", "1.2.3.4:80", "[::1]",
+						"0.0.0.0.0", " 127.0.0.1", "example.com" };
+	for (size_t i = 0; i < sizeof(bind_bad) / sizeof(bind_bad[0]); i++)
+		QUIET(CHECK_EQ_INT(cfg_validate(CFG_BIND, bind_bad[i], out), -1));
+
+	CHECK_EQ_INT(cfg_validate(CFG_SECRET, "", out), 0);
+	CHECK_EQ_STR(out, "");
+	CHECK_EQ_INT(cfg_validate(CFG_SECRET, "two words = fine#", out), 0);
+	CHECK_EQ_STR(out, "two words = fine#");
+	memset(longsecret, 'x', sizeof(longsecret) - 1);
+	longsecret[sizeof(longsecret) - 1] = '\0';
+	QUIET(CHECK_EQ_INT(cfg_validate(CFG_SECRET, longsecret, out), -1));
+	longsecret[CFG_SECRET_MAX] = '\0';
+	CHECK_EQ_INT(cfg_validate(CFG_SECRET, longsecret, out), 0);
+	static const char *const secret_bad[] = { "a\nb", "a\rb", "tab\there", " lead",
+						  "trail " };
+	for (size_t i = 0; i < sizeof(secret_bad) / sizeof(secret_bad[0]); i++)
+		QUIET(CHECK_EQ_INT(cfg_validate(CFG_SECRET, secret_bad[i], out), -1));
+
+	CHECK_EQ_INT(cfg_validate(CFG_LOGDAYS, "0", out), 0);
+	CHECK_EQ_INT(cfg_validate(CFG_LOGDAYS, "3650", out), 0);
+	CHECK_EQ_STR(out, "3650");
+	static const char *const days_bad[] = { "", "3651", "-1", "7d", "10000" };
+	for (size_t i = 0; i < sizeof(days_bad) / sizeof(days_bad[0]); i++)
+		QUIET(CHECK_EQ_INT(cfg_validate(CFG_LOGDAYS, days_bad[i], out), -1));
+}
+
+static void test_config_rewrite(void)
+{
+	static const char sample[] =
+		"# header\n"
+		"\n"
+		"# Open the listener.\n"
+		"remote_enabled=0\n"
+		"\n"
+		"# Listener port.\n"
+		"port=9876\n"
+		"\n"
+		"#bind=\n"
+		"\n"
+		"# Shared secret.\n"
+		"#secret=\n"
+		"\n"
+		"log_days=14\n";
+
+	/* Active lines replaced in place, commented ones too; the rest of
+	 * the file (comments, blank lines, order) unchanged. */
+	CHECK(rewrite_is(sample,
+			 (const char *const[]){ "remote_enabled=1", "port=19000",
+						"secret=pw", NULL },
+			 "# header\n\n# Open the listener.\nremote_enabled=1\n\n"
+			 "# Listener port.\nport=19000\n\n#bind=\n\n# Shared secret.\n"
+			 "secret=pw\n\nlog_days=14\n"));
+	CHECK(rewrite_is(sample, (const char *const[]){ "bind=::1", NULL },
+			 "# header\n\n# Open the listener.\nremote_enabled=0\n\n"
+			 "# Listener port.\nport=9876\n\nbind=::1\n\n# Shared secret.\n"
+			 "#secret=\n\nlog_days=14\n"));
+
+	/* Unchanged values: the same text. */
+	CHECK(rewrite_is(sample, (const char *const[]){ "port=9876", NULL }, sample));
+
+	/* Missing keys are appended in the sample's order; unknown lines,
+	 * other comments and a missing final newline are handled. */
+	CHECK(rewrite_is("# mine\nfoo=bar\nremote_enabled=1",
+			 (const char *const[]){ "log_days=3", "port=10000", NULL },
+			 "# mine\nfoo=bar\nremote_enabled=1\nport=10000\nlog_days=3\n"));
+	CHECK(rewrite_is("", (const char *const[]){ "remote_enabled=1", NULL },
+			 "remote_enabled=1\n"));
+
+	/* An active line wins over an earlier commented one, and later
+	 * active lines of the key go: wireviewd would read them instead. */
+	CHECK(rewrite_is("#port=1\nport=2\nx=y\nport=3\n",
+			 (const char *const[]){ "port=4000", NULL },
+			 "#port=1\nport=4000\nx=y\n"));
+	CHECK(rewrite_is("  remote_enabled = 1  \r\nremote_enabled=0\n",
+			 (const char *const[]){ "remote_enabled=0", NULL },
+			 "remote_enabled=0\n"));
+
+	/* The old bare-line secret is a secret line: replaced, not left to
+	 * win over an appended secret=. Other keys leave it alone. */
+	CHECK(rewrite_is("legacy-pass\nremote_enabled=1\n",
+			 (const char *const[]){ "secret=new", NULL },
+			 "secret=new\nremote_enabled=1\n"));
+	CHECK(rewrite_is("legacy-pass\n", (const char *const[]){ "port=2000", NULL },
+			 "legacy-pass\nport=2000\n"));
+	CHECK(rewrite_is("#secret=\nsecret=old\n", (const char *const[]){ "secret=", NULL },
+			 "#secret=\nsecret=\n"));
+
+	/* "# bind = x" is a commented key line; a comment that only
+	 * mentions a key is not. */
+	CHECK(rewrite_is("# the port= setting\n# bind = 10.0.0.1\n",
+			 (const char *const[]){ "bind=127.0.0.1", "port=2000", NULL },
+			 "# the port= setting\nbind=127.0.0.1\nport=2000\n"));
+
+	/* What it writes reads back as set. */
+	char vals[CFG_NKEYS][CFG_VALMAX] = { "1", "12345", "127.0.0.1", "s e c", "0" };
+	const char *set[CFG_NKEYS] = { vals[0], vals[1], vals[2], vals[3], vals[4] };
+	char *got = cfg_rewrite(sample, set), out[512];
+	CHECK(got != NULL);
+	if (got) {
+		show_text(got, 1, out, sizeof(out));
+		CHECK_EQ_STR(out, "remote_enabled=1\nport=12345\nbind=127.0.0.1\n"
+			     "secret=s e c\nlog_days=0\n");
+		free(got);
+	}
+}
+
+/* Run "wireviewctl config ARGS..." against path, capturing stdout and
+ * stderr; returns the exit status. */
+static int run_config(const char *path, char *out, size_t ocap, char *err,
+		      size_t ecap, const char *a1, const char *a2, const char *a3)
+{
+	char *argv[6] = { "wireviewctl", "config", (char *)a1, (char *)a2, (char *)a3, NULL };
+	int argc = 2 + (a1 != NULL) + (a1 && a2) + (a1 && a2 && a3);
+	char opath[PATH_MAX], epath[PATH_MAX];
+	int rc;
+
+	g_config_path = path;
+	snprintf(opath, sizeof(opath), "%s/cfg.out", g_tmpdir);
+	snprintf(epath, sizeof(epath), "%s/cfg.err", g_tmpdir);
+	fflush(stdout);
+	fflush(stderr);
+	int so = dup(1), se = dup(2);
+	int fo = open(opath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	int fe = open(epath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	dup2(fo, 1);
+	dup2(fe, 2);
+	close(fo);
+	close(fe);
+	rc = cmd_config(argc, argv);
+	fflush(stdout);
+	fflush(stderr);
+	dup2(so, 1);
+	dup2(se, 2);
+	close(so);
+	close(se);
+	g_config_path = CONFIG_PATH;
+
+	FILE *f = fopen(opath, "r");
+	size_t n = f ? fread(out, 1, ocap - 1, f) : 0;
+	out[n] = '\0';
+	if (f)
+		fclose(f);
+	f = fopen(epath, "r");
+	n = f ? fread(err, 1, ecap - 1, f) : 0;
+	err[n] = '\0';
+	if (f)
+		fclose(f);
+	return rc;
+}
+
+static void test_cmd_config(void)
+{
+	char path[PATH_MAX], out[2048], err[2048], text[1024];
+	struct stat st;
+	int rc;
+
+	snprintf(path, sizeof(path), "%s/wv-config", g_tmpdir);
+	snprintf(g_sock_path, sizeof(g_sock_path), "%s/no-daemon.sock", g_tmpdir);
+
+	/* No file: the defaults, with a note. */
+	unlink(path);
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), NULL, NULL, NULL);
+	CHECK_EQ_INT(rc, 0);
+	CHECK_EQ_STR(out, "remote_enabled=0\nport=9876\nbind=\nsecret=\nlog_days=14\n");
+	CHECK(strstr(err, "does not exist") != NULL);
+
+	/* set: written in place (mode kept), then the reload finds no
+	 * daemon, which is fine: exit 0 and a note. */
+	static const char before[] = "# keep me\nremote_enabled=0\n#secret=\n";
+	write_file("wv-config", before, strlen(before));
+	CHECK_EQ_INT(chmod(path, 0640), 0);
+	stat(path, &st);
+	ino_t ino = st.st_ino;
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "set",
+			"remote_enabled=on", "secret=hunter2");
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "wireviewd is not running: the change applies when it starts") != NULL);
+	FILE *f = fopen(path, "r");
+	size_t n = f ? fread(text, 1, sizeof(text) - 1, f) : 0;
+	text[n] = '\0';
+	if (f)
+		fclose(f);
+	CHECK_EQ_STR(text, "# keep me\nremote_enabled=1\nsecret=hunter2\n");
+	CHECK_EQ_INT(stat(path, &st), 0);
+	CHECK_EQ_INT(st.st_mode & 07777, 0640);
+	CHECK_EQ_INT(st.st_ino, ino);
+
+	/* show masks the secret, --show-secret does not. */
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "show", NULL, NULL);
+	CHECK_EQ_INT(rc, 0);
+	CHECK_EQ_STR(out, "remote_enabled=1\nport=9876\nbind=\nsecret=********\nlog_days=14\n");
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "--show-secret", NULL, NULL);
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "\nsecret=hunter2\n") != NULL);
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "show", "--show-secret", NULL);
+	CHECK(strstr(out, "\nsecret=hunter2\n") != NULL);
+
+	/* Invalid: exit 2 and nothing written, even with a valid pair
+	 * before it. */
+	static const char *const bad[] = { "port=80", "bind=localhost", "nokey=1",
+					   "remote_enabled", "log_days=9999",
+					   "remote_enabled=maybe" };
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		rc = run_config(path, out, sizeof(out), err, sizeof(err), "set",
+				"log_days=1", bad[i]);
+		CHECK_EQ_INT(rc, 2);
+		CHECK(err[0] != '\0');
+	}
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "set", NULL, NULL);
+	CHECK_EQ_INT(rc, 2);
+	f = fopen(path, "r");
+	n = f ? fread(text, 1, sizeof(text) - 1, f) : 0;
+	text[n] = '\0';
+	if (f)
+		fclose(f);
+	CHECK_EQ_STR(text, "# keep me\nremote_enabled=1\nsecret=hunter2\n");
+
+	/* Not writable (or readable): the wireview group hint, exit 1. Root
+	 * can write anyway, so this needs an ordinary user. */
+	if (geteuid() != 0) {
+		chmod(path, 0444);
+		rc = run_config(path, out, sizeof(out), err, sizeof(err), "set", "port=2000", NULL);
+		CHECK_EQ_INT(rc, 1);
+		CHECK(strstr(err, "Permission denied") != NULL);
+		CHECK(strstr(err, "'wireview' group") != NULL);
+		/* The hint depends on the test user: join the group, or (already
+		 * a member) the directory still has the pre-1.8 permissions. */
+		CHECK(strstr(err, "log out and back in") != NULL ||
+		      strstr(err, "older install") != NULL);
+		chmod(path, 0);
+		rc = run_config(path, out, sizeof(out), err, sizeof(err), "show", NULL, NULL);
+		CHECK_EQ_INT(rc, 1);
+		CHECK(strstr(err, "'wireview' group") != NULL);
+		chmod(path, 0640);
+	}
+
+	/* reload alone with no daemon is an error (nothing was written). */
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "reload", NULL, NULL);
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(err, "Is wireviewd running?") != NULL);
+
+	/* A daemon from before 0x0B answers status 1 with no text. */
+	pid_t pid = fake_daemon_start(RESP_OK, NULL, 0);
+	CHECK(pid > 0);
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "reload", NULL, NULL);
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(err, "cannot reload its settings") != NULL);
+	CHECK(strstr(err, "systemctl restart wireviewd") != NULL);
+	fake_daemon_stop(pid);
+
+	/* Unknown subcommand; --host refuses. */
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "edit", NULL, NULL);
+	CHECK_EQ_INT(rc, 1);
+	g_host = "192.0.2.1";
+	rc = run_config(path, out, sizeof(out), err, sizeof(err), "show", NULL, NULL);
+	g_host = NULL;
+	CHECK_EQ_INT(rc, 1);
+	CHECK(strstr(err, "local only") != NULL);
+
+	unlink(path);
+	snprintf(g_sock_path, sizeof(g_sock_path), "/nonexistent/wireviewd.sock");
+}
+
 int main(void)
 {
 	if (!mkdtemp(g_tmpdir)) {
@@ -1993,6 +2377,10 @@ int main(void)
 	test_flash_verdict();
 	test_flash_check();
 	test_cmd_flash_gates();
+	test_config_show();
+	test_config_validate();
+	test_config_rewrite();
+	test_cmd_config();
 
 	char cmd[PATH_MAX + 16];
 	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmpdir);

@@ -23,20 +23,23 @@ override_dh_auto_install:
 	install -D -m 644 debian/wireviewd.service debian/wireview-hwmon/usr/lib/systemd/system/wireviewd.service
 	install -D -m 644 99-wireview-hwmon.rules debian/wireview-hwmon/usr/lib/udev/rules.d/99-wireview-hwmon.rules
 	install -D -m 644 firmware/TG-WV-PRO2-FW.hex debian/wireview-hwmon/usr/share/wireview/TG-WV-PRO2-FW.hex
-	# Reference daemon config (conffile via dh_installdeb; may hold the HMAC secret)
-	install -d -m 700 debian/wireview-hwmon/etc/wireview
-	install -m 600 wireview-config.sample debian/wireview-hwmon/etc/wireview/config
+	# Reference daemon config (conffile via dh_installdeb; may hold the HMAC
+	# secret). Group wireview, set by the postinst once the group exists, may
+	# edit it in place.
+	install -d -m 750 debian/wireview-hwmon/etc/wireview
+	install -m 660 wireview-config.sample debian/wireview-hwmon/etc/wireview/config
 	# DKMS package (version baked into dkms.conf and the module's MODULE_VERSION)
 	install -D -m 644 wireview_hwmon.c $(DKMS_SRC)/wireview_hwmon.c
 	sed 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="$(WV_VERSION)"/' dkms.conf > $(DKMS_SRC)/dkms.conf
 	sed 's/@VERSION@/$(WV_VERSION)/' Makefile.dkms > $(DKMS_SRC)/Makefile
 
-# dh_fixperms resets everything to go=rX; restore the private config perms.
+# dh_fixperms resets everything to go=rX; restore the config perms (no access
+# for others, group read-write; the postinst sets the group).
 override_dh_fixperms:
 	dh_fixperms
 	if [ -d debian/wireview-hwmon/etc/wireview ]; then \
-		chmod 700 debian/wireview-hwmon/etc/wireview; \
-		chmod 600 debian/wireview-hwmon/etc/wireview/config; \
+		chmod 750 debian/wireview-hwmon/etc/wireview; \
+		chmod 660 debian/wireview-hwmon/etc/wireview/config; \
 	fi
 
 override_dh_auto_clean:

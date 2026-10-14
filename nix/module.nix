@@ -35,11 +35,21 @@ in
     environment.systemPackages = [ cfg.package ];
 
     # Members may send privileged daemon commands (config writes, NVM,
-    # flashing, the GUI's serial handover).
+    # flashing, the GUI's serial handover, settings reload) and edit
+    # /etc/wireview/config.
     users.groups.wireview = { };
 
-    # Same unit as the distro packages. /etc/wireview/config is optional and
-    # may hold the LAN secret, so it is not generated into the store.
+    # /etc/wireview/config is optional and may hold the LAN secret, so it is
+    # not generated into the store: create it yourself (as root, or with
+    # "wireviewctl config set" as root). The directory is root:wireview 0750;
+    # "z" gives an existing config 0660 root:wireview and skips a missing
+    # one, here at boot and on every switch.
+    systemd.tmpfiles.rules = [
+      "d /etc/wireview 0750 root wireview -"
+      "z /etc/wireview/config 0660 root wireview -"
+    ];
+
+    # Same unit as the distro packages.
     systemd.services.wireviewd = {
       description = "WireView Pro II hwmon daemon";
       after = [ "local-fs.target" "systemd-modules-load.service" ];
@@ -47,14 +57,16 @@ in
       serviceConfig = {
         Type = "simple";
         ExecStart = "${cfg.package}/bin/wireviewd";
+        # Re-read /etc/wireview/config without a restart.
+        ExecReload = "${pkgs.coreutils}/bin/kill -HUP $MAINPID";
         Restart = "on-failure";
         RestartSec = 5;
         ProtectSystem = "strict";
         ReadWritePaths = [ "/run" ];
         LogsDirectory = "wireview";
         LogsDirectoryMode = "0750";
-        ConfigurationDirectory = "wireview";
-        ConfigurationDirectoryMode = "0700";
+        # No ConfigurationDirectory=: systemd would make /etc/wireview
+        # root:root at every start; the tmpfiles rules above own it.
         ProtectHome = true;
         PrivateTmp = true;
         UMask = "0077";

@@ -1,6 +1,9 @@
 # WireView Pro II daemon settings  (/etc/wireview/config)
 #
-# Read once when wireviewd (re)starts. The LAN listener is OFF by default.
+# Read when wireviewd starts and again on reload ("wireviewctl config reload"
+# or "systemctl reload wireviewd"); "wireviewctl config set key=value" edits
+# this file and reloads in one step. Members of the wireview group may edit
+# it. The LAN listener is OFF by default.
 # Values below are the defaults shown for reference - edit as needed.
 # Comments go on their own line: text after a value is part of the value.
 
@@ -18,7 +21,8 @@ port=9876
 #bind=
 
 # Shared HMAC passphrase for authenticated remote writes.
-# Empty = reads only, no remote writes accepted.  Keep this file mode 600.
+# Empty = reads only, no remote writes accepted.  Keep this file mode 660,
+# owner root, group wireview: anyone who can read it can sign remote writes.
 #secret=
 
 # Audit-log retention in days (logs in /var/log/wireview).  0 = keep all.

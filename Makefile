@@ -39,6 +39,13 @@ clean:
 # serial port gets it from the distro's default rules; the DFU bootloader's
 # line names dialout, which udev drops where that group does not exist, so the
 # installed rules name uucp there.
+#
+# /etc/wireview is root:wireview 0750 and its config 0660, so the group can
+# edit the daemon settings (wireviewctl config set). The config is only
+# installed when missing, so the chgrp/chmod lines bring an install from an
+# earlier release, where both were root-only, to the same modes (GNU install
+# -d already does that for the directory; the explicit pair does not depend
+# on it).
 install: all
 	$(MAKE) -C $(KDIR) M=$(MDIR) modules_install
 	depmod -a
@@ -55,12 +62,15 @@ install: all
 	echo wireview_hwmon > /etc/modules-load.d/wireview-hwmon.conf
 	install -d /etc/avahi/services
 	install -m 644 avahi-wireview.service /etc/avahi/services/wireview.service
-	install -d -m 700 /etc/wireview
+	install -d -m 750 -g wireview /etc/wireview
+	chgrp wireview /etc/wireview && chmod 750 /etc/wireview
 	install -d -m 750 /var/log/wireview
-	[ -f /etc/wireview/config ] || install -m 600 wireview-config.sample /etc/wireview/config
+	[ -f /etc/wireview/config ] || install -m 660 -g wireview wireview-config.sample /etc/wireview/config
+	chgrp wireview /etc/wireview/config && chmod 660 /etc/wireview/config
 	@echo "Note: the LAN listener is OFF by default. /etc/wireview/config holds the settings (a"
-	@echo "      reference with the defaults is created on first install): set remote_enabled=1 (+ a"
-	@echo "      secret) to publish; port= and log_days= as needed. Logs go to /var/log/wireview."
+	@echo "      reference with the defaults is created on first install): to publish, run"
+	@echo "      'wireviewctl config set remote_enabled=1' (+ secret=-, port=, log_days= as needed)."
+	@echo "      Members of the wireview group may do that without sudo. Logs go to /var/log/wireview."
 	@echo "      For 'wireviewctl top', list remote hosts (one host[:port] per line) in /etc/wireview/hosts."
 	udevadm control --reload-rules
 	systemctl daemon-reload

@@ -98,7 +98,10 @@ and runs `wireviewd`:
 `wireviewctl flash` finds the bundled firmware in the Nix store and has
 `dfu-util` on its path. The optional daemon config goes in
 `/etc/wireview/config`, which the module does not generate because it may hold
-the LAN secret. `nix build github:emaspa/wireview-hwmon` builds the daemon and
+the LAN secret: create it with `sudo wireviewctl config set ...`. The module
+makes `/etc/wireview` `root:wireview` `0750` and gives an existing config
+`0660` in that group (tmpfiles rules), and `systemctl reload wireviewd` applies
+an edit. `nix build github:emaspa/wireview-hwmon` builds the daemon and
 CLI alone. The package is marked unfree because it bundles Thermal Grizzly's
 firmware image. The flake allows it on its own, so no `allowUnfree` setting is
 needed.
@@ -180,8 +183,11 @@ After rebooting, both the module and daemon will start automatically.
 and `/etc/systemd/system/`, and those copies override the packaged ones under
 `/usr/lib`. After pulling a new version, re-run `sudo make install`,
 then `sudo systemctl restart wireviewd` and replug the device (or run
-`sudo udevadm trigger`). If you have switched to a distro package, delete the
-old copies instead:
+`sudo udevadm trigger`). `make install` also gives `/etc/wireview` and its
+config to the `wireview` group (`0750` and `0660`) when an older install left
+them root-only. If you have switched to a distro package, delete the old copies
+instead (a unit from 1.7.2 or earlier would also make `/etc/wireview` root-only
+again at every start):
 
 ```bash
 sudo rm /etc/udev/rules.d/99-wireview-hwmon.rules /etc/systemd/system/wireviewd.service
@@ -245,7 +251,8 @@ The systemd unit runs `wireviewd` as root but sandboxed and with no
 capabilities. In practice:
 
 - It can write only to `/run` (the command socket) and `/var/log/wireview`;
-  audit logs are created mode `600`. `/etc/wireview` is read-only to it.
+  audit logs are created mode `600`. `/etc/wireview` is read-only to it; it
+  re-reads its config on `systemctl reload wireviewd` (SIGHUP).
 - A `port=` below 1024 in `/etc/wireview/config` fails to bind, since that
   needs `CAP_NET_BIND_SERVICE` and the unit drops all capabilities.
 - The device policy allows only CDC-ACM serial ports and `/dev/wireview-hwmon`,
@@ -401,6 +408,23 @@ Monitor:
                     also read from /etc/wireview/hosts, and the global
                     --host (before "top") adds one more. Press q to quit.
 
+Daemon settings (/etc/wireview/config, local only):
+  config [show] [--show-secret]
+                    Print the settings wireviewd uses, as key=value lines
+                    (remote_enabled, port, bind, secret, log_days, then
+                    any other keys); the secret is masked unless
+                    --show-secret is given.
+  config set KEY=VALUE...
+                    Change settings and have wireviewd apply them, no
+                    restart: remote_enabled=0|1 (on/off, true/false),
+                    port=1024-65535, bind= (all) or a numeric IPv4/IPv6
+                    address, secret=TEXT (secret=- reads it from stdin,
+                    out of ps and the shell history), log_days=0-3650.
+                    Comments and other lines are kept. Needs root or the
+                    wireview group (log in again after joining it).
+  config reload     Have wireviewd re-read the file after a manual edit
+                    (same as systemctl reload wireviewd)
+
 Other:
   -V, --version     Print the wireviewctl version
 ```
@@ -468,21 +492,76 @@ the confirmation or `-y`, as before. A daemon that does not report the product
 (wireview-hwmon 1.6.0 and earlier) only runs Pro II devices, so the device
 counts as `EF05` there.
 
+### Daemon settings (`config`)
+
+`wireviewctl config` reads and edits the daemon's settings file,
+`/etc/wireview/config` (the device's own configuration is `read-config` and
+`write-config`), and has the running daemon apply a change at once:
+
+```bash
+wireviewctl config                       # remote_enabled=0, port=9876, bind=, secret=, log_days=14
+wireviewctl config set remote_enabled=1  # config reloaded: listener on [::]:9876
+wireviewctl config set port=9900 bind=127.0.0.1
+printf '%s\n' 'my passphrase' | wireviewctl config set secret=-
+wireviewctl config reload                # after editing the file by hand
+```
+
+`config` (or `config show`) prints the values the daemon takes from the file,
+defaults included, one `key=value` per line in the order of the installed
+sample, then any other keys the file has. The secret shows as `secret=********`
+(`secret=` when there is none) unless you add `--show-secret`. Without a file it
+prints the defaults, with a note on stderr.
+
+`config set` checks every value before it writes anything (`remote_enabled` 0
+or 1, also on/off or true/false; `port` 1024 to 65535, since the service has no
+capability for a lower one; `bind` empty or a numeric IPv4 or IPv6 address;
+`secret` one line, at most 127 bytes; `log_days` 0 to 3650) and exits 2 on a
+bad one. It then rewrites the file in place, so its owner and mode stay: each
+key replaces its line, or its commented-out line from the sample (`#secret=`),
+or is appended, and comments, blank lines, other keys and the order are kept.
+A second active line for the same key is removed, because the daemon would read
+that one instead. A secret on the command line shows up in `ps` and the shell
+history; `secret=-` reads it from standard input instead.
+
+After writing, `config set` asks the daemon to reload and prints its answer:
+`config reloaded: listener on [::]:9876`, `listener off`, or the reason the
+listener could not open (exit 1). When the daemon is not running, the file is
+still written and the change applies when it starts. `config reload` (or
+`sudo systemctl reload wireviewd`, which sends SIGHUP) applies a hand edit.
+A reload replaces the secret and the log retention and reopens the listener
+only when `remote_enabled`, `port` or `bind` changed; a file that cannot be
+read leaves the running settings as they were. `config` is local only and
+refuses with `--host`.
+
 ### Permissions: the `wireview` group
 
 Commands that can change or brick the device are accepted only from root or
-members of the `wireview` system group: `bootloader`, `flash`, `nvm` and
-`write-config` (and, for other clients such as the GUI app, the serial
-handover used for log reads, theme uploads and in-app flashing). Everything
-else (`info`, `sensors`, `top`, `read-config`, `screen`, `clear-faults`,
-`build`) works for any user.
+members of the `wireview` system group: `bootloader`, `flash`, `nvm`,
+`write-config` and `config reload` (and, for other clients such as the GUI app,
+the serial handover used for log reads, theme uploads and in-app flashing).
+Everything else (`info`, `sensors`, `top`, `read-config`, `screen`,
+`clear-faults`, `build`) works for any user.
 
-The deb, rpm and AUR packages and `make install` create the group. Add
-yourself; it takes effect on the next connection, no re-login needed:
+The group may also read and edit the daemon settings: `/etc/wireview` is
+`root:wireview` mode `0750` and `/etc/wireview/config` mode `0660`, so
+`wireviewctl config set` works without sudo. That includes the LAN secret,
+which fits with what the group can already do: every device command,
+flashing included, is open to it. The group cannot create or rename files in
+`/etc/wireview`, so editors that save through a temporary file need sudo;
+`wireviewctl config set` writes the file in place.
+
+The deb, rpm and AUR packages, the NixOS module and `make install` create the
+group and set those modes (also on upgrade from a release where the directory
+was root-only). Add yourself:
 
 ```bash
 sudo usermod -aG wireview $USER
 ```
+
+For the socket commands it takes effect on the next connection, no re-login
+needed: the daemon looks up the group per connection. Editing the settings
+file goes by the groups of your login session, so for `config set` log out and
+back in (or start a shell with `newgrp wireview`).
 
 `flash` needs the group only to ask the daemon to enter the bootloader. The
 flashing itself runs `dfu-util` as you, which needs the seat or `dialout`
@@ -553,6 +632,9 @@ wireviewctl write-config config.hex
 
 # Store config to NVM
 wireviewctl nvm store
+
+# Publish this host's readings on the LAN (daemon settings, applied at once)
+wireviewctl config set remote_enabled=1
 
 # Use in scripts
 POWER=$(wireviewctl sensors | grep total_power_uw | cut -d' ' -f2)
@@ -644,7 +726,8 @@ addresses as `[addr]:port`). That daemon needs its
   the command line shows up in `ps`. Over HTTP the signature is the permission
   check; the `wireview` group does not apply.
 - `bootloader` and `flash` refuse: the daemon never exposes the bootloader
-  over the network.
+  over the network. `config` refuses too: the daemon settings can only be
+  changed on the machine itself.
 - `wireviewctl --host H top` adds H to the `top` view, like `top --host H`.
 
 A non-2xx reply prints the HTTP status and the daemon's error, and the command
@@ -666,8 +749,24 @@ The daemon listens on a Unix socket at `/run/wireviewd.sock` that any local user
 | ENTER_BOOTLOADER * | Restart the device into DFU bootloader mode |
 | SUSPEND_SERIAL * | Pause daemon polling and release the serial port for a client (1-300 s, re-armable) |
 | RESUME_SERIAL * | End a serial handover early and resume polling |
+| RELOAD_CONFIG * | Re-read `/etc/wireview/config` and apply it, the same as SIGHUP (see below) |
 
 The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`. Status is 0 (ok), 1 (error), 2 (device not connected) or 3 (denied: privileged command from a peer that is not root or in the `wireview` group).
+
+The command types are GET_DEVICE_INFO `0x01`, CLEAR_FAULTS `0x02`,
+READ_CONFIG `0x03`, WRITE_CONFIG `0x04`, SCREEN_CMD `0x05`, NVM_CMD `0x06`,
+READ_BUILD `0x07`, ENTER_BOOTLOADER `0x08`, SUSPEND_SERIAL `0x09`,
+RESUME_SERIAL `0x0A` and RELOAD_CONFIG `0x0B`.
+
+RELOAD_CONFIG (in releases after 1.7.2) takes no payload and works with or
+without a device. It re-reads the settings file, replaces the secret and the
+log retention, and closes, opens or moves the LAN listener as the file now
+says; connections already accepted are not affected. The reply is status 0
+with the listener state as text (`listener on [::]:9876`, `listener off`), or
+status 1 with the reason (`listener on 127.0.0.1:9876 failed: Address already
+in use`, or `cannot read /etc/wireview/config: ...; previous settings kept`).
+Each reload is one line in the [audit log](#audit-log) with the requester's
+uid. An older daemon answers status 1 with no text (or 2 without a device).
 
 The GET_DEVICE_INFO payload is:
 
@@ -740,8 +839,24 @@ default**: no port is opened unless you enable it.
 
 ### Enabling it
 
-Edit `/etc/wireview/config` (a documented reference with the defaults is installed by
-the deb, rpm and AUR packages and by `make install`; upgrades keep your edits):
+As root or a member of the [`wireview` group](#permissions-the-wireview-group):
+
+```bash
+wireviewctl config set remote_enabled=1
+# optional: one address only, another port, and a secret for remote writes
+wireviewctl config set bind=127.0.0.1 port=9876
+printf '%s\n' 'your-passphrase' | wireviewctl config set secret=-
+```
+
+Each `config set` applies at once (`config reloaded: listener on [::]:9876`);
+there is nothing to restart. `wireviewctl config set remote_enabled=0` closes
+the listener again. See [Daemon settings](#daemon-settings-config) for the
+details.
+
+The settings live in `/etc/wireview/config` (a documented reference with the
+defaults is installed by the deb, rpm and AUR packages and by `make install`;
+upgrades keep your edits). You can also edit it by hand and run
+`wireviewctl config reload` or `sudo systemctl reload wireviewd`:
 
 ```ini
 # open the listener (default 0 = off)
@@ -758,7 +873,7 @@ log_days=14
 
 Comments go on their own line: text after a value is part of the value.
 
-Then `sudo systemctl restart wireviewd`. Reads stay open; **writes require the secret**.
+Reads stay open; **writes require the secret**.
 
 `bind=` takes a numeric IPv4 or IPv6 address (`127.0.0.1` for a local
 Prometheus only, `::1`, `192.168.1.10`). Unset, the listener takes every
@@ -824,6 +939,11 @@ The file advertises port 9876; edit its `<port>` if you changed `port=`.
   timestamp, nonce, and signature over the body using the shared `secret`, so
   the secret never travels on the wire and replays are rejected (±30 s window).
   An empty secret disables writes (the daemon answers `403`).
+- **Who holds the secret** - `/etc/wireview/config` is readable and writable
+  by root and the `wireview` group only, so group members can read the secret
+  and sign remote writes, and can open or move the listener with
+  `wireviewctl config set`. Only add users you would also trust with the
+  device itself (the group already allows every local device command).
 - **Flood protection** - request-size cap and bounded handling.
 - **Audit log** (below). No TLS: this is built for a trusted LAN - the HMAC keeps
   the secret off the wire, but anyone on the LAN can read `/sensors` and
@@ -886,6 +1006,7 @@ file in `/var/log/wireview/` (retention from `log_days`):
 2026-06-10T09:41:08 [INFO] wireviewd 1.5.1 started; listener enabled on [::]:9876, remote writes enabled, log retention 14 days
 2026-06-10T09:41:12 [INFO] command from 192.168.1.20: op=screen -> executed
 2026-06-10T09:41:15 [WARN] command from 192.168.1.33 rejected: bad signature
+2026-06-10T09:52:30 [INFO] config reloaded: listener on [::]:9876 (uid 1000)
 ```
 
 High-frequency `/sensors` and `/metrics` polls are not logged.
@@ -894,7 +1015,7 @@ High-frequency `/sensors` and `/metrics` polls are not logged.
 
 | File | Purpose |
 |------|---------|
-| `/etc/wireview/config` | Daemon settings: `remote_enabled`, `port`, `bind`, `secret`, `log_days`. Mode `600`. Read at (re)start. A commented reference is installed by the packages and `make install`. |
+| `/etc/wireview/config` | Daemon settings: `remote_enabled`, `port`, `bind`, `secret`, `log_days`. Mode `0660`, owner root, group `wireview`, in a `0750` `root:wireview` directory: the group can read and edit it, secret included. Read at start and on reload (`wireviewctl config set` / `config reload`, `systemctl reload wireviewd`). A commented reference is installed by the packages and `make install`. |
 | `/etc/wireview/hosts` | Optional remote-host list for `wireviewctl top` (one `host[:port]` per line). Not installed; create it yourself if you want one. |
 | `/var/log/wireview/` | Daily-rotating audit logs, mode `600` (created by the daemon on its first log write). |
 | `/etc/avahi/services/wireview.service` | Optional mDNS advertisement of the listener. Installed by `make install` only; see [mDNS discovery](#mdns-discovery-optional). |

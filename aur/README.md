@@ -16,6 +16,7 @@ Arch-based distros (CachyOS, EndeavourOS):
 | `PKGBUILD` | Split recipe pulling the GitHub release tarball (sha256-pinned). |
 | `.SRCINFO` | Generated metadata (`makepkg --printsrcinfo`); regenerate on every change. |
 | `wireview-hwmon.sysusers` | Creates the `wireview` group (installed as `/usr/lib/sysusers.d/wireview-hwmon.conf`). |
+| `wireview-hwmon.tmpfiles` | Gives `/etc/wireview` (`0750`) and its `config` (`0660`) to that group (installed as `/usr/lib/tmpfiles.d/wireview-hwmon.conf`). |
 
 ## Publish (first time)
 
@@ -24,9 +25,9 @@ account with your SSH key registered.
 
 ```bash
 git clone ssh://aur@aur.archlinux.org/wireview-hwmon.git
-cp PKGBUILD .SRCINFO wireview-hwmon.sysusers wireview-hwmon/
+cp PKGBUILD .SRCINFO wireview-hwmon.sysusers wireview-hwmon.tmpfiles wireview-hwmon/
 cd wireview-hwmon
-git add PKGBUILD .SRCINFO wireview-hwmon.sysusers
+git add PKGBUILD .SRCINFO wireview-hwmon.sysusers wireview-hwmon.tmpfiles
 git commit -m "Update to wireview-hwmon 1.5.0"
 git push
 ```

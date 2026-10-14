@@ -59,7 +59,8 @@ WCMD_NVM_CMD = 0x06
 WCMD_ENTER_BOOTLOADER = 0x08
 WCMD_SUSPEND_SERIAL = 0x09
 WCMD_RESUME_SERIAL = 0x0A
-RESP_OK, RESP_NOT_CONNECTED, RESP_DENIED = 0, 2, 3
+WCMD_RELOAD_CONFIG = 0x0B
+RESP_OK, RESP_ERROR, RESP_NOT_CONNECTED, RESP_DENIED = 0, 1, 2, 3
 SECRET = "e2e-secret"   # POST /command on the loopback listener
 IDLE_S = 2              # CLIENT_IDLE_S of the test build (60 in production)
 MAX_CLIENTS = 8
@@ -311,10 +312,19 @@ def audit_log(tmp):
     return text
 
 
-def ctl(tmp, *args, env=None):
+def ctl(tmp, *args, env=None, input=None):
     return subprocess.run([os.path.join(tmp, "wireviewctl"), *args],
                           capture_output=True, text=True, timeout=10,
-                          env=env)
+                          env=env, input=input)
+
+
+def http_refused(port):
+    """True if nothing accepts connections on 127.0.0.1:port."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            return False
+    except ConnectionRefusedError:
+        return True
 
 
 def fake_sysfs(tmp):
@@ -735,6 +745,10 @@ def run_wireview2(tmp):
         status, _ = request(sock, WCMD_GET_DEVICE_INFO)
         check(status == RESP_NOT_CONNECTED,
               "WireView II: GET_DEVICE_INFO gets status 2", str(status))
+        status, data = request(sock, WCMD_RELOAD_CONFIG)
+        check(status == RESP_OK and data == b"listener off",
+              "with no device attached, RELOAD_CONFIG still answers "
+              "'listener off'", f"{status} {data!r}")
     finally:
         stop_daemon(daemon, "WireView II daemon")
         out.close()
@@ -750,6 +764,154 @@ def run_wireview2(tmp):
     check(hwmon.size() == 0 and dev.polls == 0 and not dev.writes,
           "WireView II: no sensor read, no frame written to hwmon",
           f"{hwmon.size()} hwmon bytes, {dev.polls} polls")
+
+
+def run_reload(tmp):
+    """Settings changed under a running daemon: "wireviewctl config set"
+    (the test user is privileged in this build) and SIGHUP open, move and
+    close the LAN listener and swap the secret, without a restart."""
+    sock = os.path.join(tmp, "wireviewd.sock")
+    cfg = os.path.join(tmp, "config")
+    daemon, dev, hwmon, out, _ = start_edition(tmp, 5, False,
+                                               "daemon_reload.out")
+    # The installed sample, so the rewrite meets its comments.
+    shutil.copy(os.path.join(TOP, "wireview-config.sample"), cfg)
+    os.chmod(cfg, 0o640)
+    ino = os.stat(cfg).st_ino
+    p1, p2, p3 = free_port(), free_port(), free_port()
+    try:
+        if not check(wait_until(lambda: (os.path.exists(sock) and
+                                         dev.polls >= 2) or
+                                daemon.poll() is not None, 10) and
+                     daemon.poll() is None,
+                     "reload: daemon starts with the listener off"):
+            return
+        check(http_refused(p1), "reload: nothing listens before the change")
+
+        r = ctl(tmp, "config", "set", "remote_enabled=1", "bind=127.0.0.1",
+                f"port={p1}")
+        check(r.returncode == 0 and r.stdout.strip() ==
+              f"config reloaded: listener on 127.0.0.1:{p1}",
+              "config set remote_enabled=1 port=P reports the new listener",
+              repr(r.stdout + r.stderr))
+        status, _, body = http_get(p1, "/sensors")
+        check(status == 200 and json.loads(body)["devices"][0]["id"] ==
+              UID_HEX, "GET /sensors answers on the new port at once",
+              f"{status} {body[:200]}")
+        text = open(cfg).read()
+        check("remote_enabled=1\n" in text and f"\nport={p1}\n" in text and
+              "\nbind=127.0.0.1\n" in text and "#bind=" not in text and
+              "# Listener port.\n" in text and "#secret=\n" in text and
+              os.stat(cfg).st_ino == ino and
+              os.stat(cfg).st_mode & 0o7777 == 0o640,
+              "the file is rewritten in place: comments kept, #bind= "
+              "replaced, same inode and mode", text)
+
+        r = ctl(tmp, "config", "set", f"port={p2}")
+        check(r.returncode == 0 and
+              f"listener on 127.0.0.1:{p2}" in r.stdout and
+              http_get(p2, "/sensors")[0] == 200 and http_refused(p1),
+              "config set port= moves the listener; the old port is closed",
+              repr(r.stdout + r.stderr))
+
+        # The secret is replaced: a write signed with it goes through,
+        # one signed with the old (no) secret is refused. secret=- reads
+        # it from stdin.
+        host = f"127.0.0.1:{p2}"
+        r = ctl(tmp, "config", "set", "secret=-", input="reload secret\n")
+        check(r.returncode == 0, "config set secret=- takes stdin",
+              repr(r.stdout + r.stderr))
+        r = ctl(tmp, "--host", host, "screen", "main",
+                env=dict(os.environ, WIREVIEW_SECRET="reload secret"))
+        check(r.returncode == 0,
+              "a remote write signed with the new secret is accepted",
+              repr(r.stdout + r.stderr))
+        r = ctl(tmp, "--host", host, "screen", "main",
+                env=dict(os.environ, WIREVIEW_SECRET="wrong"))
+        check(r.returncode != 0, "one signed with another secret is refused",
+              repr(r.stdout + r.stderr))
+        r = ctl(tmp, "config")
+        check(r.returncode == 0 and
+              "\nsecret=********\n" in r.stdout and
+              "reload secret" not in r.stdout,
+              "config show masks the secret", repr(r.stdout))
+        r = ctl(tmp, "config", "--show-secret")
+        check("\nsecret=reload secret\n" in r.stdout,
+              "config --show-secret prints it", repr(r.stdout))
+
+        # Invalid values: refused before anything is written.
+        before = open(cfg).read()
+        r = ctl(tmp, "config", "set", "port=80")
+        check(r.returncode == 2 and open(cfg).read() == before and
+              http_get(p2, "/sensors")[0] == 200,
+              "config set port=80 exits 2 and changes nothing",
+              repr(r.stdout + r.stderr))
+
+        r = ctl(tmp, "config", "set", "remote_enabled=off")
+        check(r.returncode == 0 and
+              r.stdout.strip() == "config reloaded: listener off" and
+              http_refused(p2),
+              "config set remote_enabled=off closes the listener",
+              repr(r.stdout + r.stderr))
+
+        # A hand edit, then SIGHUP (what systemctl reload sends).
+        with open(cfg, "w") as f:
+            f.write(f"remote_enabled=1\nbind=127.0.0.1\nport={p3}\n")
+        daemon.send_signal(signal.SIGHUP)
+        check(wait_until(lambda: not http_refused(p3), 5) and
+              http_get(p3, "/sensors")[0] == 200,
+              "SIGHUP re-reads the file and opens the listener")
+        check(wait_until(lambda: "config reloaded: listener on "
+                         f"127.0.0.1:{p3} (SIGHUP)" in audit_log(tmp), 2),
+              "the SIGHUP reload is logged", audit_log(tmp)[-400:])
+
+        # A listener that cannot open: the error comes back, exit 1.
+        with open(cfg, "w") as f:
+            f.write("remote_enabled=1\nbind=localhost\n")
+        r = ctl(tmp, "config", "reload")
+        check(r.returncode == 1 and
+              "listener on localhost:9876 failed" in r.stderr and
+              http_refused(p3),
+              "config reload reports a listener that failed to open",
+              repr(r.stdout + r.stderr))
+        status, data = request(sock, WCMD_RELOAD_CONFIG)
+        check(status == RESP_ERROR and
+              data.startswith(b"listener on localhost:9876 failed"),
+              "RELOAD_CONFIG answers status 1 with the error text",
+              f"{status} {data!r}")
+
+        # A missing file keeps the running settings.
+        with open(cfg, "w") as f:
+            f.write(f"remote_enabled=1\nbind=127.0.0.1\nport={p3}\n")
+        r = ctl(tmp, "config", "reload")
+        check(r.returncode == 0 and http_get(p3, "/sensors")[0] == 200,
+              "config reload after fixing the file reopens it",
+              repr(r.stdout + r.stderr))
+        os.rename(cfg, cfg + ".away")
+        status, data = request(sock, WCMD_RELOAD_CONFIG)
+        os.rename(cfg + ".away", cfg)
+        check(status == RESP_ERROR and b"previous settings kept" in data and
+              http_get(p3, "/sensors")[0] == 200,
+              "a missing file: status 1, previous settings kept, the "
+              "listener stays", f"{status} {data!r}")
+        check("WARN] config reload (uid " in audit_log(tmp),
+              "the failed read is a WARN in the log")
+
+        # The device is unaffected throughout.
+        polls = dev.polls
+        check(dev.wait_for(lambda: dev.polls >= polls + 3) and
+              daemon.poll() is None and request(sock, WCMD_GET_DEVICE_INFO)[0]
+              == RESP_OK, "polling and the socket carry on across reloads")
+    finally:
+        stop_daemon(daemon, "reload daemon")
+        out.close()
+        dev.stop()
+        hwmon.stop()
+    log = audit_log(tmp)
+    check(log.count("[INFO] config reloaded: ") >= 7 and
+          f"(uid {os.getuid()})" in log,
+          "each reload is one INFO line naming the requester",
+          log[-800:])
 
 
 def run_unprivileged(tmp):
@@ -796,10 +958,11 @@ def run_unprivileged(tmp):
                       ("ENTER_BOOTLOADER", WCMD_ENTER_BOOTLOADER, b""),
                       ("SUSPEND_SERIAL", WCMD_SUSPEND_SERIAL,
                        struct.pack("<H", 5)),
-                      ("RESUME_SERIAL", WCMD_RESUME_SERIAL, b""))}
+                      ("RESUME_SERIAL", WCMD_RESUME_SERIAL, b""),
+                      ("RELOAD_CONFIG", WCMD_RELOAD_CONFIG, b""))}
         check(all(s == RESP_DENIED for s in denied.values()),
-              "NVM, bootloader and serial handover get status 3 too",
-              str(denied))
+              "NVM, bootloader, serial handover and config reload get "
+              "status 3 too", str(denied))
         polls = dev.polls
         check(dev.wait_for(lambda: dev.polls >= polls + 3),
               "polling carries on: no handover was granted")
@@ -809,6 +972,8 @@ def run_unprivileged(tmp):
         check(wait_until(lambda: f"socket cmd 0x04 from uid {os.getuid()} "
                          "denied" in audit_log(utmp), 2),
               "the denied config write is audited with the peer's uid")
+        check("config reloaded" not in audit_log(utmp),
+              "the denied reload did not reload")
     finally:
         stop_daemon(daemon, "unprivileged-peer daemon")
         out.close()
@@ -1160,7 +1325,8 @@ def main():
                   "checks will fail")
         build(tmp, group or NO_GROUP)
         check_fake_reassembly()
-        for step in (run, run_noctua, run_wireview2, run_unprivileged):
+        for step in (run, run_noctua, run_wireview2, run_reload,
+                     run_unprivileged):
             try:
                 step(tmp)
             except Exception as e:  # report, then go on to the summary
@@ -1168,7 +1334,7 @@ def main():
                       f"{type(e).__name__}: {e}")
         if failed:
             for name in ("daemon.out", "daemon6.out", "daemon7.out",
-                         "u/daemon.out"):
+                         "daemon_reload.out", "u/daemon.out"):
                 p = os.path.join(tmp, name)
                 if os.path.exists(p):
                     print(f"--- {name}\n" + open(p).read())

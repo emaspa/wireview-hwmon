@@ -57,7 +57,11 @@ install -Dm0755 wireviewctl %{buildroot}%{_bindir}/wireviewctl
 install -Dm0644 debian/wireviewd.service %{buildroot}%{_unitdir}/wireviewd.service
 install -Dm0644 99-wireview-hwmon.rules %{buildroot}%{_udevrulesdir}/99-wireview-hwmon.rules
 install -Dm0644 firmware/TG-WV-PRO2-FW.hex %{buildroot}%{_datadir}/wireview/TG-WV-PRO2-FW.hex
-install -Dm0600 wireview-config.sample %{buildroot}%{_sysconfdir}/wireview/config
+install -Dm0660 wireview-config.sample %{buildroot}%{_sysconfdir}/wireview/config
+# The wireview group. rpm >= 4.19 creates it from this file before the files
+# are laid down, and it provides the group(wireview) that the %%attr lines
+# below make the package require.
+install -Dm0644 aur/wireview-hwmon.sysusers %{buildroot}%{_sysusersdir}/wireview-hwmon.conf
 
 # DKMS module source (version baked into dkms.conf and MODULE_VERSION)
 install -Dm0644 wireview_hwmon.c %{buildroot}%{_usrsrc}/%{name}-%{version}/wireview_hwmon.c
@@ -76,16 +80,29 @@ chmod 0644 %{buildroot}%{_usrsrc}/%{name}-%{version}/dkms.conf \
 %{_udevrulesdir}/99-wireview-hwmon.rules
 %dir %{_datadir}/wireview
 %{_datadir}/wireview/TG-WV-PRO2-FW.hex
-%dir %attr(0700,root,root) %{_sysconfdir}/wireview
-%config(noreplace) %attr(0600,root,root) %{_sysconfdir}/wireview/config
+%{_sysusersdir}/wireview-hwmon.conf
+# The wireview group may edit the daemon settings (wireviewctl config set).
+%dir %attr(0750,root,wireview) %{_sysconfdir}/wireview
+%config(noreplace) %attr(0660,root,wireview) %{_sysconfdir}/wireview/config
 
 %pre
 # Members of this group may send wireviewd's privileged socket commands
-# (bootloader, NVM, config write, serial handover).
+# (bootloader, NVM, config write, serial handover, settings reload) and edit
+# /etc/wireview/config. Created here, before the files are laid down, so
+# rpm can give them the group, where rpm is older than 4.19 and does not
+# create it from the sysusers.d file.
 getent group wireview >/dev/null || groupadd -r wireview
 exit 0
 
 %post
+# An upgrade keeps a locally modified config (noreplace) with the mode and
+# group of the release before, root:root 0600 in a 0700 directory; the
+# %%attr above may only reach the files rpm writes. Same fix-up as the deb.
+chgrp wireview %{_sysconfdir}/wireview && chmod 0750 %{_sysconfdir}/wireview || :
+if [ -e %{_sysconfdir}/wireview/config ]; then
+    chgrp wireview %{_sysconfdir}/wireview/config && \
+        chmod 0660 %{_sysconfdir}/wireview/config || :
+fi
 %systemd_post wireviewd.service
 
 %preun

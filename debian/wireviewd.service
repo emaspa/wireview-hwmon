@@ -10,6 +10,9 @@ Type=simple
 # below (ProtectKernelModules= and the empty capability set would block it).
 ExecStartPre=-+/sbin/modprobe wireview_hwmon
 ExecStart=/usr/bin/wireviewd
+# Re-read /etc/wireview/config (secret, log_days, LAN listener) without a
+# restart; "wireviewctl config set|reload" does the same over the socket.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 
@@ -31,13 +34,15 @@ RestartSec=5
 #    writes to that node, so misc devices get "w" and not "rw". The kernel
 #    checks the device list on access() as well as open(), so a blocked node
 #    shows up as "/dev/wireview-hwmon not available" in the journal.
-# /etc/wireview (config and HMAC secret) stays read-only.
+# /etc/wireview (config and HMAC secret) stays read-only to the daemon. It
+# is root:wireview 0750 with the file 0660, so the group can edit the
+# settings; the packages and "make install" set that up. There is no
+# ConfigurationDirectory= on purpose: systemd would make the directory
+# root:root again at every start.
 ProtectSystem=strict
 ReadWritePaths=/run
 LogsDirectory=wireview
 LogsDirectoryMode=0750
-ConfigurationDirectory=wireview
-ConfigurationDirectoryMode=0700
 ProtectHome=yes
 # No PrivateUsers=: in a private user namespace every peer of the command
 # socket except root shows up as uid 65534, so the wireview group check

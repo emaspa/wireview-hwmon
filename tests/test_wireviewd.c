@@ -1,8 +1,8 @@
 /*
  * Unit tests for wireviewd's helpers: JSON/base64/HTTP parsing, HMAC, the
  * hwmon record (v3 with energy, v2 fallback), energy integration, the
- * GET /sensors and /metrics bodies, the config file, the listener, the
- * product table, device info query and GET_DEVICE_INFO reply.
+ * GET /sensors and /metrics bodies, the config file and its reload, the
+ * listener, the product table, device info query and GET_DEVICE_INFO reply.
  *
  * wireviewd.c is one file of static functions, so it is compiled into this
  * test directly with its main() renamed out of the way.
@@ -1480,8 +1480,8 @@ static void write_config(const char *text)
 	fclose(f);
 }
 
-/* load_config() only resets the listener flag and the secret; the rest
- * keep their compiled-in defaults unless set, so reset them per case. */
+/* load_config() sets every setting (the default where the file has none);
+ * reset them per case anyway, so a case cannot pass on a leftover. */
 static void config_defaults(void)
 {
 	g_http_enabled = 0;
@@ -1598,6 +1598,289 @@ static void test_load_config(void)
 	config_defaults();
 }
 
+/* config_read() fills a struct and touches no global: what a reload
+ * parses before it decides anything. */
+static void test_config_read(void)
+{
+	char dir[] = "/tmp/wireview-test-config-XXXXXX";
+	struct wv_config c;
+
+	if (!mkdtemp(dir)) {
+		perror("mkdtemp");
+		CHECK(0);
+		return;
+	}
+	snprintf(test_config_path, sizeof(test_config_path), "%s/config", dir);
+	unsetenv("WIREVIEW_SECRET");
+	unsetenv("WIREVIEW_LISTEN");
+
+	/* Missing: -1 with ENOENT, and the defaults. */
+	memset(&c, 0x55, sizeof(c));
+	errno = 0;
+	CHECK_EQ_INT(config_read(test_config_path, &c), -1);
+	CHECK_EQ_INT(errno, ENOENT);
+	CHECK_EQ_INT(c.remote_enabled, 0);
+	CHECK_EQ_INT(c.port, 9876);
+	CHECK_EQ_STR(c.bind, "");
+	CHECK_EQ_STR(c.secret, "");
+	CHECK_EQ_INT(c.log_days, 14);
+
+	/* Every key, with comments and blank lines around them. */
+	write_config("# header\n\n  # indented comment\nremote_enabled=1\n\n"
+		     "port=19000\nbind=192.168.1.10\nsecret=pw\nlog_days=0\n");
+	g_http_port = 1234;
+	snprintf(g_secret, sizeof(g_secret), "untouched");
+	CHECK_EQ_INT(config_read(test_config_path, &c), 0);
+	CHECK_EQ_INT(c.remote_enabled, 1);
+	CHECK_EQ_INT(c.port, 19000);
+	CHECK_EQ_STR(c.bind, "192.168.1.10");
+	CHECK_EQ_STR(c.secret, "pw");
+	CHECK_EQ_INT(c.log_days, 0);
+	CHECK_EQ_INT(g_http_port, 1234);	/* no global changed */
+	CHECK_EQ_STR(g_secret, "untouched");
+
+	/* A key the file no longer has is back at its default: a reload
+	 * after deleting port= returns to 9876, not the previous port. */
+	write_config("remote_enabled=1\n");
+	CHECK_EQ_INT(config_read(test_config_path, &c), 0);
+	CHECK_EQ_INT(c.port, 9876);
+	CHECK_EQ_INT(c.log_days, 14);
+	CHECK_EQ_STR(c.bind, "");
+
+	/* The bare-line secret of old configs, with or without other keys,
+	 * and only when no secret= came first. */
+	write_config("legacy-pass\n");
+	CHECK_EQ_INT(config_read(test_config_path, &c), 0);
+	CHECK_EQ_STR(c.secret, "legacy-pass");
+	write_config("  spaced legacy pass  \r\nport=10000\n");
+	CHECK_EQ_INT(config_read(test_config_path, &c), 0);
+	CHECK_EQ_STR(c.secret, "spaced legacy pass");
+	CHECK_EQ_INT(c.port, 10000);
+	write_config("secret=\nbare-after-empty\n");
+	CHECK_EQ_INT(config_read(test_config_path, &c), 0);
+	CHECK_EQ_STR(c.secret, "bare-after-empty");
+	write_config("secret=first\nbare\n");
+	CHECK_EQ_INT(config_read(test_config_path, &c), 0);
+	CHECK_EQ_STR(c.secret, "first");
+
+	/* The spellings "wireviewctl config set" writes (0 and 1) and the
+	 * truthy forms an editor might. */
+	static const struct { const char *v; int on; } forms[] = {
+		{ "1", 1 }, { "0", 0 }, { "true", 1 }, { "True", 1 }, { "yes", 1 },
+		{ "false", 0 }, { "off", 0 }, { "no", 0 },
+	};
+	for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
+		char text[64];
+		snprintf(text, sizeof(text), "remote_enabled = %s\n", forms[i].v);
+		write_config(text);
+		CHECK_EQ_INT(config_read(test_config_path, &c), 0);
+		CHECK_EQ_INT(c.remote_enabled, forms[i].on);
+	}
+
+	/* The environment still wins, file or no file. */
+	setenv("WIREVIEW_SECRET", "env-secret", 1);
+	setenv("WIREVIEW_LISTEN", "1", 1);
+	write_config("remote_enabled=0\nsecret=file\n");
+	CHECK_EQ_INT(config_read(test_config_path, &c), 0);
+	CHECK_EQ_STR(c.secret, "env-secret");
+	CHECK_EQ_INT(c.remote_enabled, 1);
+	unlink(test_config_path);
+	errno = 0;
+	CHECK_EQ_INT(config_read(test_config_path, &c), -1);
+	CHECK_EQ_INT(errno, ENOENT);	/* errno survives the env lookups */
+	CHECK_EQ_STR(c.secret, "env-secret");
+	CHECK_EQ_INT(c.remote_enabled, 1);
+	unsetenv("WIREVIEW_SECRET");
+	unsetenv("WIREVIEW_LISTEN");
+
+	rmdir(dir);
+	snprintf(test_config_path, sizeof(test_config_path), "/nonexistent/wireview-config");
+	config_defaults();
+}
+
+static void test_listener_plan(void)
+{
+	struct wv_config c;
+
+	memset(&c, 0, sizeof(c));
+	c.port = 9876;
+
+	/* Off: close an open listener, nothing to do otherwise. */
+	CHECK_EQ_INT(listener_plan(1, 9876, "", &c), LISTENER_CLOSE);
+	CHECK_EQ_INT(listener_plan(0, 9876, "", &c), LISTENER_KEEP);
+
+	/* On: open when there is none (also after a failed attempt), keep
+	 * when the address is unchanged, reopen when port or bind moved. */
+	c.remote_enabled = 1;
+	CHECK_EQ_INT(listener_plan(0, 9876, "", &c), LISTENER_OPEN);
+	CHECK_EQ_INT(listener_plan(1, 9876, "", &c), LISTENER_KEEP);
+	CHECK_EQ_INT(listener_plan(1, 9877, "", &c), LISTENER_OPEN);
+	CHECK_EQ_INT(listener_plan(1, 9876, "127.0.0.1", &c), LISTENER_OPEN);
+	snprintf(c.bind, sizeof(c.bind), "127.0.0.1");
+	CHECK_EQ_INT(listener_plan(1, 9876, "127.0.0.1", &c), LISTENER_KEEP);
+	CHECK_EQ_INT(listener_plan(1, 9876, "", &c), LISTENER_OPEN);
+	CHECK_EQ_INT(listener_plan(1, 9876, "::1", &c), LISTENER_OPEN);
+}
+
+/* A loopback TCP port that was free a moment ago. */
+static int free_port(void)
+{
+	struct sockaddr_in a;
+	socklen_t len = sizeof(a);
+	int fd = socket(AF_INET, SOCK_STREAM, 0), port = -1;
+
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	if (fd >= 0 && bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+	    getsockname(fd, (struct sockaddr *)&a, &len) == 0)
+		port = ntohs(a.sin_port);
+	if (fd >= 0)
+		close(fd);
+	return port;
+}
+
+/* The port g_http_fd listens on, -1 if none. */
+static int listening_port(void)
+{
+	struct sockaddr_storage sa;
+	socklen_t len = sizeof(sa);
+
+	if (g_http_fd < 0 ||
+	    getsockname(g_http_fd, (struct sockaddr *)&sa, &len) != 0)
+		return -1;
+	return sa.ss_family == AF_INET6 ?
+	       ntohs(((struct sockaddr_in6 *)&sa)->sin6_port) :
+	       ntohs(((struct sockaddr_in *)&sa)->sin_port);
+}
+
+static void test_reload_config(void)
+{
+	char dir[] = "/tmp/wireview-test-reload-XXXXXX";
+	char text[160], msg[320], want[96];
+	int rc, p1 = free_port(), p2 = free_port();
+
+	if (!mkdtemp(dir) || p1 < 0 || p2 < 0) {
+		perror("reload setup");
+		CHECK(0);
+		return;
+	}
+	snprintf(test_config_path, sizeof(test_config_path), "%s/config", dir);
+	unsetenv("WIREVIEW_SECRET");
+	unsetenv("WIREVIEW_LISTEN");
+	config_defaults();
+	g_http_fd = -1;
+
+	/* Off stays off. */
+	write_config("remote_enabled=0\nsecret=one\nlog_days=3\n");
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	CHECK_EQ_INT(rc, 0);
+	CHECK_EQ_STR(msg, "listener off");
+	CHECK_EQ_INT(g_http_fd, -1);
+	CHECK_EQ_STR(g_secret, "one");
+	CHECK_EQ_INT(g_log_retain_days, 3);
+
+	/* Turned on: listening on the configured address. */
+	snprintf(text, sizeof(text), "remote_enabled=1\nbind=127.0.0.1\nport=%d\nsecret=two\n", p1);
+	write_config(text);
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	CHECK_EQ_INT(rc, 0);
+	snprintf(want, sizeof(want), "listener on 127.0.0.1:%d", p1);
+	CHECK_EQ_STR(msg, want);
+	CHECK(g_http_fd >= 0);
+	CHECK_EQ_INT(listening_port(), p1);
+	CHECK_EQ_STR(g_secret, "two");
+	CHECK_EQ_INT(g_log_retain_days, 14);	/* line removed: default */
+
+	/* Only the secret changes: the same socket stays open. */
+	int fd_before = g_http_fd;
+	struct stat st_before, st_after;
+	CHECK_EQ_INT(fstat(fd_before, &st_before), 0);
+	snprintf(text, sizeof(text), "remote_enabled=1\nbind=127.0.0.1\nport=%d\nsecret=three\n", p1);
+	write_config(text);
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	CHECK_EQ_INT(rc, 0);
+	CHECK_EQ_STR(msg, want);
+	CHECK_EQ_INT(g_http_fd, fd_before);
+	CHECK_EQ_INT(fstat(g_http_fd, &st_after), 0);
+	CHECK_EQ_INT(st_after.st_ino, st_before.st_ino);
+	CHECK_EQ_STR(g_secret, "three");
+
+	/* A new port: moved there. */
+	snprintf(text, sizeof(text), "remote_enabled=1\nbind=127.0.0.1\nport=%d\n", p2);
+	write_config(text);
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	CHECK_EQ_INT(rc, 0);
+	snprintf(want, sizeof(want), "listener on 127.0.0.1:%d", p2);
+	CHECK_EQ_STR(msg, want);
+	CHECK_EQ_INT(listening_port(), p2);
+	CHECK_EQ_STR(g_secret, "");
+
+	/* A port taken by someone else: the failure is reported, the
+	 * listener is off, and the next reload retries. */
+	int blocker = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	a.sin_port = htons((uint16_t)p1);
+	CHECK(blocker >= 0 && bind(blocker, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+	      listen(blocker, 1) == 0);
+	snprintf(text, sizeof(text), "remote_enabled=1\nbind=127.0.0.1\nport=%d\n", p1);
+	write_config(text);
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	CHECK_EQ_INT(rc, -1);
+	snprintf(want, sizeof(want), "listener on 127.0.0.1:%d failed: ", p1);
+	CHECK(strncmp(msg, want, strlen(want)) == 0);
+	CHECK(strstr(msg, "in use") != NULL);
+	CHECK_EQ_INT(g_http_fd, -1);
+	close(blocker);
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	CHECK_EQ_INT(rc, 0);
+	CHECK_EQ_INT(listening_port(), p1);
+
+	/* A bind= that is not numeric fails rather than widening. */
+	write_config("remote_enabled=1\nbind=localhost\n");
+	QUIET(QUIET_OUT(rc = reload_config("test", msg, sizeof(msg))));
+	CHECK_EQ_INT(rc, -1);
+	CHECK(strstr(msg, "listener on localhost:9876 failed") == msg);
+	CHECK_EQ_INT(g_http_fd, -1);
+
+	/* Off again: closed. */
+	snprintf(text, sizeof(text), "remote_enabled=1\nbind=127.0.0.1\nport=%d\n", p2);
+	write_config(text);
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	CHECK(g_http_fd >= 0);
+	write_config("remote_enabled=0\nsecret=kept?\n");
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	CHECK_EQ_INT(rc, 0);
+	CHECK_EQ_STR(msg, "listener off");
+	CHECK_EQ_INT(g_http_fd, -1);
+
+	/* A missing (or unreadable) file changes nothing at all. */
+	snprintf(text, sizeof(text), "remote_enabled=1\nbind=127.0.0.1\nport=%d\nsecret=last\n", p2);
+	write_config(text);
+	QUIET_OUT(rc = reload_config("test", msg, sizeof(msg)));
+	int fd_kept = g_http_fd;
+	CHECK(fd_kept >= 0);
+	unlink(test_config_path);
+	QUIET(QUIET_OUT(rc = reload_config("test", msg, sizeof(msg))));
+	CHECK_EQ_INT(rc, -1);
+	CHECK(strstr(msg, "No such file") != NULL);
+	CHECK(strstr(msg, "previous settings kept") != NULL);
+	CHECK_EQ_INT(g_http_fd, fd_kept);
+	CHECK_EQ_INT(listening_port(), p2);
+	CHECK_EQ_STR(g_secret, "last");
+	CHECK_EQ_INT(g_http_enabled, 1);
+
+	if (g_http_fd >= 0)
+		close(g_http_fd);
+	g_http_fd = -1;
+	rmdir(dir);
+	snprintf(test_config_path, sizeof(test_config_path), "/nonexistent/wireview-config");
+	config_defaults();
+}
+
 static void test_setup_http(void)
 {
 	char desc[256];
@@ -1695,6 +1978,9 @@ int main(void)
 	test_prom_escape();
 	test_metrics();
 	test_load_config();
+	test_config_read();
+	test_listener_plan();
+	test_reload_config();
 	test_setup_http();
 	return check_summary("test_wireviewd");
 }
