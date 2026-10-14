@@ -1,3 +1,41 @@
+wireview-hwmon (1.8.0~26.04.1) resolute; urgency=medium
+
+  * /etc/wireview is now root:wireview 0750 and the config file 0660, so
+    members of the wireview group edit the daemon settings without root. The
+    unit no longer declares ConfigurationDirectory; the package sets the
+    ownership on install and upgrade. Group members can read the secret, as
+    they can already send every privileged device command.
+  * wireviewd re-reads /etc/wireview/config on SIGHUP (systemctl reload
+    wireviewd) and on the new privileged socket command RELOAD_CONFIG: the
+    secret and log_days apply at once and the LAN listener is opened, moved
+    or closed without a restart.
+  * wireviewctl config shows the settings with the secret masked; config set
+    KEY=VALUE validates, rewrites the file in place and reloads the daemon;
+    config reload reloads it after a manual edit.
+  * The udev rule's serial line sets no group, so each distro's own serial
+    group applies (dialout on Debian, Ubuntu and Fedora, uucp on Arch).
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 14 Oct 2026 09:52:52 +0100
+
+wireview-hwmon (1.8.0~24.04.1) noble; urgency=medium
+
+  * /etc/wireview is now root:wireview 0750 and the config file 0660, so
+    members of the wireview group edit the daemon settings without root. The
+    unit no longer declares ConfigurationDirectory; the package sets the
+    ownership on install and upgrade. Group members can read the secret, as
+    they can already send every privileged device command.
+  * wireviewd re-reads /etc/wireview/config on SIGHUP (systemctl reload
+    wireviewd) and on the new privileged socket command RELOAD_CONFIG: the
+    secret and log_days apply at once and the LAN listener is opened, moved
+    or closed without a restart.
+  * wireviewctl config shows the settings with the secret masked; config set
+    KEY=VALUE validates, rewrites the file in place and reloads the daemon;
+    config reload reloads it after a manual edit.
+  * The udev rule's serial line sets no group, so each distro's own serial
+    group applies (dialout on Debian, Ubuntu and Fedora, uucp on Arch).
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 14 Oct 2026 09:52:52 +0100
+
 wireview-hwmon (1.7.2~26.04.1) resolute; urgency=medium
 
   * wireviewd locks the serial port (TIOCEXCL) while it runs, so another

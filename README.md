@@ -758,7 +758,7 @@ READ_CONFIG `0x03`, WRITE_CONFIG `0x04`, SCREEN_CMD `0x05`, NVM_CMD `0x06`,
 READ_BUILD `0x07`, ENTER_BOOTLOADER `0x08`, SUSPEND_SERIAL `0x09`,
 RESUME_SERIAL `0x0A` and RELOAD_CONFIG `0x0B`.
 
-RELOAD_CONFIG (in releases after 1.7.2) takes no payload and works with or
+RELOAD_CONFIG (since 1.8.0) takes no payload and works with or
 without a device. It re-reads the settings file, replaces the secret and the
 log retention, and closes, opens or moves the LAN listener as the file now
 says; connections already accepted are not affected. The reply is status 0

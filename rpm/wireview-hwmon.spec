@@ -2,7 +2,7 @@
 
 Name:           wireview-hwmon
 # Must match the top-level VERSION file ("make check-version").
-Version:        1.7.2
+Version:        1.8.0
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -146,6 +146,22 @@ dkms status -m %{name} -v %{version} -k "$(uname -r)" 2>/dev/null | grep -q ': i
 dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
 
 %changelog
+* Wed Oct 14 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.8.0-1
+- /etc/wireview is now root:wireview 0750 and the config file 0660, so
+  members of the wireview group edit the daemon settings without root. The
+  unit no longer declares ConfigurationDirectory; the package sets the
+  ownership on install and upgrade. Group members can read the secret, as
+  they can already send every privileged device command.
+- wireviewd re-reads /etc/wireview/config on SIGHUP (systemctl reload
+  wireviewd) and on the new privileged socket command RELOAD_CONFIG: the
+  secret and log_days apply at once and the LAN listener is opened, moved or
+  closed without a restart.
+- wireviewctl config shows the settings with the secret masked; config set
+  KEY=VALUE validates, rewrites the file in place and reloads the daemon;
+  config reload reloads it after a manual edit.
+- The udev rule's serial line sets no group, so each distro's own serial
+  group applies (dialout on Debian, Ubuntu and Fedora, uucp on Arch).
+
 * Fri Oct 09 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.7.2-1
 - wireviewd locks the serial port (TIOCEXCL) while it runs, so another
   program can no longer open it and split the device's replies. A
