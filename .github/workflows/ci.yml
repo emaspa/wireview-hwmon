@@ -70,12 +70,19 @@ jobs:
         run: make check-version
 
       # checkpatch exits non-zero on warnings too; only errors fail the job.
+      # raw.githubusercontent.com rate-limits the runners now and then (HTTP
+      # 429): retry with a pause, and if it still refuses, skip the check with
+      # a warning instead of failing a push that did not touch the module.
       - name: checkpatch
         run: |
           base=https://raw.githubusercontent.com/torvalds/linux/master/scripts
           mkdir -p "$RUNNER_TEMP/checkpatch"
           for f in checkpatch.pl spelling.txt const_structs.checkpatch; do
-            curl -fsSL -o "$RUNNER_TEMP/checkpatch/$f" "$base/$f"
+            if ! curl -fsSL --retry 5 --retry-delay 20 --retry-all-errors \
+                 -o "$RUNNER_TEMP/checkpatch/$f" "$base/$f"; then
+              echo "::warning::could not download $f (rate limited?); checkpatch skipped"
+              exit 0
+            fi
           done
           perl "$RUNNER_TEMP/checkpatch/checkpatch.pl" --no-tree -f \
             wireview_hwmon.c | tee checkpatch.log || true
