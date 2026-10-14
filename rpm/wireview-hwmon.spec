@@ -2,7 +2,7 @@
 
 Name:           wireview-hwmon
 # Must match the top-level VERSION file ("make check-version").
-Version:        1.8.0
+Version:        1.8.1
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -146,6 +146,13 @@ dkms status -m %{name} -v %{version} -k "$(uname -r)" 2>/dev/null | grep -q ': i
 dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
 
 %changelog
+* Wed Oct 14 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.8.1-1
+- wireviewd retries a LAN listener whose port was taken when it started or
+  at a reload, every 10 s, and opens it on its own once the port is free.
+  Until now the listener stayed off until a reload (WireView Mini publishes
+  on port 9876 itself while wireviewd is down and hands it back a moment
+  after the daemon comes back).
+
 * Wed Oct 14 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.8.0-1
 - /etc/wireview is now root:wireview 0750 and the config file 0660, so
   members of the wireview group edit the daemon settings without root. The

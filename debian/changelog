@@ -1,3 +1,25 @@
+wireview-hwmon (1.8.1~26.04.1) resolute; urgency=medium
+
+  * wireviewd retries a LAN listener whose port was taken when it started
+    or at a reload, every 10 s, and opens it on its own once the port is
+    free, with one INFO line in the log. Until now the listener stayed off
+    until a reload. The case is WireView Mini, which publishes on port 9876
+    itself while wireviewd is down and hands the port back a moment after
+    the daemon comes back.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 14 Oct 2026 20:45:09 +0000
+
+wireview-hwmon (1.8.1~24.04.1) noble; urgency=medium
+
+  * wireviewd retries a LAN listener whose port was taken when it started
+    or at a reload, every 10 s, and opens it on its own once the port is
+    free, with one INFO line in the log. Until now the listener stayed off
+    until a reload. The case is WireView Mini, which publishes on port 9876
+    itself while wireviewd is down and hands the port back a moment after
+    the daemon comes back.
+
+ -- Emanuele Sparvoli <sparvoli@gmail.com>  Wed, 14 Oct 2026 20:45:09 +0000
+
 wireview-hwmon (1.8.0~26.04.1) resolute; urgency=medium
 
   * /etc/wireview is now root:wireview 0750 and the config file 0660, so
