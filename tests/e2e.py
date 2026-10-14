@@ -645,16 +645,17 @@ def exercise_config(tmp, dev, sock, port):
           f"unknown {dev.unknown}")
 
 
-def start_edition(tmp, product_id, listen, name):
+def start_edition(tmp, product_id, listen, name, port=None):
     """Serve a fake device of product_id to the main test build, now that
     run() has stopped its daemon (the build's paths are fixed at compile
     time). Returns (daemon, dev, hwmon, out, port); port is None unless
-    listen."""
+    listen (a free one unless given)."""
     hwpath = os.path.join(tmp, "hwmon")
     if os.path.exists(hwpath):
         os.unlink(hwpath)
     hwmon = HwmonSink(hwpath)
-    port = free_port() if listen else None
+    if listen and port is None:
+        port = free_port()
     with open(os.path.join(tmp, "config"), "w") as f:
         f.write(f"remote_enabled=1\nbind=127.0.0.1\nport={port}\n"
                 if listen else "remote_enabled=0\n")
@@ -764,6 +765,50 @@ def run_wireview2(tmp):
     check(hwmon.size() == 0 and dev.polls == 0 and not dev.writes,
           "WireView II: no sensor read, no frame written to hwmon",
           f"{hwmon.size()} hwmon bytes, {dev.polls} polls")
+
+
+def run_listener_retry(tmp):
+    """The listener's port is taken when the daemon starts (WireView Mini
+    publishes on 9876 itself until it sees the daemon): the daemon starts
+    without the listener and opens it on its own once the port is free,
+    with no reload."""
+    sock = os.path.join(tmp, "wireviewd.sock")
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+    daemon, dev, hwmon, out, _ = start_edition(tmp, 5, True,
+                                               "daemon_retry.out", port)
+    try:
+        check(wait_until(lambda: (os.path.exists(sock) and
+                                  dev.polls >= 2) or
+                         daemon.poll() is not None, 10) and
+              daemon.poll() is None,
+              "listener retry: the daemon runs although its port is taken")
+        text = open(out.name).read()
+        check(f"network listener on 127.0.0.1:{port} failed: " in text and
+              "(retrying every 10 s)" in text,
+              "the failed listener is reported with the retry", text)
+        holder.close()
+        # The retry comes within 10 s of the start; allow for a slow box.
+        check(wait_until(lambda: not http_refused(port), 15),
+              "the listener opens on its own once the port is free")
+        status, _, body = http_get(port, "/sensors")
+        check(status == 200 and json.loads(body)["devices"][0]["id"] ==
+              UID_HEX, "GET /sensors answers on the retried listener",
+              f"{status} {body[:200]}")
+        text = open(out.name).read()
+        check(f"network listener on 127.0.0.1:{port} opened on a retry"
+              in text, "the retry is reported", text)
+    finally:
+        holder.close()
+        stop_daemon(daemon, "listener retry daemon")
+        out.close()
+        dev.stop()
+        hwmon.stop()
+    log = audit_log(tmp)
+    check(f"[INFO] network listener on 127.0.0.1:{port} opened on a retry"
+          in log, "the retry is one INFO line in the log", log[-600:])
 
 
 def run_reload(tmp):
@@ -1326,7 +1371,7 @@ def main():
         build(tmp, group or NO_GROUP)
         check_fake_reassembly()
         for step in (run, run_noctua, run_wireview2, run_reload,
-                     run_unprivileged):
+                     run_listener_retry, run_unprivileged):
             try:
                 step(tmp)
             except Exception as e:  # report, then go on to the summary
@@ -1334,7 +1379,8 @@ def main():
                       f"{type(e).__name__}: {e}")
         if failed:
             for name in ("daemon.out", "daemon6.out", "daemon7.out",
-                         "daemon_reload.out", "u/daemon.out"):
+                         "daemon_reload.out", "daemon_retry.out",
+                         "u/daemon.out"):
                 p = os.path.join(tmp, name)
                 if os.path.exists(p):
                     print(f"--- {name}\n" + open(p).read())

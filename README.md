@@ -765,6 +765,8 @@ says; connections already accepted are not affected. The reply is status 0
 with the listener state as text (`listener on [::]:9876`, `listener off`), or
 status 1 with the reason (`listener on 127.0.0.1:9876 failed: Address already
 in use`, or `cannot read /etc/wireview/config: ...; previous settings kept`).
+A listener that failed because its port was taken is retried every 10 s and
+opens on its own once the port is free (one INFO line in the log).
 Each reload is one line in the [audit log](#audit-log) with the requester's
 uid. An older daemon answers status 1 with no text (or 2 without a device).
 
@@ -809,6 +811,7 @@ handover. Idle disconnects and replacements are logged in the
 - When used with the wireview-linux app, the daemon handles the serial port and the app communicates through hwmon (sensors) and the daemon socket (commands). Both can run simultaneously.
 - The daemon locks the serial port while it runs: other programs that do not run as root get "Device or resource busy" instead of sharing the device's replies. The app's log reads and theme uploads borrow the port through SUSPEND_SERIAL, which lifts the lock until the handover ends.
 - If the device is disconnected, the daemon will wait and reconnect automatically. The command socket and the LAN listener keep serving meanwhile.
+- If the LAN listener's port is taken when the daemon starts (WireView Mini publishes on 9876 itself until it sees the daemon), the daemon runs without it and retries every 10 s, opening the listener on its own once the port is free.
 - Sensor readings become stale (report N/A) if no data is received for 5 seconds.
 
 ## LAN monitoring (remote access)

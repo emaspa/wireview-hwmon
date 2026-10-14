@@ -306,6 +306,12 @@ static int  g_log_retain_days = 14; /* days of audit logs to keep (config: log_d
  * WCMD_RELOAD_CONFIG from a socket client) may close or replace it in the
  * middle of the run. g_listen_desc names its address for messages. */
 static int  g_http_fd = -1;
+/* While the listener is enabled but could not be opened (its port was
+ * taken at start or at a reload: WireView Mini publishes on 9876 itself
+ * until it sees the daemon), the main loop tries again at this deadline,
+ * every LISTEN_RETRY_MS, so the LAN comes up without a reload. */
+#define LISTEN_RETRY_MS 10000
+static struct timespec g_listen_retry;
 static char g_listen_desc[256];
 
 #define HTTP_MAX_BODY    8192
@@ -1951,6 +1957,7 @@ static int reload_config(const char *who, char *msg, size_t cap)
 		if (g_http_fd < 0) {
 			snprintf(msg, cap, "listener on %s failed: %s",
 				 g_listen_desc, strerror(errno));
+			deadline_in(&g_listen_retry, LISTEN_RETRY_MS);
 			rc = -1;
 		}
 	}
@@ -2681,10 +2688,12 @@ int main(int argc, char **argv)
 	if (g_http_enabled) {
 		g_http_fd = setup_http(g_listen_desc, sizeof(g_listen_desc));
 		if (g_http_fd < 0) {
-			fprintf(stderr, "wireviewd: warning: network listener on %s failed: %s\n",
-				g_listen_desc, strerror(errno));
-			wlog("WARN", "network listener on %s failed: %s",
-			     g_listen_desc, strerror(errno));
+			fprintf(stderr, "wireviewd: warning: network listener on %s failed: %s "
+				"(retrying every %d s)\n",
+				g_listen_desc, strerror(errno), LISTEN_RETRY_MS / 1000);
+			wlog("WARN", "network listener on %s failed: %s (retrying every %d s)",
+			     g_listen_desc, strerror(errno), LISTEN_RETRY_MS / 1000);
+			deadline_in(&g_listen_retry, LISTEN_RETRY_MS);
 		} else {
 			printf("wireviewd: network listener ENABLED on %s; remote writes %s\n",
 			       g_listen_desc, g_secret[0] ? "enabled (secret set)" : "disabled (no secret)");
@@ -2736,6 +2745,22 @@ int main(int argc, char **argv)
 
 			g_reload_requested = 0;
 			reload_config("SIGHUP", msg, sizeof(msg));
+		}
+
+		/* A listener that could not be opened: try again now and
+		 * then, before the poll set is built like a reload. */
+		if (g_http_enabled && g_http_fd < 0 &&
+		    ms_until(&g_listen_retry) <= 0) {
+			g_http_fd = setup_http(g_listen_desc,
+					       sizeof(g_listen_desc));
+			if (g_http_fd >= 0) {
+				wlog("INFO", "network listener on %s opened "
+				     "on a retry", g_listen_desc);
+				printf("wireviewd: network listener on %s opened "
+				       "on a retry\n", g_listen_desc);
+			} else {
+				deadline_in(&g_listen_retry, LISTEN_RETRY_MS);
+			}
 		}
 
 		if (serial_fd < 0 && ms_until(&next_reconnect) <= 0) {
@@ -2803,6 +2828,12 @@ int main(int argc, char **argv)
 			long left = clients[i].have > 0 ?
 				    ms_until(&clients[i].req_deadline) :
 				    client_idle_left(&clients[i], &tnow);
+			if (left < wait_ms)
+				wait_ms = left;
+		}
+		/* ... or until the listener is to be retried */
+		if (g_http_enabled && g_http_fd < 0) {
+			long left = ms_until(&g_listen_retry);
 			if (left < wait_ms)
 				wait_ms = left;
 		}
