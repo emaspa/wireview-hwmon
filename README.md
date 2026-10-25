@@ -1066,4 +1066,4 @@ Thanks to [Thermal Grizzly](https://www.thermal-grizzly.com/) for providing a Wi
 
 ## License
 
-GPL-2.0
+GPL-2.0, see [LICENSE](LICENSE). `sha256.c` and `sha256.h` are CC0-1.0. The device firmware image in `firmware/` is Thermal Grizzly's and is not covered by the GPL (see [firmware/README.md](firmware/README.md)).
