@@ -1153,22 +1153,15 @@ static void json_keys(const char *j, char *out, size_t cap)
  * host,appVersion,devices,id,name,connected,hwRev,fwVer,buildString,
  * timestamp,pinVoltage,pinCurrent,tempInC,tempOutC,ext1C,ext2C,psuCapW,fan,
  * faultStatus,faultLog,sumCurrentA,sumPowerW,energyJ. */
-static int daemon_sensors_keys(char *out, size_t cap)
+/* Append to out (o bytes so far) the JSON keys written by the function of
+ * wireviewd.c that starts with head, in order, each once. */
+static void source_keys(const char *src, const char *head, char *out,
+			size_t cap, size_t *o)
 {
-	static char src[256 * 1024];
-	FILE *f = fopen(WV_SRCDIR "/wireviewd.c", "r");
-	if (!f)
-		return -1;
-	size_t n = fread(src, 1, sizeof(src) - 1, f);
-	fclose(f);
-	src[n] = '\0';
-
-	const char *p = strstr(src, "static int build_sensors_json(");
+	const char *p = strstr(src, head);
 	const char *end = p ? strstr(p, "\n}\n") : NULL;
 	if (!end)
-		return -1;
-	size_t o = 0;
-	out[0] = '\0';
+		return;
 	while ((p = strstr(p, "\\\"")) != NULL && p < end) {
 		const char *k = p + 2;
 		const char *q = strstr(k, "\\\"");
@@ -1187,13 +1180,31 @@ static int daemon_sensors_keys(char *out, size_t cap)
 			snprintf(pad, sizeof(pad), ",%s,", out);
 			snprintf(needle, sizeof(needle), ",%s,", key);
 			if (!strstr(pad, needle))
-				o += (size_t)snprintf(out + o, cap - o, "%s%s",
-						      o ? "," : "", key);
+				*o += (size_t)snprintf(out + *o, cap - *o, "%s%s",
+						       *o ? "," : "", key);
 			p = q + 2;
 		} else {
 			p = k;
 		}
 	}
+}
+
+/* The keys of wireviewd's GET /sensors: the document's own (host,
+ * appVersion, devices), then each device's. */
+static int daemon_sensors_keys(char *out, size_t cap)
+{
+	static char src[256 * 1024];
+	FILE *f = fopen(WV_SRCDIR "/wireviewd.c", "r");
+	if (!f)
+		return -1;
+	size_t n = fread(src, 1, sizeof(src) - 1, f);
+	fclose(f);
+	src[n] = '\0';
+
+	size_t o = 0;
+	out[0] = '\0';
+	source_keys(src, "static int build_sensors_json(", out, cap, &o);
+	source_keys(src, "static void sensors_json_device(", out, cap, &o);
 	return o ? 0 : -1;
 }
 
@@ -1869,9 +1880,11 @@ static int flash_no_stdin(const char *path, int yes, int force, char out[16384])
 }
 
 /*
- * A refused flash sends the daemon nothing but GET_DEVICE_INFO, even with
- * -y: no ENTER_BOOTLOADER, no dfu-util. Cases that pass the gates are run
- * without -y and with stdin at EOF, so they stop at the prompt.
+ * A refused flash sends the daemon nothing but the read-only LIST_DEVICES
+ * (0c, is the target clear?) and GET_DEVICE_INFO (01), even with -y: no
+ * ENTER_BOOTLOADER, no dfu-util. Cases that pass the gates are run without
+ * -y and with stdin at EOF, so they stop at the prompt; they list the
+ * devices once more for the target's USB port.
  */
 static void test_cmd_flash_gates(void)
 {
@@ -1912,7 +1925,7 @@ static void test_cmd_flash_gates(void)
 		CHECK(strstr(out, "entering bootloader") == NULL);
 		CHECK(strstr(out, "running: dfu-util") == NULL);
 		fake_daemon_log(log, sizeof(log));
-		CHECK_EQ_STR(log, "01\n");
+		CHECK_EQ_STR(log, "0c\n01\n");
 	}
 
 	/* A newer build passes the gates and stops at the prompt. */
@@ -1921,14 +1934,14 @@ static void test_cmd_flash_gates(void)
 	CHECK(strstr(out, "verdict: newer: ") != NULL);
 	CHECK(strstr(out, "entering bootloader") == NULL);
 	fake_daemon_log(log, sizeof(log));
-	CHECK_EQ_STR(log, "01\n");
+	CHECK_EQ_STR(log, "0c\n01\n0c\n");
 	/* --force passes a refused one on to the prompt the same way. */
 	rc = flash_no_stdin(same_path, 0, 1, out);
 	CHECK_EQ_INT(rc, 1);
 	CHECK(strstr(out, "--force: flashing anyway\n") != NULL);
 	CHECK(strstr(out, "entering bootloader") == NULL);
 	fake_daemon_log(log, sizeof(log));
-	CHECK_EQ_STR(log, "01\n");
+	CHECK_EQ_STR(log, "0c\n01\n0c\n");
 	fake_daemon_stop(pid);
 
 	/* A Noctua Edition on a daemon that reports it: the pre-0902 image
@@ -1941,12 +1954,12 @@ static void test_cmd_flash_gates(void)
 	CHECK(strstr(out, "verdict: too old: ") != NULL);
 	CHECK(strstr(out, "entering bootloader") == NULL);
 	fake_daemon_log(log, sizeof(log));
-	CHECK_EQ_STR(log, "01\n");
+	CHECK_EQ_STR(log, "0c\n01\n");
 	/* ... and the 0902 image goes on to the prompt. */
 	rc = flash_no_stdin(newer_path, 0, 0, out);
 	CHECK(strstr(out, "verdict: newer: ") != NULL);
 	fake_daemon_log(log, sizeof(log));
-	CHECK_EQ_STR(log, "01\n");
+	CHECK_EQ_STR(log, "0c\n01\n0c\n");
 	fake_daemon_stop(pid);
 
 	/* No daemon: the gates cannot run; flash says so and asks. */
@@ -1964,7 +1977,7 @@ static void test_cmd_flash_gates(void)
 		      "build TG-WV-PRO2-FW_20260902_0741\n") != NULL);
 	CHECK(strstr(out, "verdict: newer: ") != NULL);
 	fake_daemon_log(log, sizeof(log));
-	CHECK_EQ_STR(log, "01\n");
+	CHECK_EQ_STR(log, "0c\n01\n0c\n");
 	fake_daemon_stop(pid);
 }
 
@@ -2351,6 +2364,174 @@ static void test_cmd_config(void)
 	snprintf(g_sock_path, sizeof(g_sock_path), "/nonexistent/wireviewd.sock");
 }
 
+/* ---- several devices: LIST_DEVICES, --device, every local hwmon ---- */
+
+/* A LIST_DEVICES record as wireviewd writes it. */
+static void list_rec(uint8_t *r, uint8_t uid0, int index, int state, int flags,
+		     uint8_t product, const char *serial, const char *tty,
+		     const char *usb, const char *build)
+{
+	memset(r, 0, 160);
+	for (int i = 0; i < 12; i++)
+		r[i] = (uint8_t)(uid0 + i);
+	r[12] = (uint8_t)index;
+	r[13] = (uint8_t)state;
+	r[14] = 0xEF;
+	r[15] = product;
+	r[16] = 7;
+	r[17] = 2;
+	r[18] = (uint8_t)flags;
+	memcpy(r + 20, serial, strlen(serial));
+	memcpy(r + 36, tty, strlen(tty));
+	memcpy(r + 100, usb, strlen(usb));
+	memcpy(r + 116, build, strlen(build));
+}
+
+static void test_device_list(void)
+{
+	uint8_t buf[3 + 3 * 168];
+	struct wv_listdev l[4];
+
+	/* Three records; a later format may grow them (rec_size 168 here). */
+	buf[0] = 1;
+	buf[1] = 3;
+	buf[2] = 168;
+	list_rec(buf + 3, 0xC0, 0, 0, 1 | 4, 6, "20A036A64E46", "/dev/ttyACM0", "3-4", "B0");
+	list_rec(buf + 3 + 168, 0xB0, 1, 1, 4, 5, "205B38A53245",
+		 "/dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_ComPort_", "3-6", "B1");
+	list_rec(buf + 3 + 336, 0xD0, 2, 2, 0, 5, "", "/dev/ttyACM2", "", "");
+	memset(buf + 3 + 160, 0xEE, 8);		/* unknown appended bytes */
+	CHECK_EQ_INT(parse_device_list(buf, sizeof(buf), l, 4), 3);
+	CHECK_EQ_STR(l[0].uid_hex, "C0C1C2C3C4C5C6C7C8C9CACB");
+	CHECK(l[0].index == 0 && l[0].state == 0 && l[0].flags == 5 && l[0].product == 6);
+	CHECK_EQ_STR(l[0].usb_serial, "20A036A64E46");
+	CHECK_EQ_STR(l[0].tty, "/dev/ttyACM0");
+	CHECK_EQ_STR(l[0].usb_path, "3-4");
+	CHECK_EQ_STR(l[0].build, "B0");
+	CHECK(l[1].index == 1 && l[1].state == 1 && l[1].product == 5);
+	CHECK_EQ_STR(l[1].usb_path, "3-6");
+	CHECK_EQ_STR(l[1].tty, "/dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_ComPort_");
+	CHECK_EQ_STR(l[2].usb_serial, "");
+	CHECK_EQ_INT(parse_device_list(buf, sizeof(buf), l, 2), 2);	/* capped */
+	CHECK_EQ_INT(parse_device_list(buf, sizeof(buf) - 1, l, 4), -1);	/* short */
+	buf[0] = 2;
+	CHECK_EQ_INT(parse_device_list(buf, sizeof(buf), l, 4), -1);	/* format */
+	buf[0] = 1;
+	CHECK_EQ_INT(parse_device_list(buf, 2, l, 4), -1);
+	parse_device_list(buf, sizeof(buf), l, 4);
+
+	/* --device: index, UID or USB serial in full or by their end. */
+	CHECK_EQ_INT(match_device("0", l, 3), 0);
+	CHECK_EQ_INT(match_device("1", l, 3), 1);
+	CHECK_EQ_INT(match_device("7", l, 3), -1);
+	CHECK_EQ_INT(match_device("c0c1c2c3c4c5c6c7c8c9cacb", l, 3), 0);
+	CHECK_EQ_INT(match_device("205B38A53245", l, 3), 1);
+	CHECK_EQ_INT(match_device("4e46", l, 3), 0);
+	CHECK_EQ_INT(match_device("3245", l, 3), 1);
+	CHECK_EQ_INT(match_device("CACB", l, 3), 0);
+	CHECK_EQ_INT(match_device("D9DADB", l, 3), 2);
+	CHECK_EQ_INT(match_device("ab", l, 3), -1);	/* too short to be an end */
+	CHECK_EQ_INT(match_device("XYZ", l, 3), -1);
+	/* An end two devices share is ambiguous. */
+	snprintf(l[2].usb_serial, sizeof(l[2].usb_serial), "99994E46");
+	CHECK_EQ_INT(match_device("4E46", l, 3), -2);
+	CHECK_EQ_INT(match_device("20A036A64E46", l, 3), 0);	/* in full: fine */
+
+	/* The table names state, edition and the primary. */
+	static char out[4096];
+	CAPTURE(out, print_device_list(stdout, l, 3));
+	CHECK(strstr(out, "IDX STATE") == out);
+	CHECK(strstr(out, "\n0   connected   20A036A64E46 C0C1C2C3C4C5C6C7C8C9CACB "
+		     "WireView Pro II Noctua Edition") != NULL);
+	CHECK(strstr(out, "(primary)\n1   handed over ") != NULL);
+	CHECK(strstr(out, "\n2   gone ") != NULL);
+
+	/* An older daemon (RESP_ERROR to LIST): SOCK_OLD; no daemon at all. */
+	uint8_t dummy[1] = { 0 };
+	pid_t pid = fake_daemon_start(RESP_OK, dummy, 0);
+	CHECK_EQ_INT(list_devices(l, 4, 1), SOCK_OLD);
+	g_device = "1";
+	QUIET(CHECK_EQ_INT(resolve_device(), 1));
+	CHECK(!g_sel_set);
+	g_device = NULL;
+	/* require_target lets an old daemon's single device through. */
+	CHECK_EQ_INT(require_target("screen"), 0);
+	fake_daemon_stop(pid);
+	snprintf(g_sock_path, sizeof(g_sock_path), "/nonexistent/wireviewd.sock");
+	CHECK_EQ_INT(list_devices(l, 4, 1), SOCK_NODAEMON);
+}
+
+/* A second fake hwmon directory beside g_hwmon, for device 2. */
+static void test_local_multi(void)
+{
+	char d2[PATH_MAX], env[2 * PATH_MAX + 2], path[PATH_MAX];
+	static char out[32768];
+	static struct wv_snap all[WV_MAXDEV];
+	char *argv_json[] = { "wireviewctl", "sensors", "--json", NULL };
+	char *argv_plain[] = { "wireviewctl", "sensors", NULL };
+	int rc = -1;
+
+	sysfs_populate();
+	snprintf(d2, sizeof(d2), "%s/hwmon8", g_tmpdir);
+	snprintf(path, sizeof(path), "rm -rf %s && cp -r %s %s", d2, g_hwmon, d2);
+	CHECK_EQ_INT(system(path), 0);
+	/* Their identities, as a 1.9.0 module publishes them. */
+	snprintf(path, sizeof(path), "%s/uid", g_hwmon);
+	FILE *f = fopen(path, "w"); fputs("AAAAAAAAAAAAAAAAAAAA1111\n", f); fclose(f);
+	snprintf(path, sizeof(path), "%s/uid", d2);
+	f = fopen(path, "w"); fputs("BBBBBBBBBBBBBBBBBBBB2222\n", f); fclose(f);
+	snprintf(path, sizeof(path), "%s/in0_input", d2);
+	f = fopen(path, "w"); fputs("11111\n", f); fclose(f);
+
+	snprintf(env, sizeof(env), "%s:%s", g_hwmon, d2);
+	setenv("WIREVIEW_HWMON_PATH", env, 1);
+	char dirs[4][PATH_MAX];
+	CHECK_EQ_INT(find_hwmon_paths(dirs, 4), 2);
+	CHECK_EQ_INT(find_hwmon_paths(dirs, 1), 1);
+	CHECK_EQ_INT(read_local_all(all, WV_MAXDEV), 2);
+	CHECK_EQ_STR(all[0].uid, "AAAAAAAAAAAAAAAAAAAA1111");
+	CHECK_EQ_STR(all[1].uid, "BBBBBBBBBBBBBBBBBBBB2222");
+	CHECK_EQ_STR(all[0].source, "local 1111");
+	CHECK_EQ_INT(all[1].in_mv[0], 11111);
+
+	/* Plain: a header per device; JSON: one document with both. */
+	CAPTURE(out, rc = cmd_sensors(2, argv_plain));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strncmp(out, "device: 0 AAAAAAAAAAAAAAAAAAAA1111 ", 35) == 0);
+	CHECK(strstr(out, "\n\ndevice: 0 BBBBBBBBBBBBBBBBBBBB2222 ") != NULL);
+	CHECK(strstr(out, "pin1_voltage_mv: 11111\n") != NULL);
+	CAPTURE(out, rc = cmd_sensors(3, argv_json));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strstr(out, "\"id\":\"AAAAAAAAAAAAAAAAAAAA1111\"") != NULL);
+	CHECK(strstr(out, "},{\"id\":\"BBBBBBBBBBBBBBBBBBBB2222\"") != NULL);
+
+	/* --device picks one: sensors shows only it, as it always did. */
+	g_sel_set = 1;
+	memset(g_sel_uid, 0xBB, 10);
+	g_sel_uid[10] = 0x22;
+	g_sel_uid[11] = 0x22;
+	CAPTURE(out, rc = cmd_sensors(2, argv_plain));
+	CHECK_EQ_INT(rc, 0);
+	CHECK(strncmp(out, "pin1_voltage_mv: 11111\n", 23) == 0);
+	CHECK(strstr(out, "device:") == NULL);
+	struct wv_snap one;
+	CHECK_EQ_INT(read_local(&one), 0);
+	CHECK_EQ_STR(one.source, "local");
+	memset(g_sel_uid, 0xCC, 12);
+	CHECK_EQ_INT(read_local(&one), -1);
+	g_sel_set = 0;
+
+	/* No --device: read_local is the first by instance. */
+	CHECK_EQ_INT(read_local(&one), 0);
+	CHECK_EQ_STR(one.uid, "AAAAAAAAAAAAAAAAAAAA1111");
+
+	snprintf(path, sizeof(path), "%s/uid", g_hwmon);
+	unlink(path);
+	snprintf(path, sizeof(path), "rm -rf %s", d2);
+	CHECK_EQ_INT(system(path), 0);
+	setenv("WIREVIEW_HWMON_PATH", g_hwmon, 1);
+}
+
 int main(void)
 {
 	if (!mkdtemp(g_tmpdir)) {
@@ -2368,6 +2549,8 @@ int main(void)
 	test_parse_remote_tricky();
 	test_remote_absent_fields();
 	test_read_local();
+	test_device_list();
+	test_local_multi();
 	test_sensors_output();
 	test_parse_device_info();
 	test_device_edition();

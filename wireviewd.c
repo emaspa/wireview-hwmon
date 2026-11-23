@@ -8,7 +8,13 @@
  * Noctua Edition (vendor 0xEF, product 5 or 6). The WireView II family
  * (products 7 and 8) is recognized but not supported.
  *
- * Usage: wireviewd [-i interval_ms] [-d device_path] [-V]
+ * Several devices are driven at once, up to MAX_DEVICES. Each gets a
+ * stable index, kept in STATE_DIR/devices, and its own hwmon instance
+ * (wireview, wireview1, ...) through the module's WIREVIEW_IOC_BIND. Command-socket
+ * connections address the device chosen with WCMD_SELECT_DEVICE, or the
+ * connected device with the lowest index (the primary) if they never chose.
+ *
+ * Usage: wireviewd [-i interval_ms] [-d device_path]... [-V]
  *
  * The command socket (/run/wireviewd.sock) is world-connectable, but commands
  * that can alter or brick the device (bootloader, NVM, config write, serial
@@ -64,7 +70,28 @@
 #ifndef CONFIG_PATH
 #define CONFIG_PATH  "/etc/wireview/config"
 #endif
+#ifndef STATE_DIR
+#define STATE_DIR    "/var/lib/wireview"
+#endif
 #define HTTP_PORT    9876
+
+/* Devices driven at once, and the hwmon instances the module offers. */
+#define MAX_DEVICES       8
+#define MAX_HWMON_INDEX   32
+/* How often the device list is rescanned for arrivals. */
+#define RESCAN_MS         3000
+/* A port that did not answer as a WireView is probed again after this. */
+#define PROBE_RETRY_MS    5000
+
+/* WIREVIEW_IOC_BIND of the wireview_hwmon module (must match it). */
+struct wv_hwmon_bind {
+	uint32_t index;
+	char     serial[16];
+	char     uid[28];
+	char     label[48];
+};
+_Static_assert(sizeof(struct wv_hwmon_bind) == 96, "bind struct size mismatch");
+#define WIREVIEW_IOC_BIND _IOW('W', 0xA0, struct wv_hwmon_bind)
 
 /* Members of this group (and root) may send privileged socket commands.
  * Overridable (-D) only so the e2e test can run the privileged path as an
@@ -84,7 +111,7 @@
 
 /* Command-socket clients connected at once. When the table is full, a new
  * connection evicts the client that has been idle longest. */
-#define MAX_CLIENTS 8
+#define MAX_CLIENTS 32
 
 /* A socket request (3-byte header + payload) must arrive in full within
  * this many ms of its first byte, or the client is disconnected. */
@@ -133,12 +160,19 @@
  * or without a device. Privileged because it can open a port; the file
  * itself is writable by the same group. */
 #define WCMD_RELOAD_CONFIG     0x0B	/* [priv] */
+/* Several devices: LIST_DEVICES describes every device this run has seen
+ * (format in list_devices_reply()); SELECT_DEVICE (payload: the 12 UID
+ * bytes, or nothing to go back to the primary) makes the commands of this
+ * connection address that device. Both work with no device attached. */
+#define WCMD_LIST_DEVICES      0x0C
+#define WCMD_SELECT_DEVICE     0x0D
 
 /* Response status */
 #define RESP_OK            0
 #define RESP_ERROR         1
 #define RESP_NOT_CONNECTED 2
 #define RESP_DENIED        3	/* privileged command from unprivileged peer */
+#define RESP_NO_DEVICE     4	/* SELECT_DEVICE: no device with that UID */
 
 static volatile int running = 1;
 /* Set by SIGHUP; the main loop runs reload_config() and clears it. */
@@ -250,49 +284,134 @@ struct device_info {
 	int      valid;
 };
 
-static struct device_info dev_info;
+/*
+ * One device this run has seen. A slot stays after a disconnect, so the
+ * device keeps its energy counter, its hwmon instance (reporting no data)
+ * and its place in LIST_DEVICES and /metrics until it is back; it is
+ * reused only when every slot is taken.
+ */
+struct wv_device {
+	int      used;
+	int      index;			/* hwmon index, persisted in STATE_DIR */
+	char     tty[256];		/* serial port in use or last used */
+	char     usb_serial[32];	/* USB serial number; "" if unknown */
+	char     usb_path[32];		/* USB port path, e.g. "3-4"; "" if unknown */
+	char     tag[8];		/* short id for logs: last 4 of the serial */
+	char     uid_hex[25];
+	int      serial_fd;		/* -1 while disconnected */
+	int      hwmon_fd;		/* -1 if no hwmon instance */
+	int      hwmon_bound;		/* hwmon_fd is bound to instance index */
+	struct device_info info;
 
-/* Latest sensor frame, cached for the HTTP /sensors publisher. */
-static struct sensor_struct g_last;
-static int g_have_last;
+	/* Latest accepted frame, for /sensors and /metrics. */
+	struct sensor_struct last;
+	int      have_last;
 
-/* UID (uppercase hex) of the last device that connected; kept across
- * disconnects as the /metrics device label. Empty until the first. */
-static char g_dev_uid[25];
+	/* Energy integrated from accepted frames since the device first
+	 * connected in this run (never reset on reconnect). energy_frac
+	 * carries the sub-microjoule remainder in uW*ns so no rounding
+	 * accumulates; energy_ts is the CLOCK_MONOTONIC time of the previous
+	 * accepted frame, valid while energy_ts_valid. */
+	int64_t  energy_uj;
+	int64_t  energy_frac;
+	struct timespec energy_ts;
+	int      energy_ts_valid;
 
-/* Energy integrated from accepted frames since daemon start (never reset
- * on reconnect). g_energy_frac carries the sub-microjoule remainder in
- * uW*ns so no rounding accumulates; g_energy_ts is the CLOCK_MONOTONIC
- * time of the previous accepted frame, valid while g_energy_ts_valid. */
-static int64_t g_energy_uj;
-static int64_t g_energy_frac;
-static struct timespec g_energy_ts;
-static int g_energy_ts_valid;
+	/* Set when the loaded module rejected a v3 record: write v2 (no
+	 * energy) until the next connect. */
+	int      hwmon_v2;
 
-/* Set when the loaded module rejected a v3 record: write v2 (no energy)
- * until the next connect. */
-static int g_hwmon_v2;
+	/* Serial handover: CLOCK_MONOTONIC deadline (0 = active) and the
+	 * client id that asked for it (0 = none). */
+	struct timespec suspend_until;
+	unsigned long suspend_owner;
+	int      was_suspended;
 
-/* Write-command auth + relay state for the HTTP POST /command endpoint. */
+	/* Fault bits of the previous frame (debounce), reset on connect. */
+	uint16_t prev_status, prev_log;
+	struct timespec next_poll;
+	struct timespec gone_since;	/* when it disconnected */
+};
+
+static struct wv_device g_devs[MAX_DEVICES];
+
+/* The loaded module has no WIREVIEW_IOC_BIND (an older wireview_hwmon):
+ * it has one instance, which only the primary device feeds. */
+static int g_hwmon_legacy;
+
+/* Write-command auth for the HTTP POST /command endpoint. */
 static char g_secret[128];      /* shared HMAC secret; empty => writes disabled */
-static int  g_serial_fd = -1;   /* current serial fd, for HTTP command relay */
-static struct timespec g_suspend_until; /* CLOCK_MONOTONIC deadline; 0 = active */
-static unsigned long g_suspend_owner;   /* client id that asked for it; 0 = none */
 
 static void wlog(const char *level, const char *fmt, ...);
 static int reload_config(const char *who, char *msg, size_t cap);
 
-static int serial_suspended(void)
+static int dev_connected(const struct wv_device *d)
+{
+	return d && d->used && d->serial_fd >= 0;
+}
+
+/* The connected device with the lowest index, or NULL. Commands that do
+ * not name a device go to it. */
+static struct wv_device *dev_primary(void)
+{
+	struct wv_device *best = NULL;
+
+	for (int i = 0; i < MAX_DEVICES; i++)
+		if (dev_connected(&g_devs[i]) &&
+		    (!best || g_devs[i].index < best->index))
+			best = &g_devs[i];
+	return best;
+}
+
+/* The device slot with this UID (connected or not), or NULL. */
+static struct wv_device *dev_by_uid(const uint8_t uid[12])
+{
+	for (int i = 0; i < MAX_DEVICES; i++)
+		if (g_devs[i].used && g_devs[i].info.valid &&
+		    memcmp(g_devs[i].info.uid, uid, 12) == 0)
+			return &g_devs[i];
+	return NULL;
+}
+
+/* The device slot whose UID is hex (case-insensitive), or NULL. */
+static struct wv_device *dev_by_uid_hex(const char *hex)
+{
+	for (int i = 0; i < MAX_DEVICES; i++)
+		if (g_devs[i].used && g_devs[i].uid_hex[0] &&
+		    strcasecmp(g_devs[i].uid_hex, hex) == 0)
+			return &g_devs[i];
+	return NULL;
+}
+
+/* The used slots, sorted by index; returns how many. */
+static int dev_sorted(struct wv_device **out)
+{
+	int n = 0;
+
+	for (int i = 0; i < MAX_DEVICES; i++)
+		if (g_devs[i].used)
+			out[n++] = &g_devs[i];
+	for (int i = 1; i < n; i++)
+		for (int j = i; j > 0 && out[j]->index < out[j - 1]->index; j--) {
+			struct wv_device *t = out[j];
+
+			out[j] = out[j - 1];
+			out[j - 1] = t;
+		}
+	return n;
+}
+
+static int serial_suspended(struct wv_device *d)
 {
 	struct timespec now;
-	if (g_suspend_until.tv_sec == 0)
+	if (d->suspend_until.tv_sec == 0)
 		return 0;
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	if (now.tv_sec > g_suspend_until.tv_sec ||
-	    (now.tv_sec == g_suspend_until.tv_sec &&
-	     now.tv_nsec >= g_suspend_until.tv_nsec)) {
-		g_suspend_until.tv_sec = 0;
-		g_suspend_until.tv_nsec = 0;
+	if (now.tv_sec > d->suspend_until.tv_sec ||
+	    (now.tv_sec == d->suspend_until.tv_sec &&
+	     now.tv_nsec >= d->suspend_until.tv_nsec)) {
+		d->suspend_until.tv_sec = 0;
+		d->suspend_until.tv_nsec = 0;
 		return 0;
 	}
 	return 1;
@@ -398,76 +517,152 @@ static int read_exact(int fd, void *buf, size_t n, int timeout_ms)
 	return 0;
 }
 
-/* Find WireView device by scanning /sys/class/tty/ttyACM* */
-static int find_device(char *path, size_t path_len)
+/* A serial port that may be a WireView. */
+struct wv_candidate {
+	char tty[256];		/* /dev/ttyACMn, or a -d path */
+	char usb_serial[32];	/* "" if unknown */
+	char usb_path[32];	/* "" if unknown */
+	long order;		/* N of ttyACMn; -d paths: their position */
+};
+
+/* Overridable (-D) so the e2e test can serve fake ports from a fake tree. */
+#ifndef SYS_CLASS_TTY
+#define SYS_CLASS_TTY "/sys/class/tty"
+#endif
+#ifndef DEV_DIR
+#define DEV_DIR "/dev"
+#endif
+
+/* First line of dir/name, newline stripped, into out. 0 on success. */
+static int read_attr_line(const char *dir, const char *name, char *out, size_t cap)
 {
-	DIR *d = opendir("/sys/class/tty");
+	char path[PATH_MAX];
+	FILE *f;
+
+	out[0] = '\0';
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	if (!fgets(out, (int)cap, f))
+		out[0] = '\0';
+	fclose(f);
+	out[strcspn(out, "\r\n")] = '\0';
+	return 0;
+}
+
+/*
+ * The USB device a tty belongs to: from sysroot/<name> (a class link),
+ * walk up the resolved sysfs path to the first directory with idVendor.
+ * Fills its vendor and product ids, its serial number ("" without one) and
+ * its port path, which is that directory's name ("3-4"). Returns 0, or -1
+ * if the tty is not on USB.
+ */
+static int tty_usb_ident(const char *sysroot, const char *name,
+			 char vid[16], char pid[16],
+			 char *serial, size_t serial_cap,
+			 char *usb_path, size_t path_cap)
+{
+	char link[PATH_MAX], resolved[PATH_MAX];
+
+	snprintf(link, sizeof(link), "%s/%s", sysroot, name);
+	if (!realpath(link, resolved))
+		return -1;
+
+	char *p = resolved;
+	while (*p && strcmp(p, "/") != 0) {
+		if (read_attr_line(p, "idVendor", vid, 16) == 0) {
+			if (read_attr_line(p, "idProduct", pid, 16) < 0)
+				return -1;
+			read_attr_line(p, "serial", serial, serial_cap);
+			const char *base = strrchr(p, '/');
+			snprintf(usb_path, path_cap, "%s", base ? base + 1 : p);
+			return 0;
+		}
+		char *slash = strrchr(p, '/');
+		if (!slash || slash == p)
+			break;
+		*slash = '\0';
+	}
+	return -1;
+}
+
+/* Sort candidates by order (insertion sort; there are a handful). */
+static void sort_candidates(struct wv_candidate *c, int n)
+{
+	for (int i = 1; i < n; i++)
+		for (int j = i; j > 0 && c[j].order < c[j - 1].order; j--) {
+			struct wv_candidate t = c[j];
+
+			c[j] = c[j - 1];
+			c[j - 1] = t;
+		}
+}
+
+/* Every ttyACM under sysroot (SYS_CLASS_TTY) whose USB device is
+ * WIREVIEW_VID:WIREVIEW_PID, by ttyACM number. Returns how many (at most
+ * max), or -1 if sysroot cannot be read. */
+static int scan_devices(const char *sysroot, struct wv_candidate *out, int max)
+{
+	DIR *d = opendir(sysroot);
 	struct dirent *ent;
-	char sysdir[PATH_MAX], resolved[PATH_MAX], check[PATH_MAX], vid[16], pid[16];
-	ssize_t len;
+	int n = 0;
 
 	if (!d)
 		return -1;
+	while ((ent = readdir(d)) != NULL && n < max) {
+		char vid[16], pid[16];
+		struct wv_candidate *c = &out[n];
 
-	while ((ent = readdir(d)) != NULL) {
 		if (strncmp(ent->d_name, "ttyACM", 6) != 0)
 			continue;
-
-		snprintf(sysdir, sizeof(sysdir), "/sys/class/tty/%s", ent->d_name);
-		len = readlink(sysdir, resolved, sizeof(resolved) - 1);
-		if (len < 0)
+		if (tty_usb_ident(sysroot, ent->d_name, vid, pid,
+				  c->usb_serial, sizeof(c->usb_serial),
+				  c->usb_path, sizeof(c->usb_path)) < 0)
 			continue;
-		resolved[len] = '\0';
-
-		/* Make absolute path */
-		if (resolved[0] != '/') {
-			char tmp[PATH_MAX];
-			snprintf(tmp, sizeof(tmp), "/sys/class/tty/%s", resolved);
-			char *rp = realpath(tmp, resolved);
-			if (!rp)
-				continue;
-		}
-
-		/* Walk up sysfs to find idVendor/idProduct */
-		char *p = resolved;
-		while (p && *p && strcmp(p, "/") != 0) {
-			FILE *f;
-
-			snprintf(check, sizeof(check), "%s/idVendor", p);
-			f = fopen(check, "r");
-			if (f) {
-				if (fgets(vid, sizeof(vid), f))
-					vid[strcspn(vid, "\n")] = '\0';
-				fclose(f);
-
-				snprintf(check, sizeof(check), "%s/idProduct", p);
-				f = fopen(check, "r");
-				if (f) {
-					if (fgets(pid, sizeof(pid), f))
-						pid[strcspn(pid, "\n")] = '\0';
-					fclose(f);
-
-					if (strcasecmp(vid, WIREVIEW_VID) == 0 &&
-					    strcasecmp(pid, WIREVIEW_PID) == 0) {
-						snprintf(path, path_len, "/dev/%s",
-							 ent->d_name);
-						closedir(d);
-						return 0;
-					}
-				}
-			}
-
-			/* Move up one directory */
-			char *slash = strrchr(p, '/');
-			if (slash && slash != p)
-				*slash = '\0';
-			else
-				break;
-		}
+		if (strcasecmp(vid, WIREVIEW_VID) != 0 ||
+		    strcasecmp(pid, WIREVIEW_PID) != 0)
+			continue;
+		snprintf(c->tty, sizeof(c->tty), "%s/%s", DEV_DIR, ent->d_name);
+		c->order = strtol(ent->d_name + 6, NULL, 10);
+		n++;
 	}
-
 	closedir(d);
-	return -1;
+	sort_candidates(out, n);
+	return n;
+}
+
+/* The -d paths that exist now, in the order given. USB serial and port
+ * path are filled in when the path resolves to a ttyACM on USB. */
+static int scan_user_paths(const char *sysroot, char paths[][256], int npaths,
+			   struct wv_candidate *out, int max)
+{
+	int n = 0;
+
+	for (int i = 0; i < npaths && n < max; i++) {
+		struct wv_candidate *c = &out[n];
+		char real[PATH_MAX], vid[16], pid[16];
+
+		if (access(paths[i], F_OK) < 0)
+			continue;
+		memset(c, 0, sizeof(*c));
+		snprintf(c->tty, sizeof(c->tty), "%s", paths[i]);
+		c->order = i;
+		if (realpath(paths[i], real)) {
+			const char *base = strrchr(real, '/');
+
+			base = base ? base + 1 : real;
+			if (strncmp(base, "ttyACM", 6) == 0 &&
+			    tty_usb_ident(sysroot, base, vid, pid,
+					  c->usb_serial, sizeof(c->usb_serial),
+					  c->usb_path, sizeof(c->usb_path)) < 0) {
+				c->usb_serial[0] = '\0';
+				c->usb_path[0] = '\0';
+			}
+		}
+		n++;
+	}
+	return n;
 }
 
 /* Exclusive use of the tty (TIOCEXCL): other non-root openers get EBUSY
@@ -590,53 +785,56 @@ static int64_t frame_power_uw(const struct sensor_struct *ss)
 #define NSEC_PER_SEC 1000000000LL
 
 /* energy_uj += p_uw * dt_ns / 1e9, exactly (the remainder carries over in
- * g_energy_frac), saturating at INT64_MAX. Plain 64-bit arithmetic with
+ * d->energy_frac), saturating at INT64_MAX. Plain 64-bit arithmetic with
  * overflow checks, since 32-bit targets have no __int128:
  *   p * dt / 1e9 = p * s + a * n + (b * n) / 1e9
  * with dt = s * 1e9 + n and p = a * 1e9 + b, where b * n < 1e18. */
-static void energy_add(int64_t p_uw, int64_t dt_ns)
+static void energy_add(struct wv_device *d, int64_t p_uw, int64_t dt_ns)
 {
 	int64_t s = dt_ns / NSEC_PER_SEC, n = dt_ns % NSEC_PER_SEC;
 	int64_t a = p_uw / NSEC_PER_SEC, b = p_uw % NSEC_PER_SEC;
 	int64_t add, t, bn;
 	int ovf = 0;
 
-	if (p_uw <= 0 || dt_ns <= 0 || g_energy_uj == INT64_MAX)
+	if (p_uw <= 0 || dt_ns <= 0 || d->energy_uj == INT64_MAX)
 		return;
 	ovf |= __builtin_mul_overflow(p_uw, s, &add);
 	ovf |= __builtin_mul_overflow(a, n, &t);
 	ovf |= __builtin_add_overflow(add, t, &add);
-	bn = b * n + g_energy_frac;
-	g_energy_frac = bn % NSEC_PER_SEC;
+	bn = b * n + d->energy_frac;
+	d->energy_frac = bn % NSEC_PER_SEC;
 	ovf |= __builtin_add_overflow(add, bn / NSEC_PER_SEC, &add);
-	ovf |= __builtin_add_overflow(g_energy_uj, add, &g_energy_uj);
+	ovf |= __builtin_add_overflow(d->energy_uj, add, &d->energy_uj);
 	if (ovf)
-		g_energy_uj = INT64_MAX;
+		d->energy_uj = INT64_MAX;
 }
 
 /* Integrate an accepted frame's power over the time since the previous
  * accepted frame. After a gap longer than max_gap_ms (serial handover,
  * reconnect, system suspend) the step is skipped rather than attributing
  * the whole gap to this frame's power; the frame only restarts the clock. */
-static void energy_accumulate(const struct sensor_struct *ss, long max_gap_ms)
+static void energy_accumulate(struct wv_device *d, const struct sensor_struct *ss,
+			      long max_gap_ms)
 {
 	struct timespec now;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	if (g_energy_ts_valid) {
-		int64_t dt_ns = (int64_t)(now.tv_sec - g_energy_ts.tv_sec) *
-				NSEC_PER_SEC + (now.tv_nsec - g_energy_ts.tv_nsec);
+	if (d->energy_ts_valid) {
+		int64_t dt_ns = (int64_t)(now.tv_sec - d->energy_ts.tv_sec) *
+				NSEC_PER_SEC + (now.tv_nsec - d->energy_ts.tv_nsec);
 
 		if (dt_ns <= (int64_t)max_gap_ms * 1000000)
-			energy_add(frame_power_uw(ss), dt_ns);
+			energy_add(d, frame_power_uw(ss), dt_ns);
 	}
-	g_energy_ts = now;
-	g_energy_ts_valid = 1;
+	d->energy_ts = now;
+	d->energy_ts_valid = 1;
 }
 
-/* Convert sensor data to hwmon format and write to kernel module */
-static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
+/* Convert sensor data to hwmon format and write it to the device's
+ * hwmon instance (d->hwmon_fd). */
+static int write_hwmon(struct wv_device *d, const struct sensor_struct *ss)
 {
+	int hwmon_fd = d->hwmon_fd;
 	struct hwmon_data hd;
 	int i;
 
@@ -668,18 +866,19 @@ static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 	hd.psu_cap = ss->hpwr_cap;
 	hd.fault_status = ss->fault_status;
 	hd.fault_log = ss->fault_log;
-	hd.energy_uj = g_energy_uj;
+	hd.energy_uj = d->energy_uj;
 
-	if (!g_hwmon_v2) {
+	if (!d->hwmon_v2) {
 		if (write(hwmon_fd, &hd, sizeof(hd)) == sizeof(hd))
 			return 0;
 		if (errno != EINVAL)
 			return -1;
 		/* A module older than v3 is still loaded (e.g. upgraded
 		 * package, no reboot yet): keep it fed with v2 records. */
-		g_hwmon_v2 = 1;
+		d->hwmon_v2 = 1;
 		printf("wireviewd: hwmon module does not accept v3 records, writing v2 (no energy)\n");
-		wlog("WARN", "hwmon module rejected a v3 record; writing v2 until the next connect (reload wireview_hwmon for energy)");
+		wlog("WARN", "%s: hwmon module rejected a v3 record; writing v2 until the next connect (reload wireview_hwmon for energy)",
+		     d->tag);
 	}
 	hd.version = 2;
 	if (write(hwmon_fd, &hd, HWMON_V2_SIZE) != (ssize_t)HWMON_V2_SIZE)
@@ -691,17 +890,18 @@ static int write_hwmon(int hwmon_fd, const struct sensor_struct *ss)
 /* ---- Device info queries ---- */
 
 /* query_device_info() result for a WireView II (product 7 or 8): known,
- * but not supported. dev_info.vendor_id/product_id say which. */
+ * but not supported. info->vendor_id/product_id say which. */
 #define QUERY_UNSUPPORTED (-2)
 
-/* Read the device info into dev_info. Returns 0 for a supported device,
+/* Read the device info into *info. Returns 0 for a supported device,
  * QUERY_UNSUPPORTED for a WireView II, or -1 if the device did not answer
  * or is not a WireView this daemon knows. */
-static int query_device_info(int serial_fd)
+static int query_device_info(int serial_fd, struct device_info *info)
 {
 	uint8_t cmd, buf[128];
+	struct device_info *const di = info;
 
-	memset(&dev_info, 0, sizeof(dev_info));
+	memset(di, 0, sizeof(*di));
 
 	/* CMD_READ_VENDOR_DATA (0x01): VendorDataStruct = 3 bytes
 	 * (3 byte fields, Pack=4 doesn't pad since max field alignment is 1) */
@@ -710,18 +910,18 @@ static int query_device_info(int serial_fd)
 	if (write(serial_fd, &cmd, 1) != 1) return -1;
 	if (read_exact(serial_fd, buf, 3, 1000) < 0) return -1;
 
-	dev_info.vendor_id = buf[0];
-	dev_info.product_id = buf[1];
+	di->vendor_id = buf[0];
+	di->product_id = buf[1];
 	if (!edition_name(buf[0], buf[1]))
 		return is_wireview2(buf[0], buf[1]) ? QUERY_UNSUPPORTED : -1;
 
-	dev_info.fw_version = buf[2];
+	di->fw_version = buf[2];
 
 	/* CMD_READ_UID (0x02): 12 bytes */
 	cmd = CMD_READ_UID;
 	tcflush(serial_fd, TCIFLUSH);
 	if (write(serial_fd, &cmd, 1) != 1) return -1;
-	if (read_exact(serial_fd, dev_info.uid, 12, 1000) < 0) return -1;
+	if (read_exact(serial_fd, di->uid, 12, 1000) < 0) return -1;
 
 	/* CMD_READ_BUILD_INFO (0x0D): BuildStruct with Pack=4
 	 * VendorData(3) + ProductName(32) + BuildInfo(32) + ProductNameLen(1) = 68 */
@@ -730,15 +930,15 @@ static int query_device_info(int serial_fd)
 	if (write(serial_fd, &cmd, 1) != 1) goto done;
 	if (read_exact(serial_fd, buf, 68, 1000) < 0) goto done;
 	/* BuildInfo starts at offset 35 (3 + 32), 32 bytes max */
-	memcpy(dev_info.build_string, buf + 35, 32);
-	dev_info.build_string[32] = '\0';
+	memcpy(di->build_string, buf + 35, 32);
+	di->build_string[32] = '\0';
 	/* Zero everything after the first NUL so no device garbage lingers
 	 * past the string. */
 	{
-		size_t bl = strnlen(dev_info.build_string, 32);
+		size_t bl = strnlen(di->build_string, 32);
 
-		memset(dev_info.build_string + bl, 0,
-		       sizeof(dev_info.build_string) - bl);
+		memset(di->build_string + bl, 0,
+		       sizeof(di->build_string) - bl);
 	}
 
 	/* Read config version from the config struct's Version field (byte 2).
@@ -747,14 +947,14 @@ static int query_device_info(int serial_fd)
 	tcflush(serial_fd, TCIFLUSH);
 	if (write(serial_fd, &cmd, 1) != 1) goto done;
 	if (read_exact(serial_fd, buf, 4, 1000) < 0) goto done;
-	dev_info.config_version = buf[2];
+	di->config_version = buf[2];
 
 done:
-	dev_info.valid = 1;
+	di->valid = 1;
 	printf("wireviewd: %s (%02X%02X), FW v%d, config v%d\n",
-	       edition_name(dev_info.vendor_id, dev_info.product_id),
-	       dev_info.vendor_id, dev_info.product_id,
-	       dev_info.fw_version, dev_info.config_version);
+	       edition_name(di->vendor_id, di->product_id),
+	       di->vendor_id, di->product_id,
+	       di->fw_version, di->config_version);
 	return 0;
 }
 
@@ -809,6 +1009,8 @@ struct client {
 	struct timespec last_active;	/* accept, then each complete request */
 	size_t have;			/* bytes of the current request in req[] */
 	struct timespec req_deadline;	/* valid while have > 0 */
+	int   has_sel;			/* SELECT_DEVICE chose sel_uid */
+	uint8_t sel_uid[12];
 	uint8_t req[3 + CLIENT_MAX_PAYLOAD];
 };
 
@@ -893,6 +1095,7 @@ static void client_init(struct client *c, int fd)
 		c->id = ++g_client_seq;
 	clock_gettime(CLOCK_MONOTONIC, &c->last_active);
 	c->have = 0;
+	c->has_sel = 0;
 	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 &&
 	    len == sizeof(cred)) {
 		c->uid = cred.uid;
@@ -944,29 +1147,114 @@ static long client_uid(const struct client *c)
  * first NUL (GUI <= 1.2.5.0, wireviewctl <= 1.6.0) are unaffected; a
  * reply without them comes from an older daemon, which only ever
  * attached vendor 0xEF product 0x05. */
-#define DEVICE_INFO_MAX (2 + 12 + sizeof(dev_info.build_string) + 2)
+#define DEVICE_INFO_MAX (2 + 12 + sizeof(((struct device_info *)0)->build_string) + 2)
 
-/* Fill out (DEVICE_INFO_MAX bytes) from dev_info; returns the length. */
-static size_t device_info_reply(uint8_t *out)
+/* Fill out (DEVICE_INFO_MAX bytes) from *di; returns the length. */
+static size_t device_info_reply(const struct device_info *di, uint8_t *out)
 {
 	size_t n = 0;
-	size_t blen = strnlen(dev_info.build_string,
-			      sizeof(dev_info.build_string) - 1) + 1;
+	size_t blen = strnlen(di->build_string,
+			      sizeof(di->build_string) - 1) + 1;
 
-	out[n++] = dev_info.fw_version;
-	out[n++] = dev_info.config_version;
-	memcpy(out + n, dev_info.uid, 12);
+	out[n++] = di->fw_version;
+	out[n++] = di->config_version;
+	memcpy(out + n, di->uid, 12);
 	n += 12;
-	memcpy(out + n, dev_info.build_string, blen - 1);
+	memcpy(out + n, di->build_string, blen - 1);
 	n += blen - 1;
 	out[n++] = '\0';
-	out[n++] = dev_info.vendor_id;
-	out[n++] = dev_info.product_id;
+	out[n++] = di->vendor_id;
+	out[n++] = di->product_id;
 	return n;
 }
 
+/*
+ * LIST_DEVICES reply, format 1. All integers are single bytes; strings are
+ * fixed-size fields, NUL-padded and always NUL-terminated.
+ *
+ *   header (3 bytes)
+ *     0  format     1
+ *     1  count      number of records
+ *     2  rec_size   LIST_REC_SIZE (160); a later format may append fields,
+ *                   so clients step by rec_size, not by 160
+ *   record (rec_size bytes each, sorted by index)
+ *     0   uid[12]       chip UID, raw bytes
+ *     12  index         hwmon index (hwmon device wireview, wireview1, ...)
+ *     13  state         0 connected, 1 connected with the serial port
+ *                       handed over (SUSPEND_SERIAL), 2 disconnected
+ *     14  vendor_id
+ *     15  product_id
+ *     16  fw_version
+ *     17  config_version
+ *     18  flags         bit 0: primary (where commands of a connection
+ *                       without SELECT_DEVICE go); bit 1: selected by this
+ *                       connection; bit 2: has its own hwmon instance
+ *     19  reserved, 0
+ *     20  usb_serial[16]  USB serial number ("" if unknown)
+ *     36  tty[64]         serial port, e.g. "/dev/ttyACM0" (the last one
+ *                         used while disconnected; cut to 63 bytes)
+ *     100 usb_path[16]    USB port path, e.g. "3-4" ("" if unknown)
+ *     116 build[40]       firmware build string
+ *     156 reserved[4], 0
+ */
+#define LIST_FORMAT    1
+#define LIST_REC_SIZE  160
+#define LIST_MAX       (3 + MAX_DEVICES * LIST_REC_SIZE)
+
+static void put_str(uint8_t *dst, size_t cap, const char *s)
+{
+	size_t n = strnlen(s, cap - 1);
+
+	memset(dst, 0, cap);
+	memcpy(dst, s, n);
+}
+
+/* Fill out (LIST_MAX bytes) for client c; returns the length. */
+static size_t list_devices_reply(const struct client *c, uint8_t *out)
+{
+	struct wv_device *devs[MAX_DEVICES];
+	struct wv_device *prim = dev_primary();
+	int n = dev_sorted(devs);
+	size_t len = 3;
+
+	memset(out, 0, LIST_MAX);
+	out[0] = LIST_FORMAT;
+	out[1] = (uint8_t)n;
+	out[2] = LIST_REC_SIZE;
+	for (int i = 0; i < n; i++) {
+		struct wv_device *d = devs[i];
+		uint8_t *r = out + len;
+
+		memcpy(r, d->info.uid, 12);
+		r[12] = (uint8_t)d->index;
+		r[13] = !dev_connected(d) ? 2 : serial_suspended(d) ? 1 : 0;
+		r[14] = d->info.vendor_id;
+		r[15] = d->info.product_id;
+		r[16] = d->info.fw_version;
+		r[17] = d->info.config_version;
+		r[18] = (d == prim ? 1 : 0) |
+			(c && c->has_sel && memcmp(c->sel_uid, d->info.uid, 12) == 0 ? 2 : 0) |
+			(d->hwmon_fd >= 0 && d->hwmon_bound ? 4 : 0);
+		put_str(r + 20, 16, d->usb_serial);
+		put_str(r + 36, 64, d->tty);
+		put_str(r + 100, 16, d->usb_path);
+		put_str(r + 116, 40, d->info.build_string);
+		len += LIST_REC_SIZE;
+	}
+	return len;
+}
+
+/* The device the commands of client c address: the one it selected, or
+ * the primary. NULL if that device is not connected. */
+static struct wv_device *client_target(const struct client *c)
+{
+	struct wv_device *d = c->has_sel ? dev_by_uid(c->sel_uid) : dev_primary();
+
+	return dev_connected(d) ? d : NULL;
+}
+
 /* Execute the complete request held in c->req. */
-static void handle_client_request(const struct client *c, int serial_fd)
+static void handle_client_request(struct client *c)
 {
 	int client_fd = c->fd;
 	uint8_t cmd_type = c->req[0];
@@ -992,10 +1280,35 @@ static void handle_client_request(const struct client *c, int serial_fd)
 		return;
 	}
 
-	if (serial_fd < 0) {
+	if (cmd_type == WCMD_LIST_DEVICES) {
+		uint8_t resp[LIST_MAX];
+		size_t len = list_devices_reply(c, resp);
+
+		send_response(client_fd, RESP_OK, resp, (uint16_t)len);
+		return;
+	}
+	if (cmd_type == WCMD_SELECT_DEVICE) {
+		if (payload_len == 0) {
+			c->has_sel = 0;
+			send_response(client_fd, RESP_OK, NULL, 0);
+		} else if (payload_len != 12) {
+			send_response(client_fd, RESP_ERROR, NULL, 0);
+		} else if (!dev_by_uid(payload)) {
+			send_response(client_fd, RESP_NO_DEVICE, NULL, 0);
+		} else {
+			memcpy(c->sel_uid, payload, 12);
+			c->has_sel = 1;
+			send_response(client_fd, RESP_OK, NULL, 0);
+		}
+		return;
+	}
+
+	struct wv_device *d = client_target(c);
+	if (!d) {
 		send_response(client_fd, RESP_NOT_CONNECTED, NULL, 0);
 		return;
 	}
+	int serial_fd = d->serial_fd;
 
 	if (cmd_type == WCMD_SUSPEND_SERIAL) {
 		int secs = 60;
@@ -1003,44 +1316,44 @@ static void handle_client_request(const struct client *c, int serial_fd)
 			secs = payload[0] | ((int)payload[1] << 8);
 		if (secs < 1) secs = 1;
 		if (secs > 300) secs = 300;
-		clock_gettime(CLOCK_MONOTONIC, &g_suspend_until);
-		g_suspend_until.tv_sec += secs;
+		clock_gettime(CLOCK_MONOTONIC, &d->suspend_until);
+		d->suspend_until.tv_sec += secs;
 		/* This connection is not idle-closed until the handover
 		 * ends (see client_idle_left()). */
-		g_suspend_owner = c->id;
+		d->suspend_owner = c->id;
 		/* Before the reply: the GUI opens the port as soon as it
 		 * reads RESP_OK. */
 		serial_set_exclusive(serial_fd, 0);
-		wlog("INFO", "serial suspended for %d s (GUI direct access)", secs);
+		wlog("INFO", "%s: serial suspended for %d s (GUI direct access)", d->tag, secs);
 		send_response(client_fd, RESP_OK, NULL, 0);
 		return;
 	}
 	if (cmd_type == WCMD_RESUME_SERIAL) {
-		g_suspend_until.tv_sec = 0;
-		g_suspend_until.tv_nsec = 0;
-		g_suspend_owner = 0;
+		d->suspend_until.tv_sec = 0;
+		d->suspend_until.tv_nsec = 0;
+		d->suspend_owner = 0;
 		tcflush(serial_fd, TCIFLUSH);
 		serial_set_exclusive(serial_fd, 1);
-		wlog("INFO", "serial resumed");
+		wlog("INFO", "%s: serial resumed", d->tag);
 		send_response(client_fd, RESP_OK, NULL, 0);
 		return;
 	}
 	/* While the GUI owns the port, refuse serial-touching commands; the
 	 * cached GET_DEVICE_INFO is still fine. */
-	if (serial_suspended() && cmd_type != WCMD_GET_DEVICE_INFO) {
-		wlog("WARN", "relay cmd 0x%02x rejected: serial suspended", cmd_type);
+	if (serial_suspended(d) && cmd_type != WCMD_GET_DEVICE_INFO) {
+		wlog("WARN", "%s: relay cmd 0x%02x rejected: serial suspended", d->tag, cmd_type);
 		send_response(client_fd, RESP_ERROR, NULL, 0);
 		return;
 	}
 
 	switch (cmd_type) {
 	case WCMD_GET_DEVICE_INFO: {
-		if (!dev_info.valid) {
+		if (!d->info.valid) {
 			send_response(client_fd, RESP_NOT_CONNECTED, NULL, 0);
 			return;
 		}
 		uint8_t resp[DEVICE_INFO_MAX];
-		size_t resp_len = device_info_reply(resp);
+		size_t resp_len = device_info_reply(&d->info, resp);
 
 		send_response(client_fd, RESP_OK, resp, (uint16_t)resp_len);
 		break;
@@ -1067,8 +1380,8 @@ static void handle_client_request(const struct client *c, int serial_fd)
 		if (payload_len >= 2)
 			config_size = payload[0] | ((int)payload[1] << 8);
 		else
-			config_size = dev_info.config_version == 0 ? 72 :
-				      dev_info.config_version == 1 ? 74 : 96;
+			config_size = d->info.config_version == 0 ? 72 :
+				      d->info.config_version == 1 ? 74 : 96;
 
 		if (config_size > 512 || config_size < 1) {
 			send_response(client_fd, RESP_ERROR, NULL, 0);
@@ -1086,7 +1399,7 @@ static void handle_client_request(const struct client *c, int serial_fd)
 			send_response(client_fd, RESP_ERROR, NULL, 0);
 			break;
 		}
-		resp[0] = dev_info.config_version;
+		resp[0] = d->info.config_version;
 		send_response(client_fd, RESP_OK, resp, (uint16_t)(1 + config_size));
 		break;
 	}
@@ -1129,7 +1442,7 @@ static void handle_client_request(const struct client *c, int serial_fd)
 		uint8_t cmd[2] = { CMD_SCREEN_CHANGE, payload[0] };
 		tcflush(serial_fd, TCIFLUSH);
 		ssize_t wr = write(serial_fd, cmd, 2);
-		wlog("INFO", "screen relay 0x%02x -> write=%zd", payload[0], wr);
+		wlog("INFO", "%s: screen relay 0x%02x -> write=%zd", d->tag, payload[0], wr);
 		if (wr == 2)
 			send_response(client_fd, RESP_OK, NULL, 0);
 		else
@@ -1153,8 +1466,8 @@ static void handle_client_request(const struct client *c, int serial_fd)
 	}
 
 	case WCMD_READ_BUILD: {
-		int blen = (int)strlen(dev_info.build_string) + 1;
-		send_response(client_fd, RESP_OK, dev_info.build_string,
+		int blen = (int)strlen(d->info.build_string) + 1;
+		send_response(client_fd, RESP_OK, d->info.build_string,
 			      (uint16_t)blen);
 		break;
 	}
@@ -1188,7 +1501,7 @@ static size_t client_need(const struct client *c)
  * dispatch the request once it is complete. The request deadline starts
  * at its first POLLIN; main() drops clients that miss it. Returns -1 if
  * the client should be closed (EOF or read error), else 0. */
-static int client_read(struct client *c, int serial_fd)
+static int client_read(struct client *c)
 {
 	if (c->have == 0)
 		deadline_in(&c->req_deadline, CLIENT_REQ_TIMEOUT_MS);
@@ -1215,7 +1528,7 @@ static int client_read(struct client *c, int serial_fd)
 		}
 	}
 
-	handle_client_request(c, serial_fd);
+	handle_client_request(c);
 	c->have = 0;
 	clock_gettime(CLOCK_MONOTONIC, &c->last_active);
 	return 0;
@@ -1228,12 +1541,32 @@ static long ts_diff_ms(const struct timespec *a, const struct timespec *b)
 	       (a->tv_nsec - b->tv_nsec) / 1000000L;
 }
 
-/* Is client c the one holding an unexpired serial handover at now? */
+/* Milliseconds left of the unexpired serial handovers client c holds
+ * (the longest, if several), or 0 if it holds none at now. */
+static long client_handover_left(const struct client *c,
+				 const struct timespec *now)
+{
+	long left = 0;
+
+	for (int i = 0; i < MAX_DEVICES; i++) {
+		const struct wv_device *d = &g_devs[i];
+		long l;
+
+		if (!d->used || d->suspend_owner != c->id ||
+		    d->suspend_until.tv_sec == 0)
+			continue;
+		l = ts_diff_ms(&d->suspend_until, now);
+		if (l > left)
+			left = l;
+	}
+	return left;
+}
+
+/* Is client c holding an unexpired serial handover at now? */
 static int client_holds_handover(const struct client *c,
 				 const struct timespec *now)
 {
-	return c->id == g_suspend_owner && g_suspend_until.tv_sec != 0 &&
-	       ts_diff_ms(&g_suspend_until, now) > 0;
+	return client_handover_left(c, now) > 0;
 }
 
 /* Milliseconds from now until client c is closed as idle (<= 0: due).
@@ -1249,12 +1582,10 @@ static long client_idle_left(const struct client *c, const struct timespec *now)
 
 	long left = CLIENT_IDLE_S * 1000L - ts_diff_ms(now, &c->last_active);
 
-	if (client_holds_handover(c, now)) {
-		long hold = ts_diff_ms(&g_suspend_until, now);
+	long hold = client_handover_left(c, now);
 
-		if (hold > left)
-			left = hold;
-	}
+	if (hold > 0 && hold > left)
+		left = hold;
 	return left;
 }
 
@@ -1340,83 +1671,6 @@ static void json_escape(const char *in, char *out, size_t cap)
 	out[o] = '\0';
 }
 
-/*
- * Build the GET /sensors JSON body. Matches the WireViewSensorDto schema the
- * desktop app consumes (camelCase; UID is uppercase hex to match the app).
- * This daemon manages a single device.
- */
-static int build_sensors_json(char *out, size_t cap)
-{
-	char host[64] = "wireview";
-	gethostname(host, sizeof(host) - 1);
-	char host_js[sizeof(host) * 6];
-	json_escape(host, host_js, sizeof(host_js));
-
-	char ts[32];
-	time_t now = time(NULL);
-	struct tm tmv;
-	gmtime_r(&now, &tmv);
-	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
-
-	/* No device / no frame yet -> empty list so consumers drop it. */
-	if (!g_have_last || !dev_info.valid)
-		return snprintf(out, cap,
-			"{\"host\":\"%s\",\"appVersion\":\"wireviewd\",\"devices\":[]}",
-			host_js);
-
-	char uid[25];
-	for (int i = 0; i < 12; i++)
-		snprintf(uid + i * 2, 3, "%02X", dev_info.uid[i]);
-
-	char build_js[33 * 6];
-	json_escape(dev_info.build_string, build_js, sizeof(build_js));
-
-	/* hwRev as the Thermal Grizzly client formats it: vendor and
-	 * product id, two uppercase hex digits each (EF05, EF06). */
-	const char *edition = edition_name(dev_info.vendor_id, dev_info.product_id);
-	char name_js[64 * 6];
-	json_escape(edition ? edition : "WireView Pro II", name_js, sizeof(name_js));
-
-	double pv[6], pc[6], sum_p = 0, sum_c = 0;
-	for (int i = 0; i < 6; i++) {
-		pv[i] = g_last.pins[i].voltage / 1000.0;
-		pc[i] = g_last.pins[i].current / 1000.0;
-		sum_p += pv[i] * pc[i];
-		sum_c += pc[i];
-	}
-	/* Out-of-range readings (sensor disconnected) are sent as -100.0,
-	 * what the device itself reports and the desktop app publishes, not
-	 * null: the app's WireViewSensorDto declares TempInC/TempOutC/Ext1C/
-	 * Ext2C as plain (non-nullable) double, so null would fail
-	 * deserialization there. The app and wireviewctl top read anything
-	 * at or below -100 / -40 as absent. */
-	double t[4];
-	for (int i = 0; i < 4; i++) {
-		int16_t raw = g_last.ts[i];
-		t[i] = (raw < -400 || raw > 2000) ? -100.0 : raw / 10.0;
-	}
-
-	return snprintf(out, cap,
-		"{\"host\":\"%s\",\"appVersion\":\"wireviewd\",\"devices\":[{"
-		"\"id\":\"%s\",\"name\":\"%s\",\"connected\":true,"
-		"\"hwRev\":\"%02X%02X\",\"fwVer\":\"%d\",\"buildString\":\"%s\",\"timestamp\":\"%s\","
-		"\"pinVoltage\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
-		"\"pinCurrent\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
-		"\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
-		"\"psuCapW\":%d,\"fan\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
-		"\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f,\"energyJ\":%.3f}]}",
-		host_js, uid, name_js, dev_info.vendor_id, dev_info.product_id,
-		dev_info.fw_version, build_js, ts,
-		pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
-		pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
-		t[0], t[1], t[2], t[3],
-		psu_cap_watts(g_last.hpwr_cap), g_last.fan_duty,
-		g_last.fault_status, g_last.fault_log,
-		sum_c, sum_p, g_energy_uj / 1e6);
-}
-
-/* ---- HTTP /metrics (Prometheus text exposition format 0.0.4) ---- */
-
 /* Fixed-size output buffer; once a write does not fit, overflow is set
  * and later writes are ignored, so the caller never sends a torn body. */
 struct outbuf {
@@ -1443,6 +1697,99 @@ ob_printf(struct outbuf *b, const char *fmt, ...)
 	}
 	b->len += (size_t)n;
 }
+
+/* One device of the GET /sensors "devices" array, appended to out. */
+static void sensors_json_device(struct outbuf *b, const struct wv_device *d,
+				const char *ts)
+{
+	const struct sensor_struct *last = &d->last;
+	char build_js[33 * 6];
+	json_escape(d->info.build_string, build_js, sizeof(build_js));
+
+	/* hwRev as the Thermal Grizzly client formats it: vendor and
+	 * product id, two uppercase hex digits each (EF05, EF06). */
+	const char *edition = edition_name(d->info.vendor_id, d->info.product_id);
+	char name_js[64 * 6];
+	json_escape(edition ? edition : "WireView Pro II", name_js, sizeof(name_js));
+
+	double pv[6], pc[6], sum_p = 0, sum_c = 0;
+	for (int i = 0; i < 6; i++) {
+		pv[i] = last->pins[i].voltage / 1000.0;
+		pc[i] = last->pins[i].current / 1000.0;
+		sum_p += pv[i] * pc[i];
+		sum_c += pc[i];
+	}
+	/* Out-of-range readings (sensor disconnected) are sent as -100.0,
+	 * what the device itself reports and the desktop app publishes, not
+	 * null: the app's WireViewSensorDto declares TempInC/TempOutC/Ext1C/
+	 * Ext2C as plain (non-nullable) double, so null would fail
+	 * deserialization there. The app and wireviewctl top read anything
+	 * at or below -100 / -40 as absent. */
+	double t[4];
+	for (int i = 0; i < 4; i++) {
+		int16_t raw = last->ts[i];
+		t[i] = (raw < -400 || raw > 2000) ? -100.0 : raw / 10.0;
+	}
+
+	ob_printf(b,
+		"{\"id\":\"%s\",\"name\":\"%s\",\"connected\":true,"
+		"\"hwRev\":\"%02X%02X\",\"fwVer\":\"%d\",\"buildString\":\"%s\",\"timestamp\":\"%s\","
+		"\"pinVoltage\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
+		"\"pinCurrent\":[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f],"
+		"\"tempInC\":%.1f,\"tempOutC\":%.1f,\"ext1C\":%.1f,\"ext2C\":%.1f,"
+		"\"psuCapW\":%d,\"fan\":%d,\"faultStatus\":%u,\"faultLog\":%u,"
+		"\"sumCurrentA\":%.3f,\"sumPowerW\":%.3f,\"energyJ\":%.3f}",
+		d->uid_hex, name_js, d->info.vendor_id, d->info.product_id,
+		d->info.fw_version, build_js, ts,
+		pv[0], pv[1], pv[2], pv[3], pv[4], pv[5],
+		pc[0], pc[1], pc[2], pc[3], pc[4], pc[5],
+		t[0], t[1], t[2], t[3],
+		psu_cap_watts(last->hpwr_cap), last->fan_duty,
+		last->fault_status, last->fault_log,
+		sum_c, sum_p, d->energy_uj / 1e6);
+}
+
+/*
+ * Build the GET /sensors JSON body. Matches the WireViewSensorDto schema the
+ * desktop app consumes (camelCase; UID is uppercase hex to match the app).
+ * One entry per connected device that has sent a frame, by index, so a
+ * consumer that reads devices[0] gets the primary. Returns the length, or
+ * -1 if it did not fit.
+ */
+static int build_sensors_json(char *out, size_t cap)
+{
+	struct outbuf b = { .p = out, .cap = cap };
+	struct wv_device *devs[MAX_DEVICES];
+	int n = dev_sorted(devs), first = 1;
+
+	char host[64] = "wireview";
+	gethostname(host, sizeof(host) - 1);
+	char host_js[sizeof(host) * 6];
+	json_escape(host, host_js, sizeof(host_js));
+
+	char ts[32];
+	time_t now = time(NULL);
+	struct tm tmv;
+	gmtime_r(&now, &tmv);
+	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tmv);
+
+	/* No device / no frame yet -> empty list so consumers drop it. */
+	ob_printf(&b, "{\"host\":\"%s\",\"appVersion\":\"wireviewd\",\"devices\":[",
+		  host_js);
+	for (int i = 0; i < n; i++) {
+		if (!dev_connected(devs[i]) || !devs[i]->have_last ||
+		    !devs[i]->info.valid)
+			continue;
+		if (!first)
+			ob_printf(&b, ",");
+		first = 0;
+		sensors_json_device(&b, devs[i], ts);
+	}
+	ob_printf(&b, "]}");
+	return b.overflow ? -1 : (int)b.len;
+}
+
+/* ---- HTTP /metrics (Prometheus text exposition format 0.0.4) ---- */
 
 /*
  * Escape a Prometheus label value: backslash, double quote and newline
@@ -1494,118 +1841,139 @@ static const char * const fault_names[] = {
 	"wire_over_current", "over_power", "current_imbalance",
 };
 
-/* Build the GET /metrics body from the latest accepted frame. Returns 0,
- * or -1 if the body did not fit. Without a device (or before its first
- * frame) only wireview_up 0 is exposed, labelled with the last device
- * seen if there was one, so the series stays the same across a blip. */
+/* Is d reporting: connected, with an accepted frame? */
+static int dev_up(const struct wv_device *d)
+{
+	return dev_connected(d) && d->have_last && d->info.valid;
+}
+
+/* Build the GET /metrics body from the latest accepted frames, every
+ * series labelled device="<UID>". Each family is written once, with one
+ * sample per device that is up (Prometheus wants a family's samples
+ * together). wireview_up has a sample for every device this run has seen,
+ * 0 while it is gone, so its series stays the same across a blip; with no
+ * device ever seen it is a bare "wireview_up 0". Returns 0, or -1 if the
+ * body did not fit. */
 static int build_metrics(struct outbuf *b)
 {
 	static const char * const temp_names[4] = {
 		"onboard_in", "onboard_out", "external_1", "external_2",
 	};
-	int up = g_serial_fd >= 0 && g_have_last && dev_info.valid;
-	char dev[40];
-	int i;
+	struct wv_device *devs[MAX_DEVICES];
+	int n = dev_sorted(devs), nup = 0, k, i;
+	char dev[MAX_DEVICES][40];
 
-	if (g_dev_uid[0])
-		snprintf(dev, sizeof(dev), "device=\"%s\"", g_dev_uid);
-	else
-		dev[0] = '\0';
+	for (k = 0; k < n; k++) {
+		if (devs[k]->uid_hex[0])
+			snprintf(dev[k], sizeof(dev[k]), "device=\"%s\"", devs[k]->uid_hex);
+		else
+			dev[k][0] = '\0';
+		nup += dev_up(devs[k]);
+	}
 
 	prom_family(b, "wireview_up", "gauge",
 		    "1 if the device is connected and reporting, else 0.");
-	if (!up) {
-		if (dev[0])
-			ob_printf(b, "wireview_up{%s} 0\n", dev);
+	if (n == 0)
+		ob_printf(b, "wireview_up 0\n");
+	for (k = 0; k < n; k++) {
+		if (dev[k][0])
+			ob_printf(b, "wireview_up{%s} %d\n", dev[k], dev_up(devs[k]));
 		else
-			ob_printf(b, "wireview_up 0\n");
-		return b->overflow ? -1 : 0;
+			ob_printf(b, "wireview_up %d\n", dev_up(devs[k]));
 	}
-	ob_printf(b, "wireview_up{%s} 1\n", dev);
+	if (!nup)
+		return b->overflow ? -1 : 0;
 
+#define EACH_UP for (k = 0; k < n; k++) if (dev_up(devs[k]))
+#define L (&devs[k]->last)
 	prom_family(b, "wireview_pin_voltage_volts", "gauge",
 		    "Voltage per 12V-2x6 pin.");
-	for (i = 0; i < 6; i++)
+	EACH_UP for (i = 0; i < 6; i++)
 		ob_printf(b, "wireview_pin_voltage_volts{%s,pin=\"%d\"} %.3f\n",
-			  dev, i + 1, g_last.pins[i].voltage / 1000.0);
+			  dev[k], i + 1, L->pins[i].voltage / 1000.0);
 	prom_family(b, "wireview_pin_current_amps", "gauge",
 		    "Current per 12V-2x6 pin.");
-	for (i = 0; i < 6; i++)
+	EACH_UP for (i = 0; i < 6; i++)
 		ob_printf(b, "wireview_pin_current_amps{%s,pin=\"%d\"} %.3f\n",
-			  dev, i + 1, g_last.pins[i].current / 1000.0);
+			  dev[k], i + 1, L->pins[i].current / 1000.0);
 	prom_family(b, "wireview_pin_power_watts", "gauge",
 		    "Power per 12V-2x6 pin.");
-	for (i = 0; i < 6; i++)
+	EACH_UP for (i = 0; i < 6; i++)
 		ob_printf(b, "wireview_pin_power_watts{%s,pin=\"%d\"} %.3f\n",
-			  dev, i + 1,
-			  (double)g_last.pins[i].voltage *
-			  (double)g_last.pins[i].current / 1e6);
+			  dev[k], i + 1,
+			  (double)L->pins[i].voltage *
+			  (double)L->pins[i].current / 1e6);
 
 	prom_family(b, "wireview_power_watts", "gauge",
 		    "Total power, sum of the pins.");
-	ob_printf(b, "wireview_power_watts{%s} %.3f\n",
-		  dev, (double)frame_power_uw(&g_last) / 1e6);
+	EACH_UP ob_printf(b, "wireview_power_watts{%s} %.3f\n",
+			  dev[k], (double)frame_power_uw(L) / 1e6);
 	prom_family(b, "wireview_current_amps", "gauge",
 		    "Total current reported by the device.");
-	ob_printf(b, "wireview_current_amps{%s} %.3f\n",
-		  dev, g_last.total_current / 1000.0);
+	EACH_UP ob_printf(b, "wireview_current_amps{%s} %.3f\n",
+			  dev[k], L->total_current / 1000.0);
 	prom_family(b, "wireview_voltage_average_volts", "gauge",
 		    "Average pin voltage reported by the device.");
-	ob_printf(b, "wireview_voltage_average_volts{%s} %.3f\n",
-		  dev, g_last.avg_voltage / 1000.0);
+	EACH_UP ob_printf(b, "wireview_voltage_average_volts{%s} %.3f\n",
+			  dev[k], L->avg_voltage / 1000.0);
 	prom_family(b, "wireview_vdd_volts", "gauge",
 		    "Device supply voltage.");
-	ob_printf(b, "wireview_vdd_volts{%s} %.3f\n", dev, g_last.vdd / 1000.0);
+	EACH_UP ob_printf(b, "wireview_vdd_volts{%s} %.3f\n", dev[k], L->vdd / 1000.0);
 
 	prom_family(b, "wireview_temperature_celsius", "gauge",
 		    "Temperatures; disconnected sensors are omitted.");
-	for (i = 0; i < 4; i++) {
-		int16_t raw = g_last.ts[i];
+	EACH_UP for (i = 0; i < 4; i++) {
+		int16_t raw = L->ts[i];
 
 		/* Disconnected sensors report out-of-range values */
 		if (raw < -400 || raw > 2000)
 			continue;
 		ob_printf(b, "wireview_temperature_celsius{%s,sensor=\"%s\"} %.1f\n",
-			  dev, temp_names[i], raw / 10.0);
+			  dev[k], temp_names[i], raw / 10.0);
 	}
 
 	prom_family(b, "wireview_fan_duty_ratio", "gauge",
 		    "Fan duty cycle, 0 to 1.");
-	ob_printf(b, "wireview_fan_duty_ratio{%s} %.2f\n",
-		  dev, g_last.fan_duty / 100.0);
+	EACH_UP ob_printf(b, "wireview_fan_duty_ratio{%s} %.2f\n",
+			  dev[k], L->fan_duty / 100.0);
 	prom_family(b, "wireview_psu_cap_watts", "gauge",
 		    "PSU power capability from the sideband pins (0 = unknown).");
-	ob_printf(b, "wireview_psu_cap_watts{%s} %d\n",
-		  dev, psu_cap_watts(g_last.hpwr_cap));
+	EACH_UP ob_printf(b, "wireview_psu_cap_watts{%s} %d\n",
+			  dev[k], psu_cap_watts(L->hpwr_cap));
 
 	prom_family(b, "wireview_fault_status", "gauge",
 		    "Active fault bitmask (debounced).");
-	ob_printf(b, "wireview_fault_status{%s} %u\n", dev, g_last.fault_status);
+	EACH_UP ob_printf(b, "wireview_fault_status{%s} %u\n", dev[k], L->fault_status);
 	prom_family(b, "wireview_fault_log", "gauge",
 		    "Latched fault bitmask (debounced).");
-	ob_printf(b, "wireview_fault_log{%s} %u\n", dev, g_last.fault_log);
+	EACH_UP ob_printf(b, "wireview_fault_log{%s} %u\n", dev[k], L->fault_log);
 	prom_family(b, "wireview_fault_active", "gauge",
 		    "1 while the fault is active (fault_status bits 0-5).");
-	for (i = 0; i < 6; i++)
+	EACH_UP for (i = 0; i < 6; i++)
 		ob_printf(b, "wireview_fault_active{%s,fault=\"%s\"} %d\n",
-			  dev, fault_names[i], (g_last.fault_status >> i) & 1);
+			  dev[k], fault_names[i], (L->fault_status >> i) & 1);
 
 	prom_family(b, "wireview_energy_joules_total", "counter",
 		    "Energy delivered since wireviewd started.");
-	ob_printf(b, "wireview_energy_joules_total{%s} %.6f\n",
-		  dev, (double)g_energy_uj / 1e6);
+	EACH_UP ob_printf(b, "wireview_energy_joules_total{%s} %.6f\n",
+			  dev[k], (double)devs[k]->energy_uj / 1e6);
 
-	char build[33 * 2 + 1];
-	prom_escape(dev_info.build_string, build, sizeof(build));
-	const char *ed = edition_name(dev_info.vendor_id, dev_info.product_id);
-	char edition[64 * 2 + 1];
-	prom_escape(ed ? ed : "", edition, sizeof(edition));
 	prom_family(b, "wireview_firmware_info", "gauge",
 		    "Firmware version and build string, product id and edition.");
-	ob_printf(b, "wireview_firmware_info{%s,version=\"%d\",build=\"%s\","
-		  "product=\"%02X%02X\",edition=\"%s\"} 1\n",
-		  dev, dev_info.fw_version, build,
-		  dev_info.vendor_id, dev_info.product_id, edition);
+	EACH_UP {
+		const struct device_info *di = &devs[k]->info;
+		char build[33 * 2 + 1];
+		prom_escape(di->build_string, build, sizeof(build));
+		const char *ed = edition_name(di->vendor_id, di->product_id);
+		char edition[64 * 2 + 1];
+		prom_escape(ed ? ed : "", edition, sizeof(edition));
+		ob_printf(b, "wireview_firmware_info{%s,version=\"%d\",build=\"%s\","
+			  "product=\"%02X%02X\",edition=\"%s\"} 1\n",
+			  dev[k], di->fw_version, build,
+			  di->vendor_id, di->product_id, edition);
+	}
+#undef EACH_UP
+#undef L
 
 	return b->overflow ? -1 : 0;
 }
@@ -2154,46 +2522,46 @@ static int b64_decode(const char *in, uint8_t *out, size_t outcap)
 }
 
 /* ---- serial relay helpers (mirror the WCMD_* socket handlers) ---- */
-static int relay_screen(uint8_t cmd)
+static int relay_screen(struct wv_device *d, uint8_t cmd)
 {
-	if (serial_suspended())
+	if (serial_suspended(d))
 		return 0;
 	uint8_t c[2] = { CMD_SCREEN_CHANGE, cmd };
-	tcflush(g_serial_fd, TCIFLUSH);
-	return write(g_serial_fd, c, 2) == 2;
+	tcflush(d->serial_fd, TCIFLUSH);
+	return write(d->serial_fd, c, 2) == 2;
 }
-static int relay_nvm(uint8_t cmd)
+static int relay_nvm(struct wv_device *d, uint8_t cmd)
 {
-	if (serial_suspended())
+	if (serial_suspended(d))
 		return 0;
 	uint8_t c[6] = { CMD_NVM_CONFIG, 0x55, 0xAA, 0x55, 0xAA, cmd };
-	tcflush(g_serial_fd, TCIFLUSH);
-	return write(g_serial_fd, c, 6) == 6;
+	tcflush(d->serial_fd, TCIFLUSH);
+	return write(d->serial_fd, c, 6) == 6;
 }
 /* status/log are keep-masks: the firmware does fault &= mask. */
-static int relay_clear_faults(uint16_t status, uint16_t log)
+static int relay_clear_faults(struct wv_device *d, uint16_t status, uint16_t log)
 {
-	if (serial_suspended())
+	if (serial_suspended(d))
 		return 0;
 	uint8_t c[5] = { CMD_CLEAR_FAULTS, (uint8_t)(status & 0xFF),
 			 (uint8_t)(status >> 8), (uint8_t)(log & 0xFF),
 			 (uint8_t)(log >> 8) };
-	tcflush(g_serial_fd, TCIFLUSH);
-	return write(g_serial_fd, c, 5) == 5;
+	tcflush(d->serial_fd, TCIFLUSH);
+	return write(d->serial_fd, c, 5) == 5;
 }
-static int relay_write_config(const uint8_t *data, int data_len)
+static int relay_write_config(struct wv_device *d, const uint8_t *data, int data_len)
 {
-	if (serial_suspended())
+	if (serial_suspended(d))
 		return 0;
 	uint8_t frame[64];
 	frame[0] = CMD_WRITE_CONFIG;
-	tcflush(g_serial_fd, TCIFLUSH);
+	tcflush(d->serial_fd, TCIFLUSH);
 	for (int off = 0; off < data_len && off <= 255; off += 62) {
 		int n = data_len - off;
 		if (n > 62) n = 62;
 		frame[1] = (uint8_t)off;
 		memcpy(frame + 2, data + off, n);
-		if (write(g_serial_fd, frame, n + 2) != n + 2)
+		if (write(d->serial_fd, frame, n + 2) != n + 2)
 			return 0;
 	}
 	return 1;
@@ -2201,19 +2569,19 @@ static int relay_write_config(const uint8_t *data, int data_len)
 
 /* Read the device config over serial into cfg[] (needs >= 512). Sets *version
  * and returns the config byte length, or -1 on error. */
-static int relay_read_config(uint8_t *cfg, uint8_t *version)
+static int relay_read_config(struct wv_device *d, uint8_t *cfg, uint8_t *version)
 {
-	if (serial_suspended())
+	if (serial_suspended(d))
 		return -1;
-	int size = dev_info.config_version == 0 ? 72 :
-		   dev_info.config_version == 1 ? 74 : 96;
+	int size = d->info.config_version == 0 ? 72 :
+		   d->info.config_version == 1 ? 74 : 96;
 	uint8_t cmd = CMD_READ_CONFIG;
-	tcflush(g_serial_fd, TCIFLUSH);
-	if (write(g_serial_fd, &cmd, 1) != 1)
+	tcflush(d->serial_fd, TCIFLUSH);
+	if (write(d->serial_fd, &cmd, 1) != 1)
 		return -1;
-	if (read_exact(g_serial_fd, cfg, size, 2000) < 0)
+	if (read_exact(d->serial_fd, cfg, size, 2000) < 0)
 		return -1;
-	*version = dev_info.config_version;
+	*version = d->info.config_version;
 	return size;
 }
 
@@ -2311,7 +2679,24 @@ static void handle_post_command(int cfd, const char *req, const char *body,
 		return;
 	}
 
-	if (g_serial_fd < 0) {
+	/* deviceId (the UID in hex, as GET /sensors gives it) picks the
+	 * device; without one, or empty, the command goes to the primary. */
+	char dev_id[40] = {0};
+	struct wv_device *d;
+	if (json_str(body, "deviceId", dev_id, sizeof(dev_id)) && dev_id[0]) {
+		d = dev_by_uid_hex(dev_id);
+		if (!d) {
+			wlog("WARN", "command from %s rejected: unknown device %s",
+			     client_ip, dev_id);
+			http_respond(cfd, 404, "Not Found", "{\"error\":\"unknown device\"}");
+			return;
+		}
+		if (!dev_connected(d))
+			d = NULL;
+	} else {
+		d = dev_primary();
+	}
+	if (!d) {
 		http_respond(cfd, 503, "Service Unavailable", "{\"error\":\"no device\"}");
 		return;
 	}
@@ -2325,23 +2710,23 @@ static void handle_post_command(int cfd, const char *req, const char *body,
 	int ok = -1; /* -1 = unknown op */
 	long c;
 	if (strcmp(op, "screen") == 0) {
-		ok = json_int(body, "cmd", &c) ? relay_screen((uint8_t)c) : 0;
+		ok = json_int(body, "cmd", &c) ? relay_screen(d, (uint8_t)c) : 0;
 	} else if (strcmp(op, "nvm") == 0) {
-		ok = json_int(body, "cmd", &c) ? relay_nvm((uint8_t)c) : 0;
+		ok = json_int(body, "cmd", &c) ? relay_nvm(d, (uint8_t)c) : 0;
 	} else if (strcmp(op, "clearFaults") == 0) {
 		/* Keep-masks, as the firmware and the GUI use them: fault &= mask,
 		 * so 0 clears everything and ~(1 << bit) clears one fault. */
 		long s = 0, l = 0;
 		json_int(body, "statusMask", &s);
 		json_int(body, "logMask", &l);
-		ok = relay_clear_faults((uint16_t)s, (uint16_t)l);
+		ok = relay_clear_faults(d, (uint16_t)s, (uint16_t)l);
 	} else if (strcmp(op, "writeConfig") == 0) {
 		char data[4096] = {0};
 		uint8_t cfg[1024];
 		ok = 0;
 		if (json_str(body, "data", data, sizeof(data))) {
 			int n = b64_decode(data, cfg, sizeof(cfg));
-			if (n > 0) ok = relay_write_config(cfg, n);
+			if (n > 0) ok = relay_write_config(d, cfg, n);
 		}
 	}
 
@@ -2349,10 +2734,10 @@ static void handle_post_command(int cfd, const char *req, const char *body,
 		wlog("WARN", "command from %s: unknown op '%s'", client_ip, op);
 		http_respond(cfd, 400, "Bad Request", "{\"error\":\"unknown op\"}");
 	} else if (ok) {
-		wlog("INFO", "command from %s: op=%s -> executed", client_ip, op);
+		wlog("INFO", "command from %s: op=%s -> executed (%s)", client_ip, op, d->tag);
 		http_respond(cfd, 200, "OK", "{\"ok\":true}");
 	} else {
-		wlog("WARN", "command from %s: op=%s -> relay failed", client_ip, op);
+		wlog("WARN", "command from %s: op=%s -> relay failed (%s)", client_ip, op, d->tag);
 		http_respond(cfd, 500, "Internal Server Error", "{\"error\":\"relay failed\"}");
 	}
 }
@@ -2426,14 +2811,14 @@ static void http_handle(int http_fd)
 	if (sscanf(buf, "%7s %63s", method, path) != 2) { close(cfd); return; }
 
 	if (strcmp(method, "GET") == 0 && strcmp(path, "/sensors") == 0) {
-		char body[2048];
+		static char body[16384];
 		int bn = build_sensors_json(body, sizeof(body));
-		/* snprintf returns the untruncated length; never send more
-		 * than the buffer actually holds. */
-		if (bn < 0)
-			bn = 0;
-		if ((size_t)bn > sizeof(body) - 1)
-			bn = (int)(sizeof(body) - 1);
+		if (bn < 0) {
+			http_respond(cfd, 500, "Internal Server Error",
+				     "{\"error\":\"sensors overflow\"}");
+			close(cfd);
+			return;
+		}
 		char hdr[256];
 		int hn = snprintf(hdr, sizeof(hdr),
 			"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
@@ -2447,7 +2832,7 @@ static void http_handle(int http_fd)
 
 	/* Prometheus scrapes: read-only, and not logged, like /sensors. */
 	if (strcmp(method, "GET") == 0 && strcmp(path, "/metrics") == 0) {
-		static char body[16384];
+		static char body[65536];
 		struct outbuf ob = { .p = body, .cap = sizeof(body) };
 
 		if (build_metrics(&ob) < 0) {
@@ -2468,28 +2853,47 @@ static void http_handle(int http_fd)
 		return;
 	}
 
-	if (strcmp(method, "GET") == 0 && strcmp(path, "/config") == 0) {
-		if (g_serial_fd < 0) {
+	/* /config, or /config?id=<UID> for a device other than the primary */
+	if (strcmp(method, "GET") == 0 &&
+	    (strcmp(path, "/config") == 0 || strncmp(path, "/config?", 8) == 0)) {
+		struct wv_device *d = dev_primary();
+		const char *q = strchr(path, '?');
+
+		if (q) {
+			char id[40];
+			const char *v = strstr(q + 1, "id=");
+
+			if (!v || (v != q + 1 && v[-1] != '&')) {
+				http_respond(cfd, 400, "Bad Request", "{\"error\":\"bad query\"}");
+				close(cfd);
+				return;
+			}
+			snprintf(id, sizeof(id), "%.*s", (int)strcspn(v + 3, "&"), v + 3);
+			d = dev_by_uid_hex(id);
+			if (!d) {
+				http_respond(cfd, 404, "Not Found", "{\"error\":\"unknown device\"}");
+				close(cfd);
+				return;
+			}
+		}
+		if (!dev_connected(d)) {
 			http_respond(cfd, 503, "Service Unavailable", "{\"error\":\"no device\"}");
 			close(cfd);
 			return;
 		}
 		uint8_t cfg[512], ver = 0;
-		int n = relay_read_config(cfg, &ver);
+		int n = relay_read_config(d, cfg, &ver);
 		if (n < 0) {
 			http_respond(cfd, 500, "Internal Server Error", "{\"error\":\"read failed\"}");
 			close(cfd);
 			return;
 		}
-		char uid[25];
-		for (int i = 0; i < 12; i++)
-			snprintf(uid + i * 2, 3, "%02X", dev_info.uid[i]);
 		char b64[720];
 		b64_encode(cfg, n, b64);
 		char body[1024];
 		snprintf(body, sizeof(body),
-			"{\"deviceId\":\"%s\",\"version\":%d,\"data\":\"%s\"}", uid, ver, b64);
-		wlog("INFO", "config read by %s", client_ip);
+			"{\"deviceId\":\"%s\",\"version\":%d,\"data\":\"%s\"}", d->uid_hex, ver, b64);
+		wlog("INFO", "%s: config read by %s", d->tag, client_ip);
 		http_respond(cfd, 200, "OK", body);
 		close(cfd);
 		return;
@@ -2532,113 +2936,660 @@ static void http_handle(int http_fd)
 	close(cfd);
 }
 
-/* The WireView II last reported as not supported: its serial path and
- * product id. The connect loop retries every 2 s; this keeps it to one
- * report per device rather than one per attempt. Cleared once the path
- * no longer opens (unplugged) or a supported device connects. */
-static char    g_unsupported_path[256];
-static uint8_t g_unsupported_product;
+/* ---- Probing: which ports to try, and when ---- */
 
-static void unsupported_forget(void)
+/*
+ * A port that was probed and did not become a device: when to try it again,
+ * and whether it holds a WireView II, which is reported once and not probed
+ * again until it goes away (leaves the scan, or another USB serial shows up
+ * on the same path).
+ */
+struct probe_memo {
+	char tty[256];
+	char usb_serial[32];
+	struct timespec retry_at;	/* 0 = now */
+	int  unsupported;
+	uint8_t product;
+};
+
+#define MAX_MEMO 16
+static struct probe_memo g_memo[MAX_MEMO];
+
+static struct probe_memo *memo_find(const char *tty)
 {
-	g_unsupported_path[0] = '\0';
-	g_unsupported_product = 0;
+	for (int i = 0; i < MAX_MEMO; i++)
+		if (g_memo[i].tty[0] && strcmp(g_memo[i].tty, tty) == 0)
+			return &g_memo[i];
+	return NULL;
+}
+
+/* The memo for port tty with this USB serial, created if needed (a free
+ * entry, else the first). A memo of another serial on that path is a
+ * different device: it starts over. */
+static struct probe_memo *memo_get(const char *tty, const char *usb_serial)
+{
+	struct probe_memo *m = memo_find(tty);
+
+	if (m && strcmp(m->usb_serial, usb_serial) != 0) {
+		memset(m, 0, sizeof(*m));
+		m->tty[0] = '\0';
+	}
+	if (!m || !m->tty[0]) {
+		if (!m)
+			for (int i = 0; i < MAX_MEMO && !m; i++)
+				if (!g_memo[i].tty[0])
+					m = &g_memo[i];
+		if (!m)
+			m = &g_memo[0];
+		memset(m, 0, sizeof(*m));
+		snprintf(m->tty, sizeof(m->tty), "%s", tty);
+		snprintf(m->usb_serial, sizeof(m->usb_serial), "%s", usb_serial);
+	}
+	return m;
+}
+
+/* Forget the memo of port tty (it became a device or went away). */
+static void unsupported_forget(const char *tty)
+{
+	struct probe_memo *m = memo_find(tty);
+
+	if (m)
+		memset(m, 0, sizeof(*m));
 }
 
 /* Was the device at path already reported as an unsupported WireView II? */
 static int unsupported_known(const char *path)
 {
-	return g_unsupported_path[0] && strcmp(g_unsupported_path, path) == 0;
+	struct probe_memo *m = memo_find(path);
+
+	return m && m->unsupported;
 }
 
 /* Report the WireView II at path once, until the device there changes. */
-static void unsupported_report(const char *path, uint8_t product_id)
+static void unsupported_report(const char *path, const char *usb_serial,
+			       uint8_t product_id)
 {
-	if (unsupported_known(path) && g_unsupported_product == product_id)
+	struct probe_memo *m = memo_get(path, usb_serial);
+
+	if (m->unsupported && m->product == product_id)
 		return;
 	fprintf(stderr, "wireviewd: %s: WireView II (product %u) is not supported yet\n",
 		path, product_id);
 	wlog("WARN", "%s: WireView II (product %u) is not supported yet", path, product_id);
-	snprintf(g_unsupported_path, sizeof(g_unsupported_path), "%s", path);
-	g_unsupported_product = product_id;
+	m->unsupported = 1;
+	m->product = product_id;
 }
 
-/* Try to bring the device up: locate and open the serial port and the
- * hwmon node, then read the device info. Returns 0 with *serial_fd and
- * *hwmon_fd open, or the number of ms to wait before the next attempt.
- * Never sleeps, so the caller's poll loop keeps serving the command
- * socket and the HTTP listener while the device is absent. */
-static long device_connect(const char *user_dev_path, char *dev_path,
-			   size_t dev_path_len, int *serial_fd, int *hwmon_fd)
+/* Drop the memos of ports that are not among the n candidates any more. */
+static void memo_prune(const struct wv_candidate *c, int n)
 {
-	int sfd, hfd, rc;
+	for (int i = 0; i < MAX_MEMO; i++) {
+		int seen = 0;
 
-	/* Use the -d path every time; otherwise auto-detect. Clearing
-	 * dev_path below only forgets an auto-detected path. */
-	if (user_dev_path[0] != '\0') {
-		snprintf(dev_path, dev_path_len, "%s", user_dev_path);
-	} else if (dev_path[0] == '\0') {
-		if (find_device(dev_path, dev_path_len) < 0) {
-			fprintf(stderr, "wireviewd: device not found, retrying in 5s\n");
-			dev_path[0] = '\0';
-			unsupported_forget();
-			return 5000;
-		}
+		if (!g_memo[i].tty[0])
+			continue;
+		for (int j = 0; j < n && !seen; j++)
+			seen = strcmp(c[j].tty, g_memo[i].tty) == 0;
+		if (!seen)
+			memset(&g_memo[i], 0, sizeof(g_memo[i]));
 	}
+}
+
+/* ---- Device indexes, kept across restarts in STATE_DIR/devices ---- */
+
+/*
+ * One line per device ever given an index: "<index> <UID hex> <USB serial
+ * or ->". A device keeps its index, so its hwmon chip (wireview-isa-0000, wireviewN-isa-000N)
+ * and the fan-control or monitoring settings that name it stay the same
+ * across reboots and replugs. A new device takes the lowest index that no
+ * device of this run holds and that does not belong to a device present
+ * right now; the first device of a fresh install therefore gets 0, and a
+ * replacement unit takes over the index of one that is gone.
+ */
+struct state_rec {
+	int  index;
+	char uid[25];
+	char usb_serial[32];
+};
+
+static struct state_rec g_state[MAX_HWMON_INDEX];
+static int g_nstate;
+static int g_state_loaded;
+static int g_state_warned;
+
+static void state_path(char *out, size_t cap)
+{
+	snprintf(out, cap, "%s/devices", STATE_DIR);
+}
+
+static void state_load(void)
+{
+	char path[PATH_MAX], line[256];
+	FILE *f;
+
+	g_nstate = 0;
+	g_state_loaded = 1;
+	state_path(path, sizeof(path));
+	f = fopen(path, "r");
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f) && g_nstate < MAX_HWMON_INDEX) {
+		struct state_rec r;
+		char uid[64], ser[64];
+		int dup = 0;
+
+		if (line[0] == '#')
+			continue;
+		if (sscanf(line, "%d %63s %63s", &r.index, uid, ser) != 3 ||
+		    r.index < 0 || r.index >= MAX_HWMON_INDEX || strlen(uid) != 24)
+			continue;
+		snprintf(r.uid, sizeof(r.uid), "%s", uid);
+		snprintf(r.usb_serial, sizeof(r.usb_serial), "%s",
+			 strcmp(ser, "-") == 0 ? "" : ser);
+		for (int i = 0; i < g_nstate; i++)
+			dup |= g_state[i].index == r.index ||
+			       strcasecmp(g_state[i].uid, r.uid) == 0;
+		if (!dup)
+			g_state[g_nstate++] = r;
+	}
+	fclose(f);
+}
+
+/* Write the records out (temp file, then rename). A failure is reported
+ * once; the indexes still hold for this run. */
+static void state_save(void)
+{
+	char path[PATH_MAX], tmp[PATH_MAX + 8];
+	FILE *f;
+
+	state_path(path, sizeof(path));
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	mkdir(STATE_DIR, 0755);
+	f = fopen(tmp, "w");
+	if (f) {
+		fprintf(f, "# wireviewd device indexes: index uid usb-serial\n");
+		for (int i = 0; i < g_nstate; i++)
+			fprintf(f, "%d %s %s\n", g_state[i].index, g_state[i].uid,
+				g_state[i].usb_serial[0] ? g_state[i].usb_serial : "-");
+		if (fclose(f) == 0 && rename(tmp, path) == 0)
+			return;
+		unlink(tmp);
+	}
+	if (!g_state_warned) {
+		fprintf(stderr, "wireviewd: warning: cannot write %s: %s; device indexes "
+			"will not survive a restart\n", path, strerror(errno));
+		wlog("WARN", "cannot write %s: %s", path, strerror(errno));
+		g_state_warned = 1;
+	}
+}
+
+/* Does a device slot of this run hold index? */
+static int index_in_use(int index)
+{
+	for (int i = 0; i < MAX_DEVICES; i++)
+		if (g_devs[i].used && g_devs[i].index == index)
+			return 1;
+	return 0;
+}
+
+/* The index for the device with this UID, which has no slot in this run.
+ * cands are the ports present now (their USB serials tell which recorded
+ * devices are plugged in). Returns the index, or -1 if none is free. */
+static int assign_index(const char *uid_hex, const char *usb_serial,
+			const struct wv_candidate *cands, int ncand)
+{
+	int pick = -1;
+
+	if (!g_state_loaded)
+		state_load();
+
+	for (int i = 0; i < g_nstate; i++) {
+		struct state_rec *r = &g_state[i];
+
+		if (strcasecmp(r->uid, uid_hex) != 0 || index_in_use(r->index))
+			continue;
+		if (usb_serial[0] && strcmp(r->usb_serial, usb_serial) != 0) {
+			snprintf(r->usb_serial, sizeof(r->usb_serial), "%s", usb_serial);
+			state_save();
+		}
+		return r->index;
+	}
+
+	for (int idx = 0; idx < MAX_HWMON_INDEX && pick < 0; idx++) {
+		int reserved = 0;
+
+		if (index_in_use(idx))
+			continue;
+		for (int i = 0; i < g_nstate && !reserved; i++) {
+			if (g_state[i].index != idx || !g_state[i].usb_serial[0])
+				continue;
+			for (int j = 0; j < ncand && !reserved; j++)
+				reserved = strcmp(cands[j].usb_serial,
+						  g_state[i].usb_serial) == 0;
+		}
+		if (!reserved)
+			pick = idx;
+	}
+	if (pick < 0)
+		return -1;
+
+	/* The new record replaces whatever held that index or this UID. */
+	for (int i = 0; i < g_nstate; ) {
+		if (g_state[i].index == pick ||
+		    strcasecmp(g_state[i].uid, uid_hex) == 0)
+			g_state[i] = g_state[--g_nstate];
+		else
+			i++;
+	}
+	if (g_nstate < MAX_HWMON_INDEX) {
+		struct state_rec *r = &g_state[g_nstate++];
+
+		r->index = pick;
+		snprintf(r->uid, sizeof(r->uid), "%s", uid_hex);
+		snprintf(r->usb_serial, sizeof(r->usb_serial), "%s", usb_serial);
+	}
+	state_save();
+	return pick;
+}
+
+/* ---- Device slots ---- */
+
+static void dev_init(struct wv_device *d)
+{
+	memset(d, 0, sizeof(*d));
+	d->serial_fd = -1;
+	d->hwmon_fd = -1;
+}
+
+/* Free a slot: its hwmon instance goes away with the fd. */
+static void dev_release(struct wv_device *d)
+{
+	if (d->serial_fd >= 0)
+		close_serial(d->serial_fd);
+	if (d->hwmon_fd >= 0)
+		close(d->hwmon_fd);
+	dev_init(d);
+}
+
+/* A free slot, else the one disconnected longest (released), else NULL. */
+static struct wv_device *dev_alloc(void)
+{
+	struct wv_device *old = NULL;
+
+	for (int i = 0; i < MAX_DEVICES; i++) {
+		struct wv_device *d = &g_devs[i];
+
+		if (!d->used)
+			return d;
+		if (!dev_connected(d) &&
+		    (!old || d->gone_since.tv_sec < old->gone_since.tv_sec ||
+		     (d->gone_since.tv_sec == old->gone_since.tv_sec &&
+		      d->gone_since.tv_nsec < old->gone_since.tv_nsec)))
+			old = d;
+	}
+	if (old) {
+		wlog("INFO", "%s: forgotten to make room for another device", old->tag);
+		dev_release(old);
+	}
+	return old;
+}
+
+/* Bind d's hwmon instance (once per slot; it stays while the slot does).
+ * An older module without WIREVIEW_IOC_BIND has one instance, fed by the
+ * primary device only; any other failure leaves d out of hwmon. */
+static void hwmon_attach(struct wv_device *d)
+{
+	struct wv_hwmon_bind b;
+	const char *ed;
+	int fd;
+
+	if (d->hwmon_fd >= 0)
+		return;
+	fd = open(HWMON_DEV, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		fprintf(stderr, "wireviewd: failed to open %s: %s\n",
+			HWMON_DEV, strerror(errno));
+		return;
+	}
+	memset(&b, 0, sizeof(b));
+	b.index = (uint32_t)d->index;
+	snprintf(b.serial, sizeof(b.serial), "%s", d->usb_serial);
+	snprintf(b.uid, sizeof(b.uid), "%s", d->uid_hex);
+	ed = edition_name(d->info.vendor_id, d->info.product_id);
+	snprintf(b.label, sizeof(b.label), "%s %s", ed ? ed : "WireView", d->tag);
+	if (ioctl(fd, WIREVIEW_IOC_BIND, &b) == 0) {
+		d->hwmon_bound = 1;
+		g_hwmon_legacy = 0;
+	} else if (errno == ENOTTY) {
+		if (!g_hwmon_legacy) {
+			printf("wireviewd: the loaded wireview_hwmon has a single instance: only the "
+			       "primary device appears in hwmon (reload the module for one per device)\n");
+			wlog("WARN", "wireview_hwmon without instances loaded: only the primary "
+			     "device appears in hwmon until the module is reloaded");
+		}
+		g_hwmon_legacy = 1;
+		d->hwmon_bound = 0;
+	} else {
+		fprintf(stderr, "wireviewd: %s: hwmon instance %d: %s; this device stays out of hwmon\n",
+			d->tag, d->index, strerror(errno));
+		wlog("WARN", "%s: hwmon instance %d: %s; this device stays out of hwmon",
+		     d->tag, d->index, strerror(errno));
+		close(fd);
+		return;
+	}
+	d->hwmon_fd = fd;
+}
+
+/* Does d feed hwmon? Every device with its own instance does; with an
+ * older module only the primary feeds the one instance there is. */
+static int hwmon_feeds(struct wv_device *d)
+{
+	if (d->hwmon_fd < 0)
+		return 0;
+	return d->hwmon_bound || (g_hwmon_legacy && d == dev_primary());
+}
+
+static void dev_set_tag(struct wv_device *d)
+{
+	const char *src = d->usb_serial[0] ? d->usb_serial : d->uid_hex;
+	size_t n = strlen(src);
+
+	snprintf(d->tag, sizeof(d->tag), "%s", n > 4 ? src + n - 4 : src);
+}
+
+/*
+ * Probe candidate c and bring it up as a device: open the port, read the
+ * device info, find or make its slot, bind its hwmon instance. cands are
+ * all ports present now. Returns 0 if c is now a connected device, else
+ * -1 (its memo says when to try again). Never sleeps beyond the device's
+ * own answers, so the poll loop keeps serving clients meanwhile.
+ */
+static int device_connect(const struct wv_candidate *c,
+			  const struct wv_candidate *cands, int ncand,
+			  int interval_ms)
+{
+	struct probe_memo *m = memo_find(c->tty);
+	struct device_info info;
+	struct wv_device *d;
+	int sfd, rc;
+
+	/* Another USB serial on this path: another device, start over. */
+	if (m && strcmp(m->usb_serial, c->usb_serial) != 0) {
+		memset(m, 0, sizeof(*m));
+		m = NULL;
+	}
+	if (unsupported_known(c->tty))
+		return -1;
+	if (m && m->retry_at.tv_sec && ms_until(&m->retry_at) > 0)
+		return -1;
+
+	printf("wireviewd: using %s\n", c->tty);
+
+	sfd = open_serial(c->tty);
+	if (sfd < 0) {
+		fprintf(stderr, "wireviewd: failed to open %s: %s\n",
+			c->tty, strerror(errno));
+		deadline_in(&memo_get(c->tty, c->usb_serial)->retry_at, PROBE_RETRY_MS);
+		return -1;
+	}
+	tcflush(sfd, TCIFLUSH);
+
+	rc = query_device_info(sfd, &info);
+	if (rc == -1) {
+		/* A port just opened can still deliver bytes from before (the
+		 * welcome text, or the traffic of a previous owner that just
+		 * let go): one more try on a quiet line, so a first scan does
+		 * not hand the next port the lower index over a blip. */
+		usleep(300000);
+		tcflush(sfd, TCIFLUSH);
+		rc = query_device_info(sfd, &info);
+	}
+	if (rc < 0) {
+		if (rc == QUERY_UNSUPPORTED) {
+			unsupported_report(c->tty, c->usb_serial, info.product_id);
+		} else {
+			fprintf(stderr, "wireviewd: device info query failed\n");
+			deadline_in(&memo_get(c->tty, c->usb_serial)->retry_at, 2000);
+		}
+		close_serial(sfd);
+		return -1;
+	}
+	unsupported_forget(c->tty);
+
+	d = dev_by_uid(info.uid);
+	if (d && dev_connected(d)) {
+		/* The same device under a second path (two -d names for one
+		 * port, say): keep the connection there is. */
+		fprintf(stderr, "wireviewd: %s is the device already connected on %s\n",
+			c->tty, d->tty);
+		deadline_in(&memo_get(c->tty, c->usb_serial)->retry_at, 30000);
+		close_serial(sfd);
+		return -1;
+	}
+	if (!d) {
+		char uid_hex[25];
+		int index;
+
+		for (int i = 0; i < 12; i++)
+			snprintf(uid_hex + i * 2, 3, "%02X", info.uid[i]);
+		index = assign_index(uid_hex, c->usb_serial, cands, ncand);
+		d = index >= 0 ? dev_alloc() : NULL;
+		if (!d) {
+			fprintf(stderr, "wireviewd: %s: no room for another device (at most %d)\n",
+				c->tty, MAX_DEVICES);
+			deadline_in(&memo_get(c->tty, c->usb_serial)->retry_at, 30000);
+			close_serial(sfd);
+			return -1;
+		}
+		dev_init(d);
+		d->used = 1;
+		d->index = index;
+		snprintf(d->uid_hex, sizeof(d->uid_hex), "%s", uid_hex);
+	}
+
+	d->info = info;
+	d->serial_fd = sfd;
+	snprintf(d->tty, sizeof(d->tty), "%s", c->tty);
+	if (c->usb_serial[0])
+		snprintf(d->usb_serial, sizeof(d->usb_serial), "%s", c->usb_serial);
+	if (c->usb_path[0])
+		snprintf(d->usb_path, sizeof(d->usb_path), "%s", c->usb_path);
+	dev_set_tag(d);
+	d->have_last = 0;
+	d->prev_status = 0;
+	d->prev_log = 0;
+	d->hwmon_v2 = 0;
+	d->energy_ts_valid = 0;
+	d->was_suspended = 0;
+	memset(&d->suspend_until, 0, sizeof(d->suspend_until));
+	d->suspend_owner = 0;
+	clock_gettime(CLOCK_MONOTONIC, &d->next_poll);
+
+	hwmon_attach(d);
+
+	printf("wireviewd: %s: %s on %s, index %d%s\n", d->tag, d->uid_hex, d->tty,
+	       d->index, d->hwmon_bound ? "" : g_hwmon_legacy ? " (single-instance hwmon)" :
+	       " (no hwmon)");
+	printf("wireviewd: polling every %d ms\n", interval_ms);
+	wlog("INFO", "%s: connected on %s (UID %s, index %d%s%s)", d->tag, d->tty,
+	     d->uid_hex, d->index, d->usb_path[0] ? ", USB port " : "", d->usb_path);
+	return 0;
+}
+
+/* d stopped answering: close its port, keep its slot, hwmon instance and
+ * energy until it is back. */
+static void device_disconnect(struct wv_device *d)
+{
+	close_serial(d->serial_fd);
+	d->serial_fd = -1;
+	d->have_last = 0;
+	/* The next first frame restarts the energy clock. */
+	d->energy_ts_valid = 0;
+	/* A serial handover belonged to the old connection; do not let it
+	 * hold off polling on the next one. */
+	memset(&d->suspend_until, 0, sizeof(d->suspend_until));
+	d->suspend_owner = 0;
+	clock_gettime(CLOCK_MONOTONIC, &d->gone_since);
+	wlog("INFO", "%s: disconnected from %s", d->tag, d->tty);
+}
+
+/* Look for ports and bring up the ones that are not devices yet. With -d
+ * paths only those are considered, else every WireView ttyACM. */
+static void rescan(char user_paths[][256], int nuser, int interval_ms)
+{
+	static int said_none, said_no_hwmon;
+	struct wv_candidate cands[2 * MAX_DEVICES];
+	int n, pending = 0;
+
+	n = nuser ? scan_user_paths(SYS_CLASS_TTY, user_paths, nuser, cands,
+				    2 * MAX_DEVICES)
+		  : scan_devices(SYS_CLASS_TTY, cands, 2 * MAX_DEVICES);
+	if (n < 0)
+		n = 0;
+	memo_prune(cands, n);
+
+	for (int i = 0; i < n; i++) {
+		int have = 0;
+
+		for (int j = 0; j < MAX_DEVICES && !have; j++)
+			have = dev_connected(&g_devs[j]) &&
+			       strcmp(g_devs[j].tty, cands[i].tty) == 0;
+		if (!have)
+			pending++;
+	}
+
+	if (n == 0 && !dev_primary()) {
+		if (!said_none)
+			fprintf(stderr, "wireviewd: device not found, waiting for one\n");
+		said_none = 1;
+		return;
+	}
+	said_none = 0;
+	if (!pending)
+		return;
 
 	/* Check hwmon module is loaded */
 	if (access(HWMON_DEV, W_OK) < 0) {
-		fprintf(stderr, "wireviewd: %s not available (load wireview_hwmon module)\n",
-			HWMON_DEV);
-		return 5000;
+		if (!said_no_hwmon)
+			fprintf(stderr, "wireviewd: %s not available (load wireview_hwmon module)\n",
+				HWMON_DEV);
+		said_no_hwmon = 1;
+		return;
+	}
+	said_no_hwmon = 0;
+
+	for (int i = 0; i < n; i++) {
+		int have = 0;
+
+		for (int j = 0; j < MAX_DEVICES && !have; j++)
+			have = dev_connected(&g_devs[j]) &&
+			       strcmp(g_devs[j].tty, cands[i].tty) == 0;
+		if (!have)
+			device_connect(&cands[i], cands, n, interval_ms);
+		if (!running)
+			return;
+	}
+}
+
+static void next_poll_in(struct wv_device *d, const struct timespec *now,
+			 int interval_ms)
+{
+	d->next_poll.tv_sec = now->tv_sec;
+	d->next_poll.tv_nsec = now->tv_nsec + (long)interval_ms * 1000000;
+	if (d->next_poll.tv_nsec >= 1000000000L) {
+		d->next_poll.tv_sec += d->next_poll.tv_nsec / 1000000000L;
+		d->next_poll.tv_nsec %= 1000000000L;
+	}
+}
+
+/* One sensor poll of d. Returns -1 if the device is gone (disconnected
+ * here), else 0. */
+static int poll_device(struct wv_device *d, int interval_ms)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (serial_suspended(d)) {
+		d->was_suspended = 1;
+		next_poll_in(d, &now, interval_ms);
+		return 0;
+	}
+	if (d->was_suspended) {
+		/* Drop whatever the GUI's traffic left in the line
+		 * discipline before reading frames. */
+		tcflush(d->serial_fd, TCIFLUSH);
+		d->was_suspended = 0;
+	}
+	/* Every poll, not only after a handover: an expired handover never
+	 * sends RESUME, and the GUI's close clears the flag whenever it
+	 * happens. */
+	serial_set_exclusive(d->serial_fd, 1);
+
+	struct sensor_struct ss;
+	if (read_sensors(d->serial_fd, &ss) < 0) {
+		fprintf(stderr, "wireviewd: %s: read failed, reconnecting\n", d->tag);
+		device_disconnect(d);
+		return -1;
 	}
 
-	if (!unsupported_known(dev_path))
-		printf("wireviewd: using %s\n", dev_path);
+	/* A desynced read (no framing or CRC on the wire) is handled in two
+	 * layers:
+	 *
+	 * 1. Discard frames that fail frame_is_sane().
+	 * 2. Debounce fault bits - real faults persist (the device latches
+	 *    them in fault_log until cleared), so publish a bit only if it
+	 *    was set in both the previous and the current frame.
+	 *    fault_status and fault_log are debounced independently and per
+	 *    bit, so a bit already latched in the log cannot let a corrupt
+	 *    status word (or vice versa) through. */
+	if (!frame_is_sane(&ss)) {
+		wlog("WARN",
+		     "%s: discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u vdd=%u mV power=%lld W status=0x%04x log=0x%04x)",
+		     d->tag, ss.fan_duty, ss._pad1, ss._pad2, ss.vdd,
+		     (long long)(frame_power_uw(&ss) / 1000000),
+		     ss.fault_status, ss.fault_log);
+	} else {
+		uint16_t raw_status = ss.fault_status;
+		uint16_t raw_log = ss.fault_log;
+		uint16_t new_status = raw_status & ~d->prev_status;
+		uint16_t new_log = raw_log & ~d->prev_log;
 
-	sfd = open_serial(dev_path);
-	if (sfd < 0) {
-		fprintf(stderr, "wireviewd: failed to open %s: %s\n",
-			dev_path, strerror(errno));
-		dev_path[0] = '\0';
-		unsupported_forget();
-		return 5000;
+		if (new_status || new_log)
+			wlog("WARN",
+			     "%s: suppressed unconfirmed fault bits: status=0x%04x log=0x%04x",
+			     d->tag, new_status, new_log);
+		ss.fault_status = raw_status & d->prev_status;
+		ss.fault_log = raw_log & d->prev_log;
+		d->prev_status = raw_status;
+		d->prev_log = raw_log;
+
+		/* Allow a few missed polls, never less than 5 s. */
+		energy_accumulate(d, &ss, interval_ms * 3 > 5000 ?
+				  interval_ms * 3 : 5000);
+
+		if (hwmon_feeds(d) && write_hwmon(d, &ss) < 0) {
+			fprintf(stderr, "wireviewd: %s: hwmon write failed\n", d->tag);
+			/* Reopened (and bound again) on the reconnect. */
+			close(d->hwmon_fd);
+			d->hwmon_fd = -1;
+			d->hwmon_bound = 0;
+			device_disconnect(d);
+			return -1;
+		}
+
+		memcpy(&d->last, &ss, sizeof(d->last));
+		d->have_last = 1;
 	}
 
-	hfd = open(HWMON_DEV, O_WRONLY);
-	if (hfd < 0) {
-		fprintf(stderr, "wireviewd: failed to open %s: %s\n",
-			HWMON_DEV, strerror(errno));
-		close_serial(sfd);
-		return 5000;
-	}
-
-	tcflush(sfd, TCIFLUSH);
-
-	/* Query device info */
-	rc = query_device_info(sfd);
-	if (rc < 0) {
-		if (rc == QUERY_UNSUPPORTED)
-			unsupported_report(dev_path, dev_info.product_id);
-		else
-			fprintf(stderr, "wireviewd: device info query failed\n");
-		close(hfd);
-		close_serial(sfd);
-		dev_path[0] = '\0';
-		return 2000;
-	}
-
-	unsupported_forget();
-	*serial_fd = sfd;
-	*hwmon_fd = hfd;
+	next_poll_in(d, &now, interval_ms);
 	return 0;
 }
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "Usage: %s [-i interval_ms] [-d /dev/ttyACMx] [-V]\n", prog);
+	fprintf(stderr, "Usage: %s [-i interval_ms] [-d /dev/ttyACMx]... [-V]\n", prog);
 	fprintf(stderr, "  -i  Poll interval in milliseconds (default: 1000)\n");
-	fprintf(stderr, "  -d  Serial device path (default: auto-detect)\n");
+	fprintf(stderr, "  -d  Serial device path; repeat for several (default: every WireView found)\n");
 	fprintf(stderr, "  -V  Print version and exit\n");
 	exit(1);
 }
@@ -2646,8 +3597,8 @@ static void usage(const char *prog)
 int main(int argc, char **argv)
 {
 	int interval_ms = 1000;
-	char user_dev_path[256] = "";	/* -d: re-used on every reconnect */
-	char dev_path[256] = "";	/* path in use this connection */
+	char user_paths[MAX_DEVICES][256];	/* -d: only these ports */
+	int nuser = 0;
 	int opt;
 
 	/* stdout is block-buffered when not a tty (systemd); make status
@@ -2664,7 +3615,11 @@ int main(int argc, char **argv)
 			}
 			break;
 		case 'd':
-			snprintf(user_dev_path, sizeof(user_dev_path), "%s", optarg);
+			if (nuser == MAX_DEVICES) {
+				fprintf(stderr, "At most %d -d paths\n", MAX_DEVICES);
+				return 1;
+			}
+			snprintf(user_paths[nuser++], sizeof(user_paths[0]), "%s", optarg);
 			break;
 		case 'V':
 			printf("wireviewd %s\n", WIREVIEW_PKG_VERSION);
@@ -2681,6 +3636,9 @@ int main(int argc, char **argv)
 	/* A peer that hangs up before its reply must not kill the daemon
 	 * (systemd already ignores SIGPIPE; this covers manual runs). */
 	signal(SIGPIPE, SIG_IGN);
+
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
 
 	load_config();
 	resolve_wireview_group();
@@ -2721,22 +3679,15 @@ int main(int argc, char **argv)
 
 	struct client clients[MAX_CLIENTS];
 	int num_clients = 0;
-	int serial_fd = -1;
-	int hwmon_fd = -1;
 
-	/* Fault bits seen in the previous frame (debounce state),
-	 * reset on every (re)connect. */
-	uint16_t prev_status = 0, prev_log = 0;
-
-	/* next_poll is the next sensor read while connected, next_reconnect
-	 * the next connection attempt while not. First attempt: now. */
-	struct timespec next_poll, next_reconnect;
+	/* next_scan is the next look for new ports; each device polls at
+	 * its own next_poll. First scan: now. */
+	struct timespec next_scan;
 
 	memset(clients, 0, sizeof(clients));
-	clock_gettime(CLOCK_MONOTONIC, &next_reconnect);
-	next_poll = next_reconnect;
+	clock_gettime(CLOCK_MONOTONIC, &next_scan);
 
-	/* Single event loop with poll(), device present or not */
+	/* Single event loop with poll(), devices present or not */
 	while (running) {
 		/* SIGHUP: before the poll set is built, so a replaced
 		 * listener is polled from this iteration on. */
@@ -2763,24 +3714,9 @@ int main(int argc, char **argv)
 			}
 		}
 
-		if (serial_fd < 0 && ms_until(&next_reconnect) <= 0) {
-			long retry = device_connect(user_dev_path, dev_path,
-						    sizeof(dev_path),
-						    &serial_fd, &hwmon_fd);
-			if (retry > 0) {
-				deadline_in(&next_reconnect, retry);
-			} else {
-				/* Device is ready; allow HTTP command relay. */
-				g_serial_fd = serial_fd;
-				for (int i = 0; i < 12; i++)
-					snprintf(g_dev_uid + i * 2, 3, "%02X",
-						 dev_info.uid[i]);
-				prev_status = 0;
-				prev_log = 0;
-				g_hwmon_v2 = 0;
-				printf("wireviewd: polling every %d ms\n", interval_ms);
-				clock_gettime(CLOCK_MONOTONIC, &next_poll);
-			}
+		if (ms_until(&next_scan) <= 0) {
+			rescan(user_paths, nuser, interval_ms);
+			deadline_in(&next_scan, RESCAN_MS);
 			if (!running)
 				break;
 		}
@@ -2816,10 +3752,15 @@ int main(int argc, char **argv)
 			nfds++;
 		}
 
-		/* Time until the next sensor poll, or the next connection
-		 * attempt while the device is absent ... */
-		long wait_ms = ms_until(serial_fd >= 0 ? &next_poll
-						       : &next_reconnect);
+		/* Time until the next scan or the next device poll ... */
+		long wait_ms = ms_until(&next_scan);
+		for (int i = 0; i < MAX_DEVICES; i++) {
+			if (!dev_connected(&g_devs[i]))
+				continue;
+			long left = ms_until(&g_devs[i].next_poll);
+			if (left < wait_ms)
+				wait_ms = left;
+		}
 		/* ... or until the earliest partial request expires, or
 		 * the earliest idle client is due to be closed */
 		struct timespec tnow;
@@ -2858,20 +3799,19 @@ int main(int argc, char **argv)
 		    (pfds[http_pfd_idx].revents & POLLIN))
 			http_handle(g_http_fd);
 
-		/* Handle client requests (serial_fd is -1 while the device
-		 * is absent, and requests get RESP_NOT_CONNECTED). Walk
-		 * backwards: removing client i swaps the last client into
-		 * slot i, and that one has already been handled, so slot i
-		 * is never re-read against the removed client's revents.
-		 * New clients are accepted only after this loop. */
+		/* Handle client requests (a device that is absent answers
+		 * RESP_NOT_CONNECTED). Walk backwards: removing client i
+		 * swaps the last client into slot i, and that one has
+		 * already been handled, so slot i is never re-read against
+		 * the removed client's revents. New clients are accepted
+		 * only after this loop. */
 		for (int i = num_clients - 1; i >= 0; i--) {
 			int idx = client_pfd_start + i;
 			if (idx >= nfds || !pfds[idx].revents)
 				continue;
 			int drop = 0;
 			if (pfds[idx].revents & POLLIN)
-				drop = client_read(&clients[i],
-						   serial_fd) < 0;
+				drop = client_read(&clients[i]) < 0;
 			if (drop || (pfds[idx].revents &
 				     (POLLHUP | POLLERR)))
 				client_remove(clients, &num_clients, i);
@@ -2902,7 +3842,7 @@ int main(int argc, char **argv)
 
 		/* Accept a new client. With every slot taken, it replaces
 		 * the client idle longest; it is refused (status 1) only
-		 * if every client is mid-request or holds the handover. */
+		 * if every client is mid-request or holds a handover. */
 		if (sock_pfd_idx >= 0 && (pfds[sock_pfd_idx].revents & POLLIN)) {
 			int new_fd = accept4(sock_fd, NULL, NULL,
 					     SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -2929,124 +3869,21 @@ int main(int argc, char **argv)
 			}
 		}
 
-		if (serial_fd < 0)
-			continue;
+		/* Sensor polls of the devices that are due. A device that
+		 * fails is disconnected; look for it again in 2 s. */
+		for (int i = 0; i < MAX_DEVICES; i++) {
+			struct wv_device *d = &g_devs[i];
 
-		/* Sensor poll */
-		struct timespec now;
-		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (now.tv_sec > next_poll.tv_sec ||
-		    (now.tv_sec == next_poll.tv_sec &&
-		     now.tv_nsec >= next_poll.tv_nsec)) {
-
-			static int was_suspended;
-			if (serial_suspended()) {
-				was_suspended = 1;
-				next_poll.tv_sec = now.tv_sec;
-				next_poll.tv_nsec = now.tv_nsec +
-						    (long)interval_ms * 1000000;
-				if (next_poll.tv_nsec >= 1000000000L) {
-					next_poll.tv_sec +=
-						next_poll.tv_nsec / 1000000000L;
-					next_poll.tv_nsec %= 1000000000L;
-				}
+			if (!dev_connected(d) || ms_until(&d->next_poll) > 0)
 				continue;
-			}
-			if (was_suspended) {
-				/* Drop whatever the GUI's traffic left in the
-				 * line discipline before reading frames. */
-				tcflush(serial_fd, TCIFLUSH);
-				was_suspended = 0;
-			}
-			/* Every poll, not only after a handover: an expired
-			 * handover never sends RESUME, and the GUI's close
-			 * clears the flag whenever it happens. */
-			serial_set_exclusive(serial_fd, 1);
+			if (poll_device(d, interval_ms) < 0) {
+				struct timespec soon;
 
-			struct sensor_struct ss;
-			if (read_sensors(serial_fd, &ss) < 0) {
-				fprintf(stderr,
-					"wireviewd: read failed, reconnecting\n");
-				goto disconnect;
-			}
-
-			/* A desynced read (no framing or CRC on the wire)
-			 * is handled in two layers:
-			 *
-			 * 1. Discard frames that fail frame_is_sane().
-			 * 2. Debounce fault bits - real faults persist (the
-			 *    device latches them in fault_log until
-			 *    cleared), so publish a bit only if it was set
-			 *    in both the previous and the current frame.
-			 *    fault_status and fault_log are debounced
-			 *    independently and per bit, so a bit already
-			 *    latched in the log cannot let a corrupt
-			 *    status word (or vice versa) through. */
-			if (!frame_is_sane(&ss)) {
-				wlog("WARN",
-				     "discarded corrupt sensor frame (fan=%u pad1=%u pad2=%u vdd=%u mV power=%lld W status=0x%04x log=0x%04x)",
-				     ss.fan_duty, ss._pad1, ss._pad2, ss.vdd,
-				     (long long)(frame_power_uw(&ss) / 1000000),
-				     ss.fault_status, ss.fault_log);
-			} else {
-				uint16_t raw_status = ss.fault_status;
-				uint16_t raw_log = ss.fault_log;
-				uint16_t new_status = raw_status & ~prev_status;
-				uint16_t new_log = raw_log & ~prev_log;
-
-				if (new_status || new_log)
-					wlog("WARN",
-					     "suppressed unconfirmed fault bits: status=0x%04x log=0x%04x",
-					     new_status, new_log);
-				ss.fault_status = raw_status & prev_status;
-				ss.fault_log = raw_log & prev_log;
-				prev_status = raw_status;
-				prev_log = raw_log;
-
-				/* Allow a few missed polls, never less than 5 s. */
-				energy_accumulate(&ss, interval_ms * 3 > 5000 ?
-						       interval_ms * 3 : 5000);
-
-				if (write_hwmon(hwmon_fd, &ss) < 0) {
-					fprintf(stderr,
-						"wireviewd: hwmon write failed\n");
-					goto disconnect;
-				}
-
-				memcpy(&g_last, &ss, sizeof(g_last));
-				g_have_last = 1;
-			}
-
-			next_poll.tv_sec = now.tv_sec;
-			next_poll.tv_nsec = now.tv_nsec +
-					    (long)interval_ms * 1000000;
-			if (next_poll.tv_nsec >= 1000000000L) {
-				next_poll.tv_sec +=
-					next_poll.tv_nsec / 1000000000L;
-				next_poll.tv_nsec %= 1000000000L;
+				deadline_in(&soon, 2000);
+				if (ts_diff_ms(&soon, &next_scan) < 0)
+					next_scan = soon;
 			}
 		}
-		continue;
-
-disconnect:
-		/* Device gone: close it, keep the command socket and its
-		 * clients, and retry from the poll loop in 2 s. */
-		g_serial_fd = -1;
-		close(hwmon_fd);
-		close_serial(serial_fd);
-		hwmon_fd = -1;
-		serial_fd = -1;
-		dev_path[0] = '\0';
-		g_have_last = 0;
-		dev_info.valid = 0;
-		/* The next device's first frame restarts the energy clock. */
-		g_energy_ts_valid = 0;
-		/* A serial handover belonged to the old connection; do not
-		 * let it hold off polling on the next one. */
-		g_suspend_until.tv_sec = 0;
-		g_suspend_until.tv_nsec = 0;
-		g_suspend_owner = 0;
-		deadline_in(&next_reconnect, 2000);
 	}
 
 	/* Cleanup */
@@ -3055,11 +3892,9 @@ disconnect:
 	}
 	cleanup_socket(sock_fd);
 
-	if (serial_fd >= 0) {
-		g_serial_fd = -1;
-		close(hwmon_fd);
-		close_serial(serial_fd);
-	}
+	for (int i = 0; i < MAX_DEVICES; i++)
+		if (g_devs[i].used)
+			dev_release(&g_devs[i]);
 
 	if (g_http_fd >= 0)
 		close(g_http_fd);

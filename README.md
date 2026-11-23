@@ -4,6 +4,8 @@ Linux hwmon driver and daemon for the [Thermal Grizzly WireView Pro II](https://
 
 Both editions of the WireView Pro II are supported: the original and the WireView Pro II Noctua Edition, which speaks the same protocol.
 
+Several devices on one PC are supported (since 1.9.0): each gets its own hwmon device, and every command can address any of them. See [Several devices](#several-devices).
+
 Works standalone or alongside the [wireview-linux](https://github.com/emaspa/wireview-linux) GUI application. When both are used together, the app reads sensor data from hwmon and sends commands through the daemon's Unix socket - giving you full app functionality plus system-wide sensor integration.
 
 ## How it works
@@ -13,7 +15,7 @@ WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hw
                                  └─────────→ HTTP /sensors, /metrics (opt-in) → LAN: other hosts, the GUI app, wireviewctl, Prometheus
 ```
 
-- **wireview_hwmon.ko** - Kernel module that creates a virtual hwmon device
+- **wireview_hwmon.ko** - Kernel module that creates a virtual hwmon device per WireView
 - **wireviewd** - Userspace daemon that reads the device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN. It tells the two editions apart by the product id the device reports (`EF05` WireView Pro II, `EF06` Noctua Edition) and passes it on to clients
 - **wireviewctl** - CLI tool for querying sensors, sending commands, firmware flashing (`flash`), and a `top` live monitor
 
@@ -238,10 +240,11 @@ sudo make uninstall
 ## Daemon options
 
 ```
-wireviewd [-i interval_ms] [-d /dev/ttyACMx] [-V]
+wireviewd [-i interval_ms] [-d /dev/ttyACMx]... [-V]
 
   -i  Poll interval in milliseconds (default: 1000)
-  -d  Serial device path (default: auto-detect)
+  -d  Serial device path; repeat it for several devices. Only these
+      ports are used (default: every WireView found)
   -V  Print the version and exit
 ```
 
@@ -250,8 +253,9 @@ wireviewd [-i interval_ms] [-d /dev/ttyACMx] [-V]
 The systemd unit runs `wireviewd` as root but sandboxed and with no
 capabilities. In practice:
 
-- It can write only to `/run` (the command socket) and `/var/log/wireview`;
-  audit logs are created mode `600`. `/etc/wireview` is read-only to it; it
+- It can write only to `/run` (the command socket), `/var/log/wireview` and
+  `/var/lib/wireview` (the [device indexes](#several-devices)); audit logs
+  are created mode `600`. `/etc/wireview` is read-only to it; it
   re-reads its config on `systemctl reload wireviewd` (SIGHUP).
 - A `port=` below 1024 in `/etc/wireview/config` fails to bind, since that
   needs `CAP_NET_BIND_SERVICE` and the unit drops all capabilities.
@@ -287,8 +291,15 @@ Running `./wireviewd` by hand, as in the Quick start, is not sandboxed.
 | Fault Log | `intrusion1_alarm` (`intrusion1_label`) | 0/1 |
 | Fault Status (raw) | `fault_status_raw` | bitmask |
 | Fault Log (raw) | `fault_log_raw` | bitmask |
+| Device USB serial | `serial` | text |
+| Device UID | `uid` | text, 24 hex digits |
+| Device name | `label` | text, the edition and the last 4 digits of the USB serial |
 
 All voltage, current, power, temperature, and energy channels also expose `_label` attributes for tool-friendly names.
+
+`serial`, `uid` and `label` say which device a hwmon directory belongs to.
+wireviewd sets them; they report no data (`ENODATA`) until it has, and with a
+daemon older than 1.9.0.
 
 The alarms follow the active fault bits (`fault_status`, debounced by the
 daemon), not the fault log:
@@ -318,6 +329,66 @@ published as `energy1_input`, as `"energyJ"` in `GET /sensors` and as
 Module and daemon must both be this release or newer. An older module has no
 `energy1_input` (the daemon notices and keeps feeding it the old record), and
 with an older daemon the new module reports no data (`ENODATA`) for it.
+
+## Several devices
+
+wireviewd drives every WireView it finds, up to 8 at once. Each gets its own
+hwmon device:
+
+| Device | hwmon name | `sensors` chip | sysfs device |
+|--------|------------|----------------|--------------|
+| index 0 | `wireview` | `wireview-isa-0000` | `/sys/devices/platform/wireview_hwmon` |
+| index 1 | `wireview1` | `wireview1-isa-0001` | `/sys/devices/platform/wireview_hwmon.1` |
+| index N | `wireviewN` | `wireviewN-isa-000N` | `/sys/devices/platform/wireview_hwmon.N` |
+
+The `serial`, `uid` and `label` attributes of each hwmon directory name the
+device behind it. Index 0 keeps the name, chip and path a single device has
+always had, so a setup with one WireView sees no change.
+
+**Stable indexes.** A device keeps its index across restarts, reboots and
+replugs: wireviewd records it by UID in `/var/lib/wireview/devices`
+(`index uid usb-serial`, one line per device). On the first start with
+several devices plugged in, they are numbered by serial port, `ttyACM0`
+first. A device seen for the first time takes the lowest index that no
+device of this run uses and that does not belong to a device plugged in
+right now, so a replacement unit takes over the index of the one it
+replaces. To renumber, stop wireviewd, edit or delete the file, and start it
+again.
+
+**The primary device** is the connected device with the lowest index. A
+command-socket connection that has not chosen a device (every client before
+1.9.0) talks to the primary; so do HTTP requests without a device id.
+
+**Older clients.** Only index 0 is called `wireview`, which is the name the
+wireview-linux app up to 1.4 and `wireviewctl` up to 1.8.1 look for. They
+keep showing the primary device and never mix up another one; they cannot
+reach the others. Fan-control and monitoring tools see every device.
+
+**Module and daemon versions.** Both must be 1.9.0 or newer for one hwmon
+device per WireView. With an older module still loaded (the package was
+upgraded but the module not reloaded), the daemon drives every device over
+the socket and HTTP but only the primary appears in hwmon; it says so once in
+the journal. Reload the module, or reboot, to get the rest. An older daemon on
+the new module drives one device and feeds hwmon device 0, as before.
+
+**wireviewctl.** `wireviewctl devices` lists the devices with their index,
+state, USB serial, UID, edition, firmware, serial port, USB port and hwmon
+directory. `--device` picks one for any command: its index, UID or USB
+serial, or the last digits of either (`--device 4E46`). Without it, `info`,
+`build` and `sensors` show every device, `read-config` reads the primary,
+and commands that change a device (screen, nvm, clear-faults, write-config,
+bootloader, flash) refuse to run as long as more than one is connected, and
+list them instead.
+`flash` enters the bootloader of that device only and points `dfu-util` at
+its USB port (`-p`), so it never takes another STM32 bootloader on the system
+for its target.
+
+```bash
+wireviewctl devices
+wireviewctl --device 4E46 info
+wireviewctl --device 1 screen temp
+sensors 'wireview*'
+```
 
 ## Example `sensors` output
 
@@ -364,9 +435,15 @@ whose alarm is set gets `ALARM` at the end of its line.
 `wireviewctl` lets you query sensor data and send device commands from the terminal or scripts.
 
 ```
-Usage: wireviewctl [--host H[:port] [--secret-file FILE]] <command> [args]
+Usage: wireviewctl [--device DEV] [--host H[:port] [--secret-file FILE]] <command> [args]
 
 Global options:
+  --device DEV      The device to address when several are attached: its
+                    index, UID or USB serial, or the last digits of either
+                    (see "devices"). Without it, info, build and sensors
+                    show every device, other reads go to the primary
+                    (lowest index), and commands that change a device
+                    refuse to run while more than one is connected.
   --host H[:port]   Talk to wireviewd on H over HTTP (default port 9876)
                     instead of the local socket: info, build, sensors and
                     read-config read; screen, nvm, clear-faults and
@@ -377,7 +454,11 @@ Global options:
                     Without it, $WIREVIEW_SECRET is used.
 
 Commands (require wireviewd running):
+  devices           List the devices wireviewd drives: index (the hwmon device
+                    wireview, wireview1, ...), state, USB serial, UID, edition,
+                    firmware, serial port, USB port and hwmon directory
   info              Show device firmware, UID, build, product and edition
+                    (every device, or the --device one)
   clear-faults [STATUS_MASK [LOG_MASK]]
                     Clear faults. Masks are hex bits to clear (default FFFF,
                     i.e. all active faults and the whole fault log)
@@ -398,8 +479,9 @@ Commands (require wireviewd running):
                     -y only skips the confirmation prompt.
 
 Commands (require wireview_hwmon module):
-  sensors [--json]  Show all sensor readings from hwmon sysfs; --json prints
-                    the same schema as the daemon's GET /sensors
+  sensors [--json]  Show all sensor readings from hwmon sysfs, for every
+                    device (or the --device one); --json prints the same
+                    schema as the daemon's GET /sensors
 
 Monitor:
   top [--host H[:port][,H2...]]... [--interval MS]
@@ -750,13 +832,72 @@ The daemon listens on a Unix socket at `/run/wireviewd.sock` that any local user
 | SUSPEND_SERIAL * | Pause daemon polling and release the serial port for a client (1-300 s, re-armable) |
 | RESUME_SERIAL * | End a serial handover early and resume polling |
 | RELOAD_CONFIG * | Re-read `/etc/wireview/config` and apply it, the same as SIGHUP (see below) |
+| LIST_DEVICES | Describe every device the daemon has seen since it started |
+| SELECT_DEVICE | Make the commands of this connection address one device |
 
-The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`. Status is 0 (ok), 1 (error), 2 (device not connected) or 3 (denied: privileged command from a peer that is not root or in the `wireview` group).
+The socket uses a binary protocol: request `[type:u8][len:u16 LE][payload]`, response `[status:u8][len:u16 LE][payload]`. Status is 0 (ok), 1 (error), 2 (device not connected), 3 (denied: privileged command from a peer that is not root or in the `wireview` group) or 4 (SELECT_DEVICE: no device with that UID).
 
 The command types are GET_DEVICE_INFO `0x01`, CLEAR_FAULTS `0x02`,
 READ_CONFIG `0x03`, WRITE_CONFIG `0x04`, SCREEN_CMD `0x05`, NVM_CMD `0x06`,
 READ_BUILD `0x07`, ENTER_BOOTLOADER `0x08`, SUSPEND_SERIAL `0x09`,
-RESUME_SERIAL `0x0A` and RELOAD_CONFIG `0x0B`.
+RESUME_SERIAL `0x0A`, RELOAD_CONFIG `0x0B`, LIST_DEVICES `0x0C` and
+SELECT_DEVICE `0x0D`.
+
+### Addressing a device
+
+Each connection addresses one device. Until it sends SELECT_DEVICE, that is
+the [primary](#several-devices), the connected device with the lowest index,
+which follows the devices as they come and go. After SELECT_DEVICE it is
+the chosen device, by UID, for the rest of the connection: while that device
+is unplugged its commands get status 2, and they work again once it is back,
+even on another port. A serial handover (SUSPEND_SERIAL) applies to the
+addressed device only; the others keep being polled.
+
+LIST_DEVICES and SELECT_DEVICE (since 1.9.0) are open to every user and
+work with no device attached. An older daemon answers both with status 1, or
+2 while it has no device: a client then knows it is talking to a daemon that
+drives one device.
+
+**SELECT_DEVICE** payload: the 12 UID bytes, as GET_DEVICE_INFO and
+LIST_DEVICES give them, to choose that device; or no payload to go back to
+the primary. The reply is status 0 with no payload; 4 if no device with that
+UID has been seen since the daemon started (the earlier choice then stands);
+1 for a payload of any other length.
+
+**LIST_DEVICES** takes no payload. The reply is status 0 with this payload,
+every integer one byte:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 1 | format, `1` |
+| 1 | 1 | number of records |
+| 2 | 1 | record size, `160` |
+| 3 | record size x number | the records, sorted by index |
+
+A later format may append fields to the records and raise the record size,
+so step through them by the size given, not by 160. Each record:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 12 | UID, raw bytes |
+| 12 | 1 | index (the hwmon device `wireview`, `wireview1`, ...) |
+| 13 | 1 | state: `0` connected, `1` connected with its serial port handed over (SUSPEND_SERIAL), `2` disconnected |
+| 14 | 1 | vendor id |
+| 15 | 1 | product id |
+| 16 | 1 | firmware version |
+| 17 | 1 | config version |
+| 18 | 1 | flags: bit 0 primary, bit 1 chosen by this connection, bit 2 has its own hwmon device |
+| 19 | 1 | reserved, 0 |
+| 20 | 16 | USB serial number, empty if unknown |
+| 36 | 64 | serial port, `/dev/ttyACM0`; the last one used while disconnected |
+| 100 | 16 | USB port path, `3-4`, empty if unknown; the same path its DFU bootloader appears on |
+| 116 | 40 | firmware build string |
+| 156 | 4 | reserved, 0 |
+
+The text fields are ASCII, padded with NUL bytes to their size and always
+NUL-terminated (a longer value is cut). A disconnected device keeps its
+record, its index and its last values until the daemon stops, or until it
+is forgotten to make room once 8 devices have been seen.
 
 RELOAD_CONFIG (since 1.8.0) takes no payload and works with or
 without a device. It re-reads the settings file, replaces the secret and the
@@ -792,14 +933,14 @@ connected across an unplug and replug; while no device is present every
 command gets status 2 (a privileged command from an unprivileged peer still
 gets 3), and the same connection works again once the device is back.
 
-Up to 8 clients can be connected at once. A client that sends no request for
+Up to 32 clients can be connected at once. A client that sends no request for
 60 seconds (counted from the connection, then from its last complete request)
-is disconnected, and when all 8 slots are taken a new connection replaces the
+is disconnected, and when all 32 slots are taken a new connection replaces the
 client that has been idle longest. A client should therefore expect the daemon
 to close a connection it left idle, and reconnect and retry when that happens:
 the GUI does this from wireview-linux 1.2.5.0. A request in progress is not
 idle, but it must arrive in full within 2 seconds of its first byte or the
-client is disconnected. The client that requested a SUSPEND_SERIAL handover is
+client is disconnected. A client that requested a SUSPEND_SERIAL handover is
 neither closed as idle nor replaced until the handover ends, since the GUI
 renews it only once a minute. A new connection is refused (status 1, then
 closed) only while every connected client is mid-request or holds the
@@ -810,7 +951,8 @@ handover. Idle disconnects and replacements are logged in the
 
 - When used with the wireview-linux app, the daemon handles the serial port and the app communicates through hwmon (sensors) and the daemon socket (commands). Both can run simultaneously.
 - The daemon locks the serial port while it runs: other programs that do not run as root get "Device or resource busy" instead of sharing the device's replies. The app's log reads and theme uploads borrow the port through SUSPEND_SERIAL, which lifts the lock until the handover ends.
-- If the device is disconnected, the daemon will wait and reconnect automatically. The command socket and the LAN listener keep serving meanwhile.
+- If a device is disconnected, the daemon will wait and reconnect automatically, with the same index. The command socket, the LAN listener and the other devices keep serving meanwhile.
+- A WireView the daemon does not support is reported once in the journal and left alone until it is unplugged; the other ports are still used.
 - If the LAN listener's port is taken when the daemon starts (WireView Mini publishes on 9876 itself until it sees the daemon), the daemon runs without it and retries every 10 s, opening the listener on its own once the port is free.
 - Sensor readings become stale (report N/A) if no data is received for 5 seconds.
 
@@ -824,21 +966,24 @@ default**: no port is opened unless you enable it.
 
 ### Endpoints (port 9876 by default)
 
-- **`GET /sensors`** - JSON snapshot of the device (per-pin V/I, power, temps,
+- **`GET /sensors`** - JSON snapshot of the devices (per-pin V/I, power, temps,
   faults, fan duty, PSU cap, energy, firmware build; see the example under
   [`wireviewctl sensors` output](#wireviewctl-sensors-output)). Open, read-only;
-  the same endpoint the GUI app and `wireviewctl top` consume. With no device,
-  `devices` is empty. `name` is the edition (`"WireView Pro II"` or
+  the same endpoint the GUI app and `wireviewctl top` consume. `devices` has one
+  entry per connected device, the primary first, and is empty with no device. `name` is the edition (`"WireView Pro II"` or
   `"WireView Pro II Noctua Edition"`) and `hwRev` its vendor and product id in
   uppercase hex, as Thermal Grizzly's own client writes them (`"EF05"`,
   `"EF06"`); daemons before 1.7.0 sent `"WireView Pro II"` and `""`.
 - **`GET /metrics`** - the same readings for Prometheus (see
   [below](#prometheus-get-metrics)). Open, read-only.
 - **`GET /config`** - the device's current configuration, so a remote editor can
-  load it.
+  load it. `GET /config?id=<UID>` reads another device than the primary (404
+  for an unknown one).
 - **`POST /command`** - write commands (screen / NVM / clear-faults / writeConfig).
   **Authenticated** (see below); the firmware bootloader is never reachable
-  over the network.
+  over the network. A `"deviceId"` member with a device's UID (the `id` of
+  `GET /sensors`) sends the command to that device; without one, or empty, it
+  goes to the primary, and an unknown one is refused with 404.
 
 ### Enabling it
 
@@ -909,9 +1054,10 @@ port. It is read-only and, like `/sensors`, not logged. Every sample carries
 | `wireview_energy_joules_total` | counter | | Energy since `wireviewd` started |
 | `wireview_firmware_info` | gauge | `version`, `build`, `product` (`"EF05"`, `"EF06"`), `edition` | Always 1 |
 
-Without a device only `wireview_up 0` is served, labelled with the last device
-seen (unlabelled before the first one), so an `up == 0` alert stays on the same
-series across a disconnect. A minimal scrape config:
+Every device has its own series, told apart by `device`. A device that is gone
+keeps only `wireview_up 0`, still labelled with its UID, so an `up == 0` alert
+stays on the same series across a disconnect; before the first device, an
+unlabelled `wireview_up 0` is all there is. A minimal scrape config:
 
 ```yaml
 scrape_configs:
@@ -997,7 +1143,8 @@ red `offline` line instead of stalling the view.)
 
 Remote hosts can also be listed (one `host[:port]` per line) in
 `/etc/wireview/hosts`, which you create yourself (nothing installs it). The
-local device is read straight from hwmon sysfs; remotes via `GET /sensors`.
+local devices are read straight from hwmon sysfs, every one of them; remotes
+via `GET /sensors`.
 Press **q** to quit.
 
 ### Audit log
@@ -1034,8 +1181,21 @@ the compiler supports them, and an end-to-end test: `tests/e2e.py` runs a test
 build of `wireviewd` against `tests/fake_device.py`, a simulated WireView Pro II
 on a pseudo-terminal, with the hwmon node, socket, log directory and config
 moved into a temporary directory, so it never touches an installed daemon.
+It also serves three simulated devices at once through a fake `/sys` tree, to
+cover the scan, the indexes and addressing each device.
 `WIREVIEW_SKIP_E2E=1` skips the end-to-end test (so does a missing `python3`),
 and `SANITIZE=0` builds without the sanitizers.
+
+```bash
+make module
+tests/kmod/run-vm-test.sh
+```
+
+boots the running kernel in QEMU with a busybox initramfs and exercises the
+module's instances there: binding, the identity attributes, removal on close,
+thousands of bind and close rounds while other processes read every hwmon
+attribute, and module reloads under the same load. It needs `qemu-system-x86_64`,
+a static busybox, static libc and `sudo` to read the kernel image.
 
 CI runs the same tests on every push and pull request, plus a `-Werror` build
 of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
@@ -1043,10 +1203,6 @@ of the daemon and CLI, a `W=1` module build that fails on any warning, and lint
 
 ## Roadmap
 
-- **Multi-device support** (deferred). One hwmon device per WireView. The
-  `/sensors` schema already has a `devices[]` array, but the daemon handles one
-  device: this needs a misc node per device or a device id in the record, and a
-  decision on how the hwmon devices are named.
 - **Remote readings on a par with local ones**: carry average voltage, Vdd and
   the alarms in `GET /sensors`, so `wireviewctl --host h sensors` prints what
   the local command does.

@@ -17,7 +17,8 @@ TEST_DEFS := -DWIREVIEW_PKG_VERSION=\"$(VERSION)-test\" \
 	-DHWMON_DEV=\"/nonexistent/wireview-hwmon\" \
 	-DSOCK_PATH=\"/nonexistent/wireviewd.sock\" \
 	-DLOG_DIR=\"/nonexistent/wireview-log\" \
-	-DCONFIG_PATH=\"/nonexistent/wireview-config\"
+	-DCONFIG_PATH=\"/nonexistent/wireview-config\" \
+	-DSTATE_DIR=\"/nonexistent/wireview-state\"
 
 SANITIZE ?= 1
 ifeq ($(SANITIZE),1)

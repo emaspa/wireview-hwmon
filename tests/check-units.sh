@@ -12,6 +12,14 @@ for u in "$top/wireviewd.service" "$top/debian/wireviewd.service"; do
 		rc=1
 	fi
 done
+for u in "$top/wireviewd.service" "$top/debian/wireviewd.service"; do
+	# ProtectSystem=strict leaves /var/lib read-only: the device index file
+	# (/var/lib/wireview/devices) needs the state directory.
+	if ! grep -Eq '^StateDirectory=wireview$' "$u"; then
+		echo "FAIL $u: StateDirectory=wireview is missing (device indexes)"
+		rc=1
+	fi
+done
 # The two units differ only in where the daemon binary lives.
 a=$(grep -Ev '^(ExecStart=|#)' "$top/wireviewd.service")
 b=$(grep -Ev '^(ExecStart=|#)' "$top/debian/wireviewd.service")

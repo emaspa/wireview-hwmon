@@ -1,4 +1,5 @@
-# NixOS VM test: module loads, wireviewd serves its socket without a device,
+# NixOS VM test: module loads, wireviewd serves its socket without a device
+# and has its state directory,
 # udev rules and group are in place, wireviewctl finds the bundled firmware,
 # /etc/wireview belongs to the group and a settings change applies on reload.
 { module }:
@@ -24,6 +25,10 @@
     machine.succeed("grep -q dfu-util $(command -v wireviewctl)")
     machine.fail("wireviewctl info")
     machine.succeed("systemctl is-active wireviewd")
+    # The device index file lives in the state directory; with no device,
+    # the device list is empty but answers.
+    machine.succeed("test -d /var/lib/wireview")
+    machine.succeed("wireviewctl devices | grep -q 'no device has connected'")
 
     # The settings directory, then a config created the way a user would
     # and its mode and group from the tmpfiles rule.

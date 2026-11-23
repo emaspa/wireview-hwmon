@@ -53,22 +53,35 @@
 #define WCMD_READ_BUILD        0x07
 #define WCMD_ENTER_BOOTLOADER  0x08
 #define WCMD_RELOAD_CONFIG     0x0B	/* re-read /etc/wireview/config */
+#define WCMD_LIST_DEVICES      0x0C	/* every device the daemon has seen */
+#define WCMD_SELECT_DEVICE     0x0D	/* address this connection to one */
 
 /* Response status */
 #define RESP_OK            0
 #define RESP_ERROR         1
 #define RESP_NOT_CONNECTED 2
 #define RESP_DENIED        3	/* privileged command, peer not root or in "wireview" */
+#define RESP_NO_DEVICE     4	/* SELECT_DEVICE: no device with that UID */
 
 /* sock_command() return values other than 0 */
 #define SOCK_FAIL     (-1)
 #define SOCK_DENIED   (-2)
 #define SOCK_NODAEMON (-3)	/* no daemon listening on the socket */
+#define SOCK_OLD      (-4)	/* a daemon older than 1.9.0: one device only */
 
 /* Global options. With --host, commands go to that host's wireviewd over
  * HTTP (writes signed with the shared secret) instead of the local socket. */
 static const char *g_host;		/* "host[:port]", NULL = local */
 static const char *g_secret_file;	/* --secret-file, else $WIREVIEW_SECRET */
+
+/* --device: which device the commands address. Locally, every socket
+ * connection selects g_sel_uid first (SELECT_DEVICE); with --host, the
+ * device's UID goes into each request as deviceId. Unset: the daemon's
+ * primary device. */
+static const char *g_device;
+static int     g_sel_set;
+static uint8_t g_sel_uid[12];
+static char    g_remote_uid[25];
 
 /* Remote (--host) implementations, defined with the HTTP client below. */
 static int http_command(const char *json);
@@ -79,6 +92,21 @@ static void b64_encode(const uint8_t *in, size_t len, char *out);
 /* Connect to the daemon socket. Returns the fd, SOCK_NODAEMON when no
  * daemon listens there (no socket, or nothing accepting on it), or
  * SOCK_FAIL. Prints why unless quiet, which only silences SOCK_NODAEMON. */
+static int read_full(int fd, void *buf, size_t n);
+
+/* SELECT_DEVICE g_sel_uid on a fresh connection fd. 0 if the daemon
+ * took it, -1 otherwise. */
+static int sock_select(int fd)
+{
+	uint8_t req[3 + 12] = { WCMD_SELECT_DEVICE, 12, 0 }, rh[3];
+
+	memcpy(req + 3, g_sel_uid, 12);
+	if (write(fd, req, sizeof(req)) != (ssize_t)sizeof(req) ||
+	    read_full(fd, rh, 3) < 0 || rh[1] || rh[2])
+		return -1;
+	return rh[0] == RESP_OK ? 0 : -1;
+}
+
 static int sock_open(int quiet)
 {
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -110,6 +138,12 @@ static int sock_open(int quiet)
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+	if (g_sel_set && sock_select(fd) < 0) {
+		fprintf(stderr, "wireviewctl: the device chosen with --device is not "
+			"known to wireviewd any more\n");
+		close(fd);
+		return SOCK_FAIL;
+	}
 	return fd;
 }
 
@@ -325,6 +359,10 @@ static int local_device_info(struct wv_devinfo *out, int timeout_s)
 		close(fd);
 		return DEVINFO_NO_DAEMON;
 	}
+	if (g_sel_set && sock_select(fd) < 0) {
+		close(fd);
+		return DEVINFO_NOT_CONNECTED;
+	}
 
 	int rc = DEVINFO_ERROR;
 	uint8_t hdr[3] = { WCMD_GET_DEVICE_INFO, 0, 0 };
@@ -342,16 +380,240 @@ static int local_device_info(struct wv_devinfo *out, int timeout_s)
 	return rc;
 }
 
+/* ---------- Several devices: LIST_DEVICES, --device ---------- */
+
+/* One LIST_DEVICES record (see wireviewd's list_devices_reply()). */
+struct wv_listdev {
+	uint8_t uid[12];
+	char    uid_hex[25];
+	int     index;
+	int     state;		/* 0 connected, 1 serial handed over, 2 gone */
+	int     flags;		/* bit 0 primary, 1 selected, 2 own hwmon instance */
+	uint8_t vendor, product, fw, cfg_ver;
+	char    usb_serial[17];
+	char    tty[65];
+	char    usb_path[17];
+	char    build[41];
+};
+
+#define WV_LIST_MAX 32
+
+static void get_field(char *out, const uint8_t *in, size_t n)
+{
+	size_t l = 0;
+
+	while (l < n && in[l])
+		l++;
+	memcpy(out, in, l);
+	out[l] = '\0';
+}
+
+/* Parse a LIST_DEVICES reply into out (at most max). Returns the number of
+ * records, or -1 if the reply is malformed or of an unknown format. */
+static int parse_device_list(const uint8_t *d, size_t len,
+			     struct wv_listdev *out, int max)
+{
+	if (len < 3 || d[0] != 1 || d[2] < 156)
+		return -1;
+	size_t rs = d[2];
+	int n = d[1];
+
+	if (len < 3 + (size_t)n * rs)
+		return -1;
+	if (n > max)
+		n = max;
+	for (int i = 0; i < n; i++) {
+		const uint8_t *r = d + 3 + (size_t)i * rs;
+		struct wv_listdev *o = &out[i];
+
+		memset(o, 0, sizeof(*o));
+		memcpy(o->uid, r, 12);
+		for (int k = 0; k < 12; k++)
+			snprintf(o->uid_hex + k * 2, 3, "%02X", r[k]);
+		o->index = r[12];
+		o->state = r[13];
+		o->vendor = r[14];
+		o->product = r[15];
+		o->fw = r[16];
+		o->cfg_ver = r[17];
+		o->flags = r[18];
+		get_field(o->usb_serial, r + 20, 16);
+		get_field(o->tty, r + 36, 64);
+		get_field(o->usb_path, r + 100, 16);
+		get_field(o->build, r + 116, 40);
+	}
+	return n;
+}
+
+/* LIST_DEVICES from the local daemon. Returns the count, SOCK_OLD for a
+ * daemon that does not know the command, or SOCK_NODAEMON / SOCK_FAIL. */
+static int list_devices(struct wv_listdev *out, int max, int quiet)
+{
+	uint8_t status, *data;
+	uint16_t rlen;
+	int saved = g_sel_set, rc;
+
+	/* LIST needs no selection, and must not fail on a stale one. */
+	g_sel_set = 0;
+	rc = sock_exchange(WCMD_LIST_DEVICES, NULL, 0, quiet, &status, &data, &rlen);
+	g_sel_set = saved;
+	if (rc < 0)
+		return rc;
+	/* Before 1.9.0 the daemon answered an unknown command with
+	 * RESP_ERROR, or RESP_NOT_CONNECTED while it had no device. */
+	if (status != RESP_OK) {
+		free(data);
+		return SOCK_OLD;
+	}
+	rc = parse_device_list(data, rlen, out, max);
+	free(data);
+	if (rc < 0) {
+		fprintf(stderr, "wireviewctl: malformed device list from wireviewd\n");
+		return SOCK_FAIL;
+	}
+	return rc;
+}
+
+static int all_digits(const char *s)
+{
+	if (!*s)
+		return 0;
+	for (; *s; s++)
+		if (*s < '0' || *s > '9')
+			return 0;
+	return 1;
+}
+
+static int ends_with_ci(const char *s, const char *suffix)
+{
+	size_t a = strlen(s), b = strlen(suffix);
+
+	return b && a >= b && strcasecmp(s + a - b, suffix) == 0;
+}
+
+/*
+ * The device spec names among l[0..n): an index ("0", "1"), a UID or USB
+ * serial in full, or the end of one (at least 3 characters, "4E46"),
+ * case-insensitive. Returns its position, -1 if none matches, -2 if the
+ * spec fits more than one.
+ */
+static int match_device(const char *spec, const struct wv_listdev *l, int n)
+{
+	int found = -1;
+
+	if (all_digits(spec) && strlen(spec) <= 2) {
+		for (int i = 0; i < n; i++)
+			if (l[i].index == atoi(spec))
+				return i;
+	}
+	for (int i = 0; i < n; i++)
+		if (strcasecmp(spec, l[i].uid_hex) == 0 ||
+		    (l[i].usb_serial[0] && strcasecmp(spec, l[i].usb_serial) == 0))
+			return i;
+	if (strlen(spec) < 3)
+		return -1;
+	for (int i = 0; i < n; i++) {
+		if (!ends_with_ci(l[i].uid_hex, spec) &&
+		    !(l[i].usb_serial[0] && ends_with_ci(l[i].usb_serial, spec)))
+			continue;
+		if (found >= 0)
+			return -2;
+		found = i;
+	}
+	return found;
+}
+
+static const char *state_name(int state)
+{
+	return state == 0 ? "connected" : state == 1 ? "handed over" : "gone";
+}
+
+/* The hwmon directory whose uid attribute is uid_hex, into out; -1 if none. */
+static int hwmon_dir_for_uid(const char *uid_hex, char *out, size_t cap);
+
+/* The device table of "devices", also printed (to f) when a command
+ * needs --device. */
+static void print_device_list(FILE *f, const struct wv_listdev *l, int n)
+{
+	fprintf(f, "%-3s %-11s %-12s %-24s %-30s %-4s %-13s %-6s %s\n", "IDX", "STATE",
+		"USB SERIAL", "UID", "EDITION", "FW", "PORT", "USB", "HWMON");
+	for (int i = 0; i < n; i++) {
+		const struct wv_listdev *d = &l[i];
+		const char *ed = edition_name(d->vendor, d->product);
+		char hw[PATH_MAX] = "-", fw[8];
+
+		if (hwmon_dir_for_uid(d->uid_hex, hw, sizeof(hw)) == 0) {
+			const char *b = strrchr(hw, '/');
+			memmove(hw, b ? b + 1 : hw, strlen(b ? b + 1 : hw) + 1);
+		}
+		snprintf(fw, sizeof(fw), "%u", d->fw);
+		fprintf(f, "%-3d %-11s %-12s %-24s %-30s %-4s %-13s %-6s %s%s\n",
+			d->index, state_name(d->state),
+			d->usb_serial[0] ? d->usb_serial : "-", d->uid_hex,
+			ed ? ed : "unknown", fw, d->tty[0] ? d->tty : "-",
+			d->usb_path[0] ? d->usb_path : "-", hw,
+			d->flags & 1 ? "  (primary)" : "");
+	}
+}
+
+static int remote_get_sensors(char *body, size_t cap);
+struct wv_snap;
+static int parse_remote(const char *hostport, const char *body,
+			struct wv_snap *snaps, int max);
+
+/* Resolve --device: locally against LIST_DEVICES (g_sel_uid), with
+ * --host against the ids in that host's GET /sensors (g_remote_uid).
+ * Returns 0, or 1 after printing why not. */
+static int resolve_device(void);
+
+/* Commands that change a device refuse to guess: with several devices
+ * attached and no --device they print the list and return 1. 0 when the
+ * target is clear (one device, --device given, or a daemon that drives
+ * one device only). */
+static int require_target(const char *op);
+
 /* ---------- Subcommands ---------- */
 
-static int cmd_info(void)
+/* Run a read-only command on every local device when several are attached
+ * and no --device was given: a header line per device, a blank line between
+ * them, as "sensors" prints. One device (or a daemon older than 1.9.0)
+ * prints exactly as before. */
+static int for_each_device(int (*one)(void))
+{
+	struct wv_listdev l[WV_LIST_MAX];
+	int n, rc = 0;
+
+	if (g_sel_set)
+		return one();
+	n = list_devices(l, WV_LIST_MAX, 1);
+	if (n <= 1)
+		return one();
+	for (int i = 0; i < n; i++) {
+		const char *ed = edition_name(l[i].vendor, l[i].product);
+
+		printf("%sdevice: %d %s %s\n", i ? "\n" : "", l[i].index,
+		       l[i].uid_hex, ed ? ed : "unknown");
+		if (l[i].state == 2) {
+			printf("state: %s\n", state_name(l[i].state));
+			continue;
+		}
+		memcpy(g_sel_uid, l[i].uid, 12);
+		g_sel_set = 1;
+		fflush(stdout);
+		if (one())
+			rc = 1;
+		fflush(stdout);
+	}
+	g_sel_set = 0;
+	return rc;
+}
+
+static int info_one(void)
 {
 	uint8_t *data = NULL;
 	uint16_t len = 0;
 	struct wv_devinfo di;
 
-	if (g_host)
-		return remote_info(0);
 	if (sock_command(WCMD_GET_DEVICE_INFO, NULL, 0, &data, &len) < 0)
 		return 1;
 
@@ -378,6 +640,13 @@ static int cmd_info(void)
 	       di.product_reported ? "" : " (assumed: this wireviewd does not report it)");
 	printf("edition: %s\n", ed ? ed : "unknown");
 	return 0;
+}
+
+static int cmd_info(void)
+{
+	if (g_host)
+		return remote_info(0);
+	return for_each_device(info_one);
 }
 
 static int parse_fault_mask(const char *s, uint16_t *out)
@@ -410,6 +679,8 @@ static int cmd_clear_faults(const char *status_arg, const char *log_arg)
 	if (status_arg && parse_fault_mask(status_arg, &status_mask) < 0)
 		return 1;
 	if (log_arg && parse_fault_mask(log_arg, &log_mask) < 0)
+		return 1;
+	if (require_target("clear-faults"))
 		return 1;
 
 	uint16_t status_keep = (uint16_t)~status_mask;
@@ -468,6 +739,9 @@ static int cmd_read_config(void)
 
 static int cmd_write_config(const char *path)
 {
+	if (require_target("write-config"))
+		return 1;
+
 	FILE *f = fopen(path, "r");
 	if (!f) {
 		perror(path);
@@ -574,6 +848,8 @@ static const struct name_val screen_cmds[] = {
  * {"op":OP,"cmd":N} over HTTP. Returns 0 on success, 1 on failure. */
 static int send_byte_command(uint8_t wcmd, const char *op, uint8_t val)
 {
+	if (require_target(op))
+		return 1;
 	if (g_host) {
 		char json[64];
 		snprintf(json, sizeof(json), "{\"op\":\"%s\",\"cmd\":%u}", op, val);
@@ -630,13 +906,11 @@ static int cmd_nvm(const char *name)
 	return 1;
 }
 
-static int cmd_build(void)
+static int build_one(void)
 {
 	uint8_t *data = NULL;
 	uint16_t len = 0;
 
-	if (g_host)
-		return remote_info(1);
 	if (sock_command(WCMD_READ_BUILD, NULL, 0, &data, &len) < 0)
 		return 1;
 
@@ -649,11 +923,20 @@ static int cmd_build(void)
 	return 0;
 }
 
+static int cmd_build(void)
+{
+	if (g_host)
+		return remote_info(1);
+	return for_each_device(build_one);
+}
+
 static int cmd_bootloader(void)
 {
 	uint8_t *resp = NULL;
 	uint16_t rlen = 0;
 
+	if (require_target("bootloader"))
+		return 1;
 	if (sock_command(WCMD_ENTER_BOOTLOADER, NULL, 0, &resp, &rlen) < 0)
 		return 1;
 
@@ -1194,16 +1477,43 @@ static int flash_check(const struct fw_ident *img, int dev_rc,
 	return 1;
 }
 
-static int dfu_device_present(void)
+/* STM32 DFU bootloaders dfu-util lists: at USB port path usb_path if
+ * given ("Found DFU: [0483:df11] ... path=\"3-4\" ..."), else anywhere.
+ * Returns how many. */
+static int dfu_devices(const char *usb_path)
 {
 	FILE *p = popen("dfu-util -l 2>/dev/null", "r");
 	if (!p) return 0;
-	char line[512];
+	char line[512], want[48];
 	int found = 0;
+
+	snprintf(want, sizeof(want), "path=\"%s\"", usb_path ? usb_path : "");
 	while (fgets(line, sizeof(line), p))
-		if (strstr(line, "[0483:df11]")) found = 1;
+		if (strstr(line, "[0483:df11]") && (!usb_path || strstr(line, want)))
+			found++;
 	pclose(p);
 	return found;
+}
+
+/* The device flash addresses, from the daemon's list: the --device one,
+ * else the only connected one. 0 with *out filled, -1 if not known (no
+ * daemon, an older one, or no device connected). */
+static int flash_target(struct wv_listdev *out)
+{
+	struct wv_listdev l[WV_LIST_MAX];
+	int n = list_devices(l, WV_LIST_MAX, 1), pick = -1;
+
+	for (int i = 0; i < n; i++) {
+		if (g_sel_set ? memcmp(l[i].uid, g_sel_uid, 12) == 0 : l[i].state != 2) {
+			if (pick >= 0 && !g_sel_set)
+				return -1;
+			pick = i;
+		}
+	}
+	if (pick < 0)
+		return -1;
+	*out = l[pick];
+	return 0;
 }
 
 /* Firmware image bundled with the wireview-hwmon package ("make install"
@@ -1233,11 +1543,38 @@ static int cmd_flash(const char *path, int yes, int force)
 
 	/* The gates: only GET_DEVICE_INFO goes to the daemon before them, and
 	 * nothing to the device. */
+	if (require_target("flash")) {
+		free(img);
+		return 1;
+	}
+
 	struct fw_ident id;
 	struct wv_devinfo dev;
 	fw_image_ident(img, len, &id);
 	int dev_rc = local_device_info(&dev, 3);
 	if (flash_check(&id, dev_rc, &dev, force)) {
+		free(img);
+		return 1;
+	}
+
+	/* The USB port of the target: its bootloader appears on the same
+	 * port, and dfu-util is pointed there (-p), so no other STM32
+	 * bootloader on the system is ever taken for it. */
+	struct wv_listdev target;
+	const char *usb_path = NULL;
+	if (flash_target(&target) == 0) {
+		const char *ed = edition_name(target.vendor, target.product);
+
+		if (target.usb_path[0])
+			usb_path = target.usb_path;
+		printf("target: %s %s, USB serial %s, USB port %s\n",
+		       ed ? ed : "WireView", target.uid_hex,
+		       target.usb_serial[0] ? target.usb_serial : "unknown",
+		       usb_path ? usb_path : "unknown");
+	}
+	if (!usb_path && dfu_devices(NULL) > 1) {
+		fprintf(stderr, "wireviewctl: several DFU bootloaders are attached and the "
+			"target's USB port is not known; unplug the others\n");
 		free(img);
 		return 1;
 	}
@@ -1261,7 +1598,7 @@ static int cmd_flash(const char *path, int yes, int force)
 		}
 	}
 
-	if (!dfu_device_present()) {
+	if (!dfu_devices(usb_path)) {
 		uint8_t *resp = NULL;
 		uint16_t rlen = 0;
 		printf("entering bootloader...\n");
@@ -1276,13 +1613,14 @@ static int cmd_flash(const char *path, int yes, int force)
 					"manually started DFU bootloader\n");
 
 		int waited = 0;
-		while (!dfu_device_present() && waited < 25) {
+		while (!dfu_devices(usb_path) && waited < 25) {
 			sleep(1);
 			waited++;
 		}
-		if (!dfu_device_present()) {
-			fprintf(stderr, "wireviewctl: DFU bootloader (0483:df11) did not appear; "
-					"check the udev rules and connection\n");
+		if (!dfu_devices(usb_path)) {
+			fprintf(stderr, "wireviewctl: DFU bootloader (0483:df11) did not appear%s%s; "
+					"check the udev rules and connection\n",
+				usb_path ? " on USB port " : "", usb_path ? usb_path : "");
 			free(img);
 			return 1;
 		}
@@ -1299,9 +1637,12 @@ static int cmd_flash(const char *path, int yes, int force)
 	close(fd);
 	free(img);
 
-	char cmd[512];
+	char cmd[512], port_opt[48] = "";
+	if (usb_path)
+		snprintf(port_opt, sizeof(port_opt), " -p %s", usb_path);
 	snprintf(cmd, sizeof(cmd),
-		 "dfu-util -d 0483:df11 -a 0 -s 0x%08X:leave -D %s 2>&1", base, tmp);
+		 "dfu-util -d 0483:df11%s -a 0 -s 0x%08X:leave -D %s 2>&1",
+		 port_opt, base, tmp);
 	printf("running: %s\n", cmd);
 
 	/* dfu-util exits non-zero when the device detaches right after ":leave"
@@ -1333,26 +1674,48 @@ static int cmd_flash(const char *path, int yes, int force)
 
 /* ---------- Sensors (sysfs, no daemon needed) ---------- */
 
-/* $WIREVIEW_HWMON_PATH names a hwmon directory to use instead of scanning
- * /sys/class/hwmon, so the sysfs readers can be tested against a fake tree. */
-static int find_hwmon_path(char *buf, size_t bufsize)
+/* A wireview_hwmon instance's hwmon name: "wireview" for instance 0,
+ * "wireview<N>" for the others. */
+static int is_wireview_name(const char *name)
+{
+	if (strncmp(name, "wireview", 8) != 0)
+		return 0;
+	for (name += 8; *name; name++)
+		if (*name < '0' || *name > '9')
+			return 0;
+	return 1;
+}
+
+/* The wireview hwmon directories, one per device, into dirs (at most
+ * max); returns how many. $WIREVIEW_HWMON_PATH names the directories to
+ * use instead of scanning /sys/class/hwmon (colon-separated), so the
+ * sysfs readers can be tested against a fake tree. */
+static int find_hwmon_paths(char dirs[][PATH_MAX], int max)
 {
 	const char *env = getenv("WIREVIEW_HWMON_PATH");
+	int n = 0;
+
 	if (env && env[0]) {
-		char namepath[PATH_MAX];
-		snprintf(namepath, sizeof(namepath), "%s/name", env);
-		if (access(namepath, R_OK) != 0)
-			return -1;
-		snprintf(buf, bufsize, "%s", env);
-		return 0;
+		char list[4096];
+		char *save = NULL;
+
+		snprintf(list, sizeof(list), "%s", env);
+		for (char *t = strtok_r(list, ":", &save); t && n < max;
+		     t = strtok_r(NULL, ":", &save)) {
+			char namepath[PATH_MAX];
+			snprintf(namepath, sizeof(namepath), "%s/name", t);
+			if (access(namepath, R_OK) == 0)
+				snprintf(dirs[n++], PATH_MAX, "%s", t);
+		}
+		return n;
 	}
 
 	DIR *dir = opendir("/sys/class/hwmon");
 	if (!dir)
-		return -1;
+		return 0;
 
 	struct dirent *ent;
-	while ((ent = readdir(dir)) != NULL) {
+	while ((ent = readdir(dir)) != NULL && n < max) {
 		if (ent->d_name[0] == '.')
 			continue;
 
@@ -1365,22 +1728,66 @@ static int find_hwmon_path(char *buf, size_t bufsize)
 
 		char name[64];
 		if (fgets(name, sizeof(name), f)) {
-			/* Strip newline */
-			size_t l = strlen(name);
-			if (l > 0 && name[l - 1] == '\n')
-				name[l - 1] = '\0';
-
-			if (strcmp(name, "wireview") == 0) {
-				snprintf(buf, bufsize, "/sys/class/hwmon/%s", ent->d_name);
-				fclose(f);
-				closedir(dir);
-				return 0;
-			}
+			name[strcspn(name, "\n")] = '\0';
+			if (is_wireview_name(name))
+				snprintf(dirs[n++], PATH_MAX, "/sys/class/hwmon/%s", ent->d_name);
 		}
 		fclose(f);
 	}
-
 	closedir(dir);
+	return n;
+}
+
+/* First line of dir/attr, newline stripped; "" and -1 if unreadable
+ * (the module answers ENODATA for the identity of an unbound instance). */
+static int read_sysfs_str(const char *dir, const char *attr, char *out, size_t cap)
+{
+	char path[PATH_MAX];
+	FILE *f;
+
+	out[0] = '\0';
+	snprintf(path, sizeof(path), "%s/%s", dir, attr);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	if (!fgets(out, (int)cap, f)) {
+		out[0] = '\0';
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	out[strcspn(out, "\n")] = '\0';
+	return 0;
+}
+
+/* The wireview_hwmon instance behind a hwmon directory: N of platform
+ * device "wireview_hwmon.N", 0 for "wireview_hwmon" and for a directory
+ * without a device link (an older module, or a test tree). */
+static int hwmon_instance(const char *dir)
+{
+	char link[PATH_MAX], real[PATH_MAX];
+	const char *b, *dot;
+
+	snprintf(link, sizeof(link), "%s/device", dir);
+	if (!realpath(link, real))
+		return 0;
+	b = strrchr(real, '/');
+	b = b ? b + 1 : real;
+	dot = strchr(b, '.');
+	return dot && strncmp(b, "wireview_hwmon", 14) == 0 ? atoi(dot + 1) : 0;
+}
+
+static int hwmon_dir_for_uid(const char *uid_hex, char *out, size_t cap)
+{
+	char dirs[32][PATH_MAX], uid[40];
+	int n = find_hwmon_paths(dirs, 32);
+
+	for (int i = 0; i < n; i++)
+		if (read_sysfs_str(dirs[i], "uid", uid, sizeof(uid)) == 0 &&
+		    strcasecmp(uid, uid_hex) == 0) {
+			snprintf(out, cap, "%s", dirs[i]);
+			return 0;
+		}
 	return -1;
 }
 
@@ -1411,6 +1818,7 @@ static int read_sysfs_int(const char *hwmon, const char *attr, long long *val)
  */
 struct wv_snap {
 	char      source[72];   /* "local" or "host[:port]" */
+	int       instance;     /* local: wireview_hwmon instance, the index */
 	char      name[40];     /* edition name, WV_DEFAULT_NAME if unknown */
 	char      hwrev[8];     /* vendor+product as hex, "EF06"; "" if unknown */
 	char      fw[12];       /* firmware version, "" if unknown */
@@ -1483,12 +1891,8 @@ static void get_local_info(struct wv_snap *s)
 /* Read every attribute the module exposes. Newer modules publish pwm1,
  * power1_cap, energy1_input and *_alarm; older ones only fan1_input and
  * psu_cap, so each new attribute falls back to its old counterpart. */
-static int read_local(struct wv_snap *s)
+static void read_local_at(const char *hwmon, struct wv_snap *s)
 {
-	char hwmon[PATH_MAX];
-	if (find_hwmon_path(hwmon, sizeof(hwmon)) < 0)
-		return -1;
-
 	memset(s, 0, sizeof(*s));
 	snprintf(s->source, sizeof(s->source), "local");
 	snprintf(s->name, sizeof(s->name), WV_DEFAULT_NAME);
@@ -1561,7 +1965,91 @@ static int read_local(struct wv_snap *s)
 
 	/* The module answers ENODATA once the daemon's data is stale. */
 	s->ok = s->have_in || s->have_curr || s->have_power;
-	get_local_info(s);
+	s->instance = hwmon_instance(hwmon);
+	read_sysfs_str(hwmon, "uid", s->uid, sizeof(s->uid));
+}
+
+/* Fill the identity of s (UID from its hwmon uid attribute) from the
+ * daemon's device list. */
+static void info_from_list(struct wv_snap *s, const struct wv_listdev *l, int n)
+{
+	for (int i = 0; i < n; i++) {
+		const char *ed;
+
+		if (strcasecmp(l[i].uid_hex, s->uid) != 0)
+			continue;
+		snprintf(s->fw, sizeof(s->fw), "%u", l[i].fw);
+		snprintf(s->build, sizeof(s->build), "%s", l[i].build);
+		snprintf(s->hwrev, sizeof(s->hwrev), "%02X%02X", l[i].vendor, l[i].product);
+		ed = edition_name(l[i].vendor, l[i].product);
+		if (ed)
+			snprintf(s->name, sizeof(s->name), "%s", ed);
+		return;
+	}
+}
+
+/* Every local device's readings, by hwmon instance; returns how many.
+ * Identity comes from the daemon's device list, or, from a module or
+ * daemon older than 1.9.0 (no uid attribute), GET_DEVICE_INFO. */
+static int read_local_all(struct wv_snap *snaps, int max)
+{
+	char dirs[WV_MAXDEV][PATH_MAX];
+	struct wv_listdev l[WV_LIST_MAX];
+	int n = find_hwmon_paths(dirs, max < WV_MAXDEV ? max : WV_MAXDEV);
+	int nl = -1;
+
+	for (int i = 0; i < n; i++) {
+		read_local_at(dirs[i], &snaps[i]);
+		if (snaps[i].uid[0]) {
+			if (nl == -1) {
+				nl = list_devices(l, WV_LIST_MAX, 1);
+				if (nl < 0)
+					nl = 0;
+			}
+			info_from_list(&snaps[i], l, nl);
+		} else {
+			get_local_info(&snaps[i]);
+		}
+	}
+	/* By instance: index 0, the hwmon device "wireview", first. */
+	for (int i = 1; i < n; i++)
+		for (int j = i; j > 0 && snaps[j].instance < snaps[j - 1].instance; j--) {
+			struct wv_snap t = snaps[j];
+			snaps[j] = snaps[j - 1];
+			snaps[j - 1] = t;
+		}
+	if (n > 1)
+		for (int i = 0; i < n; i++) {
+			size_t ul = strlen(snaps[i].uid);
+			snprintf(snaps[i].source, sizeof(snaps[i].source), "local %s",
+				 ul > 4 ? snaps[i].uid + ul - 4 : snaps[i].uid);
+		}
+	return n;
+}
+
+/* The local device commands address: the --device one if given, else
+ * the first by instance. Returns 0, or -1 if there is none. */
+static int read_local(struct wv_snap *s)
+{
+	static struct wv_snap all[WV_MAXDEV];
+	int n = read_local_all(all, WV_MAXDEV);
+	char sel[25];
+
+	if (n == 0)
+		return -1;
+	if (g_sel_set) {
+		for (int i = 0; i < 12; i++)
+			snprintf(sel + i * 2, 3, "%02X", g_sel_uid[i]);
+		for (int i = 0; i < n; i++)
+			if (strcasecmp(all[i].uid, sel) == 0) {
+				*s = all[i];
+				snprintf(s->source, sizeof(s->source), "local");
+				return 0;
+			}
+		return -1;
+	}
+	*s = all[0];
+	snprintf(s->source, sizeof(s->source), "local");
 	return 0;
 }
 
@@ -2167,11 +2655,25 @@ static void remote_fail(int status, char *body)
  * HMAC-SHA256 of "ts\nnonce\nbody" under the shared secret. Returns 0 on a
  * 2xx reply, 1 otherwise (after printing why).
  */
-static int http_command(const char *json)
+static int http_command(const char *json_in)
 {
 	char secret[128];
-	if (load_secret(secret, sizeof(secret)) < 0)
+	/* --device: the daemon picks the device by deviceId (the UID). */
+	char *with_id = NULL;
+	const char *json = json_in;
+	if (g_remote_uid[0] && json_in[0] == '{') {
+		size_t cap = strlen(json_in) + 64;
+		with_id = malloc(cap);
+		if (!with_id)
+			return 1;
+		snprintf(with_id, cap, "{\"deviceId\":\"%s\"%s%s", g_remote_uid,
+			 json_in[1] == '}' ? "" : ",", json_in + 1);
+		json = with_id;
+	}
+	if (load_secret(secret, sizeof(secret)) < 0) {
+		free(with_id);
 		return 1;
+	}
 
 	char ts[24], nonce[33], sig[65];
 	uint8_t rnd[16], mac[32];
@@ -2179,6 +2681,7 @@ static int http_command(const char *json)
 	if (random_bytes(rnd, sizeof(rnd)) < 0) {
 		fprintf(stderr, "wireviewctl: no random source for the nonce\n");
 		explicit_bzero(secret, sizeof(secret));
+		free(with_id);
 		return 1;
 	}
 	hex_encode(rnd, sizeof(rnd), nonce);
@@ -2187,6 +2690,7 @@ static int http_command(const char *json)
 	char *msg = malloc(mcap);
 	if (!msg) {
 		explicit_bzero(secret, sizeof(secret));
+		free(with_id);
 		return 1;
 	}
 	int mlen = snprintf(msg, mcap, "%s\n%s\n%s", ts, nonce, json);
@@ -2202,8 +2706,10 @@ static int http_command(const char *json)
 
 	char resp[4096];
 	int status = 0;
-	if (http_request(g_host, "POST", "/command", json, hdrs, 5000,
-			 resp, sizeof(resp), &status) < 0) {
+	int hr = http_request(g_host, "POST", "/command", json, hdrs, 5000,
+			      resp, sizeof(resp), &status);
+	free(with_id);
+	if (hr < 0) {
 		remote_unreachable();
 		return 1;
 	}
@@ -2211,6 +2717,22 @@ static int http_command(const char *json)
 		remote_fail(status, resp);
 		return 1;
 	}
+	return 0;
+}
+
+/* The device of a GET /sensors body that --host commands address: the
+ * one --device chose, else the first (the daemon's primary). Returns 1
+ * with *s filled, 0 if there is none. */
+static int remote_pick(const char *body, struct wv_snap *s)
+{
+	static struct wv_snap all[WV_MAXDEV];
+	int n = parse_remote(g_host, body, all, WV_MAXDEV);
+
+	for (int i = 0; i < n; i++)
+		if (!g_remote_uid[0] || strcasecmp(all[i].uid, g_remote_uid) == 0) {
+			*s = all[i];
+			return 1;
+		}
 	return 0;
 }
 
@@ -2234,11 +2756,11 @@ static int remote_get_sensors(char *body, size_t cap)
  * The config version is not published there, so info omits it. */
 static int remote_info(int build_only)
 {
-	static char body[16384];
+	static char body[65536];
 	struct wv_snap s;
 	if (remote_get_sensors(body, sizeof(body)) < 0)
 		return 1;
-	if (parse_remote(g_host, body, &s, 1) < 1) {
+	if (remote_pick(body, &s) < 1) {
 		fprintf(stderr, "wireviewctl: %s: device not connected\n", g_host);
 		return 1;
 	}
@@ -2271,9 +2793,13 @@ static int remote_info(int build_only)
 /* read-config over HTTP: GET /config -> {"deviceId","version","data":b64}. */
 static int remote_read_config(void)
 {
-	char body[2048];
+	char body[2048], path[64];
 	int status = 0;
-	if (http_request(g_host, "GET", "/config", NULL, NULL, 5000,
+	if (g_remote_uid[0])
+		snprintf(path, sizeof(path), "/config?id=%s", g_remote_uid);
+	else
+		snprintf(path, sizeof(path), "/config");
+	if (http_request(g_host, "GET", path, NULL, NULL, 5000,
 			 body, sizeof(body), &status) < 0) {
 		remote_unreachable();
 		return 1;
@@ -2296,6 +2822,136 @@ static int remote_read_config(void)
 	for (int i = 0; i < n; i++)
 		printf("%02x", cfg[i]);
 	printf("\n");
+	return 0;
+}
+
+/* ---------- --device and the device list ---------- */
+
+static int resolve_device(void)
+{
+	if (g_host) {
+		static char body[65536];
+		static struct wv_snap all[WV_MAXDEV];
+		struct wv_listdev l[WV_MAXDEV];
+		int n, m;
+
+		if (remote_get_sensors(body, sizeof(body)) < 0)
+			return 1;
+		n = parse_remote(g_host, body, all, WV_MAXDEV);
+		memset(l, 0, sizeof(l));
+		for (int i = 0; i < n; i++) {
+			snprintf(l[i].uid_hex, sizeof(l[i].uid_hex), "%s", all[i].uid);
+			l[i].index = i;
+		}
+		m = match_device(g_device, l, n);
+		if (m < 0) {
+			fprintf(stderr, "wireviewctl: %s: %s device '%s'; devices there:\n",
+				g_host, m == -2 ? "more than one" : "no", g_device);
+			for (int i = 0; i < n; i++)
+				fprintf(stderr, "  %d  %s  %s\n", i, all[i].uid, all[i].name);
+			return 1;
+		}
+		snprintf(g_remote_uid, sizeof(g_remote_uid), "%s", l[m].uid_hex);
+		return 0;
+	}
+
+	struct wv_listdev l[WV_LIST_MAX];
+	int n = list_devices(l, WV_LIST_MAX, 0);
+	if (n == SOCK_OLD) {
+		fprintf(stderr, "wireviewctl: this wireviewd drives a single device; "
+			"--device needs wireviewd 1.9.0 or newer\n");
+		return 1;
+	}
+	if (n < 0)
+		return 1;
+	int m = match_device(g_device, l, n);
+	if (m < 0) {
+		fprintf(stderr, "wireviewctl: %s device '%s'. Devices:\n",
+			m == -2 ? "more than one" : "no", g_device);
+		print_device_list(stderr, l, n);
+		return 1;
+	}
+	memcpy(g_sel_uid, l[m].uid, 12);
+	g_sel_set = 1;
+	return 0;
+}
+
+static int require_target(const char *op)
+{
+	if (g_sel_set || g_remote_uid[0])
+		return 0;
+	if (g_host) {
+		static char body[65536];
+		static struct wv_snap all[WV_MAXDEV];
+		int n;
+
+		if (remote_get_sensors(body, sizeof(body)) < 0)
+			return 0;	/* the command reports the failure */
+		n = parse_remote(g_host, body, all, WV_MAXDEV);
+		if (n <= 1)
+			return 0;
+		fprintf(stderr, "wireviewctl: %s: %d devices on %s; choose one with "
+			"--device:\n", op, n, g_host);
+		for (int i = 0; i < n; i++)
+			fprintf(stderr, "  %d  %s  %s\n", i, all[i].uid, all[i].name);
+		return 1;
+	}
+
+	struct wv_listdev l[WV_LIST_MAX];
+	int n = list_devices(l, WV_LIST_MAX, 1), up = 0;
+	for (int i = 0; i < n; i++)
+		up += l[i].state != 2;
+	if (up <= 1)
+		return 0;
+	fprintf(stderr, "wireviewctl: %s: %d devices are connected; choose one with "
+		"--device (index, UID or USB serial, or their last digits):\n", op, up);
+	print_device_list(stderr, l, n);
+	return 1;
+}
+
+static int cmd_devices(void)
+{
+	if (g_host) {
+		static char body[65536];
+		static struct wv_snap all[WV_MAXDEV];
+		int n;
+
+		if (remote_get_sensors(body, sizeof(body)) < 0)
+			return 1;
+		n = parse_remote(g_host, body, all, WV_MAXDEV);
+		printf("%-3s %-24s %-30s %s\n", "IDX", "UID", "EDITION", "FW");
+		for (int i = 0; i < n; i++)
+			printf("%-3d %-24s %-30s %s\n", i, all[i].uid, all[i].name,
+			       all[i].fw[0] ? all[i].fw : "-");
+		return 0;
+	}
+
+	struct wv_listdev l[WV_LIST_MAX];
+	int n = list_devices(l, WV_LIST_MAX, 0);
+	if (n == SOCK_OLD) {
+		/* One device at most: show what GET_DEVICE_INFO knows. */
+		struct wv_devinfo di;
+		if (local_device_info(&di, 3) != 0) {
+			fprintf(stderr, "wireviewctl: no device connected\n");
+			return 1;
+		}
+		memset(l, 0, sizeof(l[0]));
+		memcpy(l[0].uid, di.uid, 12);
+		for (int k = 0; k < 12; k++)
+			snprintf(l[0].uid_hex + k * 2, 3, "%02X", di.uid[k]);
+		l[0].vendor = di.vendor;
+		l[0].product = di.product;
+		l[0].fw = di.fw;
+		l[0].flags = 1;
+		n = 1;
+	}
+	if (n < 0)
+		return 1;
+	if (n == 0) {
+		printf("no device has connected since wireviewd started\n");
+		return 0;
+	}
+	print_device_list(stdout, l, n);
 	return 0;
 }
 
@@ -2378,7 +3034,7 @@ static void json_escape(const char *in, char *out, size_t cap)
  * from the daemon socket and are "" when it cannot be reached; "connected"
  * is false when the module has no fresh readings.
  */
-static void print_sensors_json(const struct wv_snap *s)
+static void print_sensors_json(const struct wv_snap *snaps, int nsnap)
 {
 	char host[64] = "wireview";
 	gethostname(host, sizeof(host) - 1);
@@ -2387,7 +3043,11 @@ static void print_sensors_json(const struct wv_snap *s)
 	json_escape(host, host_js, sizeof(host_js));
 
 	printf("{\"host\":\"%s\",\"appVersion\":\"wireviewctl\",\"devices\":[", host_js);
-	if (s) {
+	for (int k = 0; k < nsnap; k++) {
+		const struct wv_snap *s = &snaps[k];
+
+		if (k)
+			printf(",");
 		char ts[32];
 		time_t now = time(NULL);
 		struct tm tmv;
@@ -2449,10 +3109,10 @@ static int cmd_sensors(int argc, char **argv)
 	struct wv_snap s;
 	if (g_host) {
 		/* --json passes the daemon's own document through unchanged. */
-		static char body[16384];
+		static char body[65536];
 		if (remote_get_sensors(body, sizeof(body)) < 0)
 			return 1;
-		int n = parse_remote(g_host, body, &s, 1);
+		int n = remote_pick(body, &s);
 		if (json) {
 			size_t l = strlen(body);
 			printf("%s%s", body, l && body[l - 1] == '\n' ? "" : "\n");
@@ -2470,17 +3130,39 @@ static int cmd_sensors(int argc, char **argv)
 		return 0;
 	}
 
-	if (read_local(&s) < 0) {
-		fprintf(stderr, "wireviewctl: wireview hwmon device not found\n"
-			"Is the wireview_hwmon module loaded?\n");
+	/* With --device, that device; else every local device. */
+	static struct wv_snap all[WV_MAXDEV];
+	int n;
+	if (g_sel_set) {
+		n = read_local(&all[0]) == 0;
+	} else {
+		n = read_local_all(all, WV_MAXDEV);
+		if (n == 1)
+			snprintf(all[0].source, sizeof(all[0].source), "local");
+	}
+	if (n == 0) {
+		if (g_sel_set)
+			fprintf(stderr, "wireviewctl: no hwmon instance for the device chosen "
+				"with --device\n");
+		else
+			fprintf(stderr, "wireviewctl: wireview hwmon device not found\n"
+				"Is the wireview_hwmon module loaded?\n");
 		if (json)
-			print_sensors_json(NULL);
+			print_sensors_json(NULL, 0);
 		return 1;
 	}
-	if (json)
-		print_sensors_json(&s);
-	else
-		print_sensors_plain(&s);
+	if (json) {
+		print_sensors_json(all, n);
+		return 0;
+	}
+	for (int i = 0; i < n; i++) {
+		/* One device prints as it always has; several get a header
+		 * line each and a blank line between them. */
+		if (n > 1)
+			printf("%sdevice: %d %s %s\n", i ? "\n" : "", all[i].instance,
+			       all[i].uid[0] ? all[i].uid : "-", all[i].name);
+		print_sensors_plain(&all[i]);
+	}
 	return 0;
 }
 
@@ -2660,7 +3342,7 @@ static int cmd_top(int argc, char **argv)
 	while (!g_quit) {
 		struct wv_snap snaps[WV_MAXDEV];
 		int n = 0;
-		if (read_local(&snaps[n]) == 0) n++;
+		n += read_local_all(snaps, WV_MAXDEV);
 		for (int h = 0; h < nhost && n < WV_MAXDEV; h++) {
 			static char buf[16384];
 			if (http_get_sensors(hosts[h], buf, sizeof(buf)) == 0) {
@@ -3390,9 +4072,15 @@ static int cmd_config(int argc, char **argv)
 static void usage(void)
 {
 	fprintf(stderr,
-		"Usage: wireviewctl [--host H[:port] [--secret-file FILE]] <command> [args]\n"
+		"Usage: wireviewctl [--device DEV] [--host H[:port] [--secret-file FILE]] <command> [args]\n"
 		"\n"
 		"Global options:\n"
+		"  --device DEV      The device to address when several are attached: its\n"
+		"                    index, UID or USB serial, or the last digits of either\n"
+		"                    (see \"devices\"). Without it, info, build and sensors\n"
+		"                    show every device, other reads go to the primary\n"
+		"                    (lowest index), and commands that change a device\n"
+		"                    refuse to run while more than one is connected.\n"
 		"  --host H[:port]   Talk to wireviewd on H over HTTP (default port 9876)\n"
 		"                    instead of the local socket: info, build, sensors and\n"
 		"                    read-config read; screen, nvm, clear-faults and\n"
@@ -3403,7 +4091,11 @@ static void usage(void)
 		"                    Without it, $WIREVIEW_SECRET is used.\n"
 		"\n"
 		"Commands (require wireviewd running):\n"
+		"  devices           List the devices wireviewd drives: index (the hwmon device\n"
+		"                    wireview, wireview1, ...), state, USB serial, UID, edition,\n"
+		"                    firmware, serial port, USB port and hwmon directory\n"
 		"  info              Show device firmware, UID, build, product and edition\n"
+		"                    (every device, or the --device one)\n"
 		"  clear-faults [STATUS_MASK [LOG_MASK]]\n"
 		"                    Clear faults. Masks are hex bits to clear (default FFFF,\n"
 		"                    i.e. all active faults and the whole fault log)\n"
@@ -3424,8 +4116,9 @@ static void usage(void)
 		"                    -y only skips the confirmation prompt.\n"
 		"\n"
 		"Commands (require wireview_hwmon module):\n"
-		"  sensors [--json]  Show all sensor readings from hwmon sysfs; --json prints\n"
-		"                    the same schema as the daemon's GET /sensors\n"
+		"  sensors [--json]  Show all sensor readings from hwmon sysfs, for every\n"
+		"                    device (or the --device one); --json prints the same\n"
+		"                    schema as the daemon's GET /sensors\n"
 		"\n"
 		"Monitor:\n"
 		"  top [--host H[:port][,H2...]]... [--interval MS]\n"
@@ -3463,16 +4156,22 @@ int main(int argc, char **argv)
 	int argi = 1;
 	while (argi < argc) {
 		const char *o = argv[argi];
-		if (strcmp(o, "--host") == 0 || strcmp(o, "--secret-file") == 0) {
+		if (strcmp(o, "--host") == 0 || strcmp(o, "--secret-file") == 0 ||
+		    strcmp(o, "--device") == 0) {
 			if (argi + 1 >= argc) {
 				fprintf(stderr, "wireviewctl: %s needs an argument\n", o);
 				return 1;
 			}
 			if (o[2] == 'h')
 				g_host = argv[argi + 1];
+			else if (o[2] == 'd')
+				g_device = argv[argi + 1];
 			else
 				g_secret_file = argv[argi + 1];
 			argi += 2;
+		} else if (strncmp(o, "--device=", 9) == 0) {
+			g_device = o + 9;
+			argi++;
 		} else if (strncmp(o, "--host=", 7) == 0) {
 			g_host = o + 7;
 			argi++;
@@ -3512,6 +4211,17 @@ int main(int argc, char **argv)
 		printf("wireviewctl %s\n", WIREVIEW_PKG_VERSION);
 		return 0;
 	}
+	if (g_device && !g_device[0]) {
+		fprintf(stderr, "wireviewctl: --device needs a device\n");
+		return 1;
+	}
+	/* config talks to the daemon about itself, and help needs nothing. */
+	if (g_device && strcmp(cmd, "config") != 0 && strcmp(cmd, "help") != 0 &&
+	    strcmp(cmd, "--help") != 0 && strcmp(cmd, "-h") != 0 &&
+	    strcmp(cmd, "devices") != 0 && resolve_device())
+		return 1;
+	if (strcmp(cmd, "devices") == 0)
+		return cmd_devices();
 	if (strcmp(cmd, "info") == 0)
 		return cmd_info();
 	if (strcmp(cmd, "clear-faults") == 0) {

@@ -14,7 +14,10 @@ hwmon sysfs directory through $WIREVIEW_HWMON_PATH.
 
 The main run drives a WireView Pro II (product 5). The same build then
 serves a Noctua Edition (product 6), which must be reported as such, and
-a WireView II (product 7), which must be refused.
+a WireView II (product 7), which must be refused. A last run scans a fake
+/sys tree with three ports at once (a WireView II, a Noctua Edition and a
+Pro II): both supported devices are driven side by side, each addressed
+on its own over the socket, wireviewctl and HTTP, with stable indexes.
 
 Environment: CC (default cc), SAN_FLAGS (extra compiler flags, e.g. ASan),
 WIREVIEW_E2E_KEEP=1 keeps the temp dir.
@@ -60,10 +63,13 @@ WCMD_ENTER_BOOTLOADER = 0x08
 WCMD_SUSPEND_SERIAL = 0x09
 WCMD_RESUME_SERIAL = 0x0A
 WCMD_RELOAD_CONFIG = 0x0B
+WCMD_LIST_DEVICES = 0x0C
+WCMD_SELECT_DEVICE = 0x0D
 RESP_OK, RESP_ERROR, RESP_NOT_CONNECTED, RESP_DENIED = 0, 1, 2, 3
+RESP_NO_DEVICE = 4
 SECRET = "e2e-secret"   # POST /command on the loopback listener
 IDLE_S = 2              # CLIENT_IDLE_S of the test build (60 in production)
-MAX_CLIENTS = 8
+MAX_CLIENTS = 32
 
 FW_VERSION = 7
 BUILD = b"FAKE build 1.0"
@@ -126,6 +132,9 @@ def build(tmp, group, programs=("wireviewd", "wireviewctl")):
         f'-DCONFIG_PATH="{tmp}/config"',
         f'-DWIREVIEW_GROUP="{group}"',
         f'-DCLIENT_IDLE_S={IDLE_S}',
+        f'-DSTATE_DIR="{tmp}/state"',
+        f'-DSYS_CLASS_TTY="{tmp}/sys/class/tty"',
+        f'-DDEV_DIR="{tmp}/dev"',
     ]
     flags = ["-g", "-O1", "-Wall", "-Wextra", "-Wno-format-truncation"] + san
     for out, srcs in (("wireviewd", ["wireviewd.c", "sha256.c"]),
@@ -730,18 +739,22 @@ def run_noctua(tmp):
 
 
 def run_wireview2(tmp):
-    """A WireView II (product 7) is refused with one clear message, however
-    often the daemon retries, and nothing reaches hwmon."""
+    """A WireView II (product 7) is refused with one clear message and is
+    not probed again while it stays plugged in; nothing reaches hwmon."""
     sock = os.path.join(tmp, "wireviewd.sock")
     msg = "WireView II (product 7) is not supported yet"
     daemon, dev, hwmon, out, _ = start_edition(tmp, 7, False,
                                                "daemon7.out")
     try:
-        # The daemon retries every 2 s: wait for a second attempt.
-        check(wait_until(lambda: dev.vendor_queries >= 2 or
+        # The daemon rescans every 3 s: give it two rescans.
+        check(wait_until(lambda: dev.vendor_queries >= 1 or
                          daemon.poll() is not None, 6) and
               daemon.poll() is None,
-              "WireView II: daemon keeps running and retries",
+              "WireView II: daemon keeps running",
+              f"{dev.vendor_queries} vendor-data queries")
+        time.sleep(7)
+        check(dev.vendor_queries == 1 and daemon.poll() is None,
+              "WireView II: probed once, not again on the rescans",
               f"{dev.vendor_queries} vendor-data queries")
         status, _ = request(sock, WCMD_GET_DEVICE_INFO)
         check(status == RESP_NOT_CONNECTED,
@@ -758,13 +771,405 @@ def run_wireview2(tmp):
     log = open(os.path.join(tmp, "daemon7.out")).read()
     check(log.count(msg) == 1 and log.count("wireviewd: using ") == 1 and
           "device info query failed" not in log,
-          "WireView II: one 'not supported yet' line across the retries",
+          "WireView II: one 'not supported yet' line across the rescans",
           log[-600:])
     check(audit_log(tmp).count(msg) == 1,
           "WireView II: the audit log has it once too")
     check(hwmon.size() == 0 and dev.polls == 0 and not dev.writes,
           "WireView II: no sensor read, no frame written to hwmon",
           f"{hwmon.size()} hwmon bytes, {dev.polls} polls")
+
+# ---- several devices at once, found by scanning a fake /sys ----
+
+SERIAL_A, SERIAL_B = "20A036A64E46", "205B38A53245"
+UID_A = bytes(range(0x10, 0x1C))
+UID_B = bytes(range(0x30, 0x3C))
+UID_A_HEX, UID_B_HEX = UID_A.hex().upper(), UID_B.hex().upper()
+PINS_A = tuple((12000, 1000) for _ in range(6))
+PINS_B = tuple((11500, 2000) for _ in range(6))
+
+
+def fake_port(tmp, acm, usb, serial, target, vid="0483", pid="5740"):
+    """ttyACM<acm> on USB port usb with this serial: the class link and
+    device tree under tmp/sys, and tmp/dev/ttyACM<acm> pointing at target
+    (a fake device's pty)."""
+    name = f"ttyACM{acm}"
+    usbdir = os.path.join(tmp, "sys", "devices", "usb3", usb)
+    os.makedirs(os.path.join(usbdir, f"{usb}:1.0", "tty", name),
+                exist_ok=True)
+    for attr, val in (("idVendor", vid), ("idProduct", pid),
+                      ("serial", serial)):
+        with open(os.path.join(usbdir, attr), "w") as f:
+            f.write(val + "\n")
+    cls = os.path.join(tmp, "sys", "class", "tty")
+    os.makedirs(cls, exist_ok=True)
+    link = os.path.join(cls, name)
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(f"../../devices/usb3/{usb}/{usb}:1.0/tty/{name}", link)
+    point_port(tmp, acm, target)
+
+
+def point_port(tmp, acm, target):
+    os.makedirs(os.path.join(tmp, "dev"), exist_ok=True)
+    dev = os.path.join(tmp, "dev", f"ttyACM{acm}")
+    if os.path.lexists(dev):
+        os.unlink(dev)
+    os.symlink(target, dev)
+
+
+def list_devices(c):
+    """LIST_DEVICES over Client c: (status, [records as dicts])."""
+    status, data = c.request(WCMD_LIST_DEVICES)
+    if status != RESP_OK:
+        return status, []
+    fmt, n, size = data[0], data[1], data[2]
+    recs = []
+    for i in range(n):
+        r = data[3 + i * size:3 + (i + 1) * size]
+
+        def s(off, ln):
+            return r[off:off + ln].split(b"\0")[0].decode()
+        recs.append({"uid": r[0:12], "index": r[12], "state": r[13],
+                     "vendor": r[14], "product": r[15], "fw": r[16],
+                     "cfg": r[17], "flags": r[18], "serial": s(20, 16),
+                     "tty": s(36, 64), "usb": s(100, 16), "build": s(116, 40),
+                     "format": fmt, "size": size})
+    return status, recs
+
+
+def frames_pins(data):
+    """The pin voltages of every whole frame in data."""
+    frames, _ = read_frames(data)
+    return [struct.unpack_from("<6i", f, OFF_VOLTAGE) for f in frames]
+
+
+def run_multi(tmp):
+    sock = os.path.join(tmp, "wireviewd.sock")
+    hwpath = os.path.join(tmp, "hwmon")
+    if os.path.exists(hwpath):
+        os.unlink(hwpath)
+    hwmon = HwmonSink(hwpath)
+    shutil.rmtree(os.path.join(tmp, "state"), ignore_errors=True)
+    port = free_port()
+    with open(os.path.join(tmp, "config"), "w") as f:
+        f.write(f"remote_enabled=1\nbind=127.0.0.1\nport={port}\n"
+                f"secret={SECRET}\n")
+    secret_file = os.path.join(tmp, "secret")
+    with open(secret_file, "w") as f:
+        f.write(SECRET + "\n")
+
+    wv2 = fd.FakeWireView(product_id=7, uid=bytes(range(0x50, 0x5C)))
+    devA = fd.FakeWireView(fw_version=FW_VERSION, uid=UID_A, build=b"A build",
+                           product_id=6, sensors=fd.pack_sensors(pins=PINS_A))
+    devB = fd.FakeWireView(fw_version=FW_VERSION, uid=UID_B, build=b"B build",
+                           product_id=5, sensors=fd.pack_sensors(pins=PINS_B))
+    for d in (wv2, devA, devB):
+        d.start()
+    # The WireView II on the first port: it must not keep the others out.
+    fake_port(tmp, 0, "3-2", "0WV2SERIAL0", wv2.path)
+    fake_port(tmp, 1, "3-4", SERIAL_A, devA.path)
+    fake_port(tmp, 2, "3-6", SERIAL_B, devB.path)
+
+    # A fake dfu-util: lists the bootloaders named in dfu-paths, logs a
+    # download's arguments and reports success.
+    bindir = os.path.join(tmp, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    dfu_paths = os.path.join(tmp, "dfu-paths")
+    dfu_log = os.path.join(tmp, "dfu.log")
+    open(dfu_paths, "w").write("9-9\n")     # an unrelated bootloader
+    with open(os.path.join(bindir, "dfu-util"), "w") as f:
+        f.write(f"""#!/bin/sh
+case "$1" in
+--version) echo "dfu-util 0.11 (fake)"; exit 0;;
+-l) while read p; do
+      echo "Found DFU: [0483:df11] ver=2200, devnum=9, cfg=1, intf=0, path=\\"$p\\", alt=0, name=\\"@Internal Flash\\", serial=\\"X\\""
+    done < {dfu_paths}; exit 0;;
+esac
+echo "$@" >> {dfu_log}
+echo "File downloaded successfully"
+exit 74
+""")
+    os.chmod(os.path.join(bindir, "dfu-util"), 0o755)
+    env = daemon_env()
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+
+    out = open(os.path.join(tmp, "daemon_multi.out"), "w")
+    daemon = subprocess.Popen([os.path.join(tmp, "wireviewd"), "-i", "100"],
+                              env=daemon_env(), stdout=out,
+                              stderr=subprocess.STDOUT)
+    c = None
+    try:
+        if not check(wait_until(lambda: os.path.exists(sock) or
+                                daemon.poll() is not None, 10) and
+                     daemon.poll() is None, "multi: daemon starts"):
+            return
+        c = Client(sock)
+
+        def both_up():
+            st, recs = list_devices(c)
+            return st == RESP_OK and len(recs) == 2 and \
+                all(r["state"] == 0 for r in recs)
+        check(wait_until(both_up, 15),
+              "multi: the scan brings up both WireViews behind a WireView II")
+        st, recs = list_devices(c)
+        check(st == RESP_OK and recs and recs[0]["format"] == 1 and
+              recs[0]["size"] == 160, "multi: LIST_DEVICES format 1, "
+              "160-byte records", f"{st} {recs[:1]}")
+        a = recs[0] if recs else {}
+        b = recs[1] if len(recs) > 1 else {}
+        check(a.get("uid") == UID_A and a.get("index") == 0 and
+              a.get("flags", 0) & 1 and a.get("product") == 6 and
+              a.get("serial") == SERIAL_A and a.get("usb") == "3-4" and
+              a.get("tty") == os.path.join(tmp, "dev", "ttyACM1")[:63] and
+              a.get("build") == "A build",
+              "multi: first device: index 0, primary, its USB serial, "
+              "USB port, port and build", str(a))
+        check(b.get("uid") == UID_B and b.get("index") == 1 and
+              not b.get("flags", 0) & 1 and b.get("serial") == SERIAL_B and
+              b.get("usb") == "3-6",
+              "multi: second device: index 1, USB port 3-6", str(b))
+        check(wv2.vendor_queries == 1 and wv2.polls == 0,
+              "multi: the WireView II was probed once and never polled",
+              f"{wv2.vendor_queries} queries, {wv2.polls} polls")
+        state = open(os.path.join(tmp, "state", "devices")).read()
+        check(f"\n0 {UID_A_HEX} {SERIAL_A}\n" in state and
+              f"\n1 {UID_B_HEX} {SERIAL_B}\n" in state,
+              "multi: indexes are written to STATE_DIR/devices", state)
+
+        # Commands: the primary by default, the selected one after SELECT.
+        st, data = c.request(WCMD_GET_DEVICE_INFO)
+        check(st == RESP_OK and data[2:14] == UID_A,
+              "multi: GET_DEVICE_INFO without SELECT is the primary's")
+        st, _ = c.request(WCMD_SELECT_DEVICE, UID_B)
+        st2, data = c.request(WCMD_GET_DEVICE_INFO)
+        check(st == RESP_OK and st2 == RESP_OK and data[2:14] == UID_B and
+              data[14:] == b"B build\0\xef\x05",
+              "multi: after SELECT_DEVICE, GET_DEVICE_INFO is the "
+              "second device's", f"{st} {st2} {data!r}")
+        st, _ = c.request(WCMD_SCREEN_CMD, b"\xe4")
+        check(st == RESP_OK and devB.wait_for(
+              lambda: b"\xe4" in devB.writes_of(fd.CMD_SCREEN_CHANGE)) and
+              b"\xe4" not in devA.writes_of(fd.CMD_SCREEN_CHANGE),
+              "multi: a command reaches the selected device only")
+        st, _ = c.request(WCMD_SELECT_DEVICE, bytes(12))
+        check(st == RESP_NO_DEVICE, "multi: SELECT of an unknown UID is "
+              "status 4", str(st))
+
+        # Serial handover of the second device leaves the first locked.
+        def open_errno(path):
+            try:
+                os.close(os.open(path, os.O_RDWR | os.O_NOCTTY |
+                                 os.O_NONBLOCK))
+                return 0
+            except OSError as e:
+                return e.errno
+        st, _ = c.request(WCMD_SUSPEND_SERIAL, struct.pack("<H", 5))
+        pa, pb = devA.polls, devB.polls
+        time.sleep(0.6)
+        check(st == RESP_OK and open_errno(devB.path) == 0 and
+              open_errno(devA.path) == errno.EBUSY,
+              "multi: SUSPEND_SERIAL hands over the selected port only")
+        check(devB.polls == pb and devA.polls >= pa + 3,
+              "multi: the handed-over device is not polled, the other is",
+              f"A {devA.polls - pa} B {devB.polls - pb}")
+        st, recs = list_devices(c)
+        check([r["state"] for r in recs] == [0, 1] and
+              [r["flags"] & 2 for r in recs] == [0, 2],
+              "multi: LIST shows the handover and this connection's choice",
+              str([(r["state"], r["flags"]) for r in recs]))
+        c.request(WCMD_RESUME_SERIAL)
+        check(open_errno(devB.path) == errno.EBUSY and
+              devB.wait_for(lambda: devB.polls > pb + 2, 3),
+              "multi: RESUME_SERIAL locks the port again and polling resumes")
+
+        # wireviewctl: devices, --device, and no guessing for writes.
+        r = ctl(tmp, "devices")
+        check(r.returncode == 0 and SERIAL_A in r.stdout and
+              SERIAL_B in r.stdout and "(primary)" in r.stdout and
+              "WireView Pro II Noctua Edition" in r.stdout,
+              "multi: wireviewctl devices lists both", r.stdout + r.stderr)
+        r = ctl(tmp, "--device", "3245", "info")
+        check(r.returncode == 0 and "uid: " + UID_B.hex() in r.stdout,
+              "multi: --device by the end of the USB serial", r.stdout + r.stderr)
+        r = ctl(tmp, "--device", "1", "info")
+        check(r.returncode == 0 and "uid: " + UID_B.hex() in r.stdout,
+              "multi: --device by index", r.stdout + r.stderr)
+        r = ctl(tmp, "--device", UID_A_HEX.lower(), "info")
+        check(r.returncode == 0 and "uid: " + UID_A.hex() in r.stdout,
+              "multi: --device by UID", r.stdout + r.stderr)
+        r = ctl(tmp, "--device", "zzzz", "info")
+        check(r.returncode == 1 and "no device 'zzzz'" in r.stderr and
+              SERIAL_A in r.stderr,
+              "multi: an unknown --device is refused with the list",
+              r.stderr)
+        r = ctl(tmp, "info")
+        check(r.returncode == 0 and "uid: " + UID_A.hex() in r.stdout and
+              "uid: " + UID_B.hex() in r.stdout and
+              r.stdout.index(UID_A.hex()) < r.stdout.index(UID_B.hex()) and
+              r.stdout.count("device: ") == 2,
+              "multi: info without --device shows every device, the primary "
+              "first", r.stdout + r.stderr)
+        r = ctl(tmp, "build")
+        check(r.returncode == 0 and r.stdout.count("build: ") == 2 and
+              r.stdout.count("device: ") == 2,
+              "multi: build without --device shows every device",
+              r.stdout + r.stderr)
+        r = ctl(tmp, "read-config")
+        check(r.returncode == 0,
+              "multi: read-config without --device reads the primary",
+              r.stdout + r.stderr)
+        n_a = len(devA.writes_of(fd.CMD_SCREEN_CHANGE))
+        n_b = len(devB.writes_of(fd.CMD_SCREEN_CHANGE))
+        r = ctl(tmp, "screen", "temp")
+        check(r.returncode == 1 and "choose one with --device" in r.stderr and
+              len(devA.writes_of(fd.CMD_SCREEN_CHANGE)) == n_a and
+              len(devB.writes_of(fd.CMD_SCREEN_CHANGE)) == n_b,
+              "multi: a write without --device is refused and sends "
+              "nothing", r.stderr)
+        r = ctl(tmp, "--device", "4E46", "screen", "temp")
+        check(r.returncode == 0 and devA.wait_for(
+              lambda: len(devA.writes_of(fd.CMD_SCREEN_CHANGE)) == n_a + 1) and
+              len(devB.writes_of(fd.CMD_SCREEN_CHANGE)) == n_b,
+              "multi: --device 4E46 screen temp reaches the first device "
+              "only", r.stderr)
+
+        # HTTP: /sensors, /metrics, /config?id=, POST /command deviceId.
+        status, _, body = http_get(port, "/sensors")
+        doc = json.loads(body) if status == 200 else {}
+        ids = [d["id"] for d in doc.get("devices", [])]
+        check(ids == [UID_A_HEX, UID_B_HEX],
+              "multi: GET /sensors lists both, the primary first", body[:300])
+        _, _, body = http_get(port, "/metrics")
+        samples, bad = parse_metrics(body)
+        check(not bad and body.count("# TYPE wireview_power_watts ") == 1 and
+              metric(samples, "wireview_power_watts", device=UID_A_HEX) ==
+              72.0 and
+              metric(samples, "wireview_power_watts", device=UID_B_HEX) ==
+              138.0,
+              "multi: /metrics has one family with a sample per device",
+              f"bad {bad[:3]}")
+        status, _, body = http_get(port, f"/config?id={UID_B_HEX}")
+        check(status == 200 and json.loads(body)["deviceId"] == UID_B_HEX,
+              "multi: GET /config?id= reads that device", body[:200])
+        status, _, _ = http_get(port, "/config?id=00FF")
+        check(status == 404, "multi: GET /config?id= of an unknown "
+              "device is 404", str(status))
+        r = ctl(tmp, "--host", f"127.0.0.1:{port}", "--secret-file",
+                secret_file, "screen", "simple")
+        check(r.returncode == 1 and "choose one with --device" in r.stderr,
+              "multi: --host write without --device is refused", r.stderr)
+        r = ctl(tmp, "--host", f"127.0.0.1:{port}", "--secret-file",
+                secret_file, "--device", "3A3B", "screen", "simple")
+        check(r.returncode == 0 and devB.wait_for(
+              lambda: b"\xe1" in devB.writes_of(fd.CMD_SCREEN_CHANGE)) and
+              b"\xe1" not in devA.writes_of(fd.CMD_SCREEN_CHANGE),
+              "multi: --host --device sends deviceId and reaches that "
+              "device only", r.stdout + r.stderr)
+
+        # An older module (here: the FIFO, no BIND) has one instance:
+        # only the primary feeds it.
+        pins = frames_pins(hwmon.data())
+        check(pins and all(p == tuple(v for v, _ in PINS_A) for p in pins),
+              "multi: with a single-instance module only the primary "
+              "feeds hwmon", f"{len(pins)} frames, {set(pins)}")
+        log = open(out.name).read()
+        check("single instance" in log,
+              "multi: the single-instance module is reported", log[-400:])
+
+        # Flash: refused without --device; with it, the bootloader
+        # command goes to that device and dfu-util to its USB port.
+        fw = os.path.join(TOP, "firmware", "TG-WV-PRO2-FW.hex")
+        r = subprocess.run([os.path.join(tmp, "wireviewctl"), "flash", fw,
+                            "-y", "--force"], capture_output=True,
+                           text=True, timeout=10, env=env)
+        check(r.returncode == 1 and "choose one with --device" in r.stderr and
+              not devA.writes_of(fd.CMD_BOOTLOADER) and
+              not devB.writes_of(fd.CMD_BOOTLOADER),
+              "multi: flash without --device is refused before anything",
+              r.stdout + r.stderr)
+        proc = subprocess.Popen(
+            [os.path.join(tmp, "wireviewctl"), "--device", "3245", "flash",
+             fw, "-y", "--force"], stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, env=env)
+        got = devB.wait_for(lambda: devB.writes_of(fd.CMD_BOOTLOADER), 8)
+        open(dfu_paths, "a").write("3-6\n")     # its bootloader shows up
+        try:
+            text, _ = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            text, _ = proc.communicate()
+        dlog = open(dfu_log).read() if os.path.exists(dfu_log) else ""
+        check(got and proc.returncode == 0 and
+              not devA.writes_of(fd.CMD_BOOTLOADER) and
+              "-p 3-6 " in dlog and "target: WireView Pro II " + UID_B_HEX
+              in text and "USB port 3-6" in text,
+              "multi: flash --device enters that device's bootloader and "
+              "points dfu-util at its USB port", text[-600:] + dlog)
+
+        # The primary goes away: the other becomes primary and feeds
+        # hwmon; it comes back on a new pty with its index.
+        size = hwmon.size()
+        devA.unplug()
+        def a_gone():
+            st, recs = list_devices(c)
+            return [r["state"] for r in recs] == [2, 0] and \
+                recs[1]["flags"] & 1
+        check(wait_until(a_gone, 6),
+              "multi: the unplugged device is listed as gone, the other "
+              "is primary")
+        check(wait_until(lambda: any(
+              p == tuple(v for v, _ in PINS_B)
+              for p in frames_pins(hwmon.data()[size - size % 156:])), 5),
+              "multi: the new primary feeds the single-instance hwmon")
+        st, data = request(sock, WCMD_GET_DEVICE_INFO)
+        check(st == RESP_OK and data[2:14] == UID_B,
+              "multi: unselected commands follow the new primary")
+        point_port(tmp, 1, devA.replug())
+        def a_back():
+            st, recs = list_devices(c)
+            return [r["state"] for r in recs] == [0, 0] and \
+                recs[0]["uid"] == UID_A and recs[0]["flags"] & 1
+        check(wait_until(a_back, 10),
+              "multi: the device is back with index 0 and primary again")
+    finally:
+        if c:
+            c.close()
+        stop_daemon(daemon, "multi daemon")
+        out.close()
+
+    # Restart with the ports swapped: indexes follow the devices.
+    point_port(tmp, 1, devB.path)
+    point_port(tmp, 2, devA.path)
+    for acm, usb, serial in ((1, "3-6", SERIAL_B), (2, "3-4", SERIAL_A)):
+        fake_port(tmp, acm, usb, serial,
+                  devB.path if acm == 1 else devA.path)
+    out = open(os.path.join(tmp, "daemon_multi2.out"), "w")
+    daemon = subprocess.Popen([os.path.join(tmp, "wireviewd"), "-i", "100"],
+                              env=daemon_env(), stdout=out,
+                              stderr=subprocess.STDOUT)
+    try:
+        def both():
+            try:
+                st, recs = list_devices(Client(sock))
+            except OSError:
+                return False
+            return len(recs) == 2 and all(r["state"] == 0 for r in recs)
+        check(wait_until(both, 15), "multi: restarted daemon brings both up")
+        _, recs = list_devices(Client(sock))
+        check([(r["uid"], r["index"]) for r in recs] ==
+              [(UID_A, 0), (UID_B, 1)] and recs[0]["tty"].endswith("ttyACM2"),
+              "multi: after a restart with the ports swapped each device "
+              "keeps its index", str([(r["index"], r["tty"]) for r in recs]))
+    finally:
+        stop_daemon(daemon, "multi daemon (restart)")
+        out.close()
+        for d in (wv2, devA, devB):
+            d.stop()
+        hwmon.stop()
+    log = open(os.path.join(tmp, "daemon_multi.out")).read()
+    check(log.count("WireView II (product 7) is not supported yet") == 1,
+          "multi: the WireView II is reported once", log[-400:])
 
 
 def run_listener_retry(tmp):
@@ -1240,8 +1645,8 @@ def exercise_client_limit(tmp, sock):
             clients.append(c)
             statuses.append(c.request(WCMD_GET_DEVICE_INFO)[0])
         check(statuses == [RESP_OK] * MAX_CLIENTS,
-              f"{MAX_CLIENTS} clients connected at once are all served "
-              "(the 5th to 8th were refused before)", str(statuses))
+              f"{MAX_CLIENTS} clients connected at once are all served",
+              str(statuses))
         # clients[0] is the oldest connection but the most recently
         # active, so the longest idle one is clients[1].
         clients[0].request(WCMD_GET_DEVICE_INFO)
@@ -1371,7 +1776,7 @@ def main():
         build(tmp, group or NO_GROUP)
         check_fake_reassembly()
         for step in (run, run_noctua, run_wireview2, run_reload,
-                     run_listener_retry, run_unprivileged):
+                     run_listener_retry, run_unprivileged, run_multi):
             try:
                 step(tmp)
             except Exception as e:  # report, then go on to the summary
@@ -1380,7 +1785,8 @@ def main():
         if failed:
             for name in ("daemon.out", "daemon6.out", "daemon7.out",
                          "daemon_reload.out", "daemon_retry.out",
-                         "u/daemon.out"):
+                         "u/daemon.out", "daemon_multi.out",
+                         "daemon_multi2.out"):
                 p = os.path.join(tmp, name)
                 if os.path.exists(p):
                     print(f"--- {name}\n" + open(p).read())

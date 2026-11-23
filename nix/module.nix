@@ -65,6 +65,8 @@ in
         ReadWritePaths = [ "/run" ];
         LogsDirectory = "wireview";
         LogsDirectoryMode = "0750";
+        # /var/lib/wireview/devices: each device's hwmon index.
+        StateDirectory = "wireview";
         # No ConfigurationDirectory=: systemd would make /etc/wireview
         # root:root at every start; the tmpfiles rules above own it.
         ProtectHome = true;

@@ -20,11 +20,14 @@ RestartSec=5
 # wireviewd runs as root but needs no capabilities: every file and device
 # node it touches is root-owned. (A port= below 1024 in /etc/wireview/config
 # would need CAP_NET_BIND_SERVICE; the default 9876 does not.) It needs write
-# access to only three places:
+# access to only four places:
 #  - /run: the command socket is /run/wireviewd.sock (a fixed path shared with
 #    the GUI app). The daemon unlinks and re-binds it on every reconnect, so
 #    the whole directory has to be writable, not just the socket file.
 #  - /var/log/wireview: the daily audit log, set up by LogsDirectory=.
+#  - /var/lib/wireview: the device index file (devices), set up by
+#    StateDirectory=, so each WireView keeps its hwmon chip number
+#    (wireview-isa-0000, wireview1-isa-0001, ...) across restarts.
 #  - two device nodes, set up by DevicePolicy=closed plus DeviceAllow=:
 #    char-ttyACM is the CDC-ACM serial class (major 166) that the WireView
 #    enumerates as. char-misc (major 10) covers /dev/wireview-hwmon, a misc
@@ -43,6 +46,7 @@ ProtectSystem=strict
 ReadWritePaths=/run
 LogsDirectory=wireview
 LogsDirectoryMode=0750
+StateDirectory=wireview
 ProtectHome=yes
 # No PrivateUsers=: in a private user namespace every peer of the command
 # socket except root shows up as uid 65534, so the wireview group check

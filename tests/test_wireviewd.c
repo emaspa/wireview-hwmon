@@ -33,11 +33,51 @@ static char test_config_path[256] = "/nonexistent/wireview-config";
 #undef CONFIG_PATH
 #define CONFIG_PATH test_config_path
 
+/* The device index file goes under STATE_DIR: a temp dir of the test. */
+static char test_state_dir[256] = "/nonexistent/wireview-state";
+#undef STATE_DIR
+#define STATE_DIR test_state_dir
+
 #define write test_write
 #define main wireviewd_main
 #include "../wireviewd.c"
 #undef main
 #undef write
+
+/* Most cases below drive one device, slot 0 (TD), through the names the
+ * single-device daemon had for its state. */
+#define TD (&g_devs[0])
+#define dev_info (TD->info)
+#define g_last (TD->last)
+#define g_have_last (TD->have_last)
+#define g_energy_uj (TD->energy_uj)
+#define g_energy_frac (TD->energy_frac)
+#define g_energy_ts (TD->energy_ts)
+#define g_energy_ts_valid (TD->energy_ts_valid)
+#define g_hwmon_v2 (TD->hwmon_v2)
+#define g_suspend_until (TD->suspend_until)
+#define g_suspend_owner (TD->suspend_owner)
+#define g_serial_fd (TD->serial_fd)
+#define g_dev_uid (TD->uid_hex)
+
+/* write_hwmon() of TD into fd. */
+static int write_hwmon_fd(int fd, const struct sensor_struct *ss)
+{
+	int rc;
+
+	TD->hwmon_fd = fd;
+	rc = write_hwmon(TD, ss);
+	TD->hwmon_fd = -1;
+	return rc;
+}
+
+/* handle_client_request() with TD connected on serial_fd (-1: absent). */
+static void handle_with(struct client *c, int serial_fd)
+{
+	TD->serial_fd = serial_fd;
+	handle_client_request(c);
+	TD->serial_fd = -1;
+}
 
 #include <stddef.h>
 #include "check.h"
@@ -368,6 +408,7 @@ static int post_command(const char *body, uint8_t *serial, size_t serial_cap,
 		 ts, nonce, sig, strlen(body), body);
 
 	g_serial_fd = pp[1];
+	snprintf(g_dev_uid, sizeof(g_dev_uid), "A1A2A3A4A5A6A7A8A9AAABAC");
 	handle_post_command(sp[0], req, strstr(req, "\r\n\r\n") + 4, "test");
 	g_serial_fd = -1;
 
@@ -397,14 +438,14 @@ static void test_post_command(void)
 
 	/* The requests the GUI (WireViewCommand.ToJson) and wireviewctl
 	 * send, and the serial bytes each must produce. */
-	CHECK_EQ_INT(post_command("{\"deviceId\":\"A1A2\",\"op\":\"screen\",\"cmd\":227}",
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"A1A2A3A4A5A6A7A8A9AAABAC\",\"op\":\"screen\",\"cmd\":227}",
 				  ser, sizeof(ser), &n), 200);
 	CHECK_EQ_INT(n, 2);
 	CHECK_EQ_MEM(ser, "\x0c\xe3", 2);
 	CHECK_EQ_INT(post_command("{\"op\":\"nvm\",\"cmd\":2}", ser, sizeof(ser), &n), 200);
 	CHECK_EQ_INT(n, 6);
 	CHECK_EQ_MEM(ser, "\xf2\x55\xaa\x55\xaa\x02", 6);
-	CHECK_EQ_INT(post_command("{\"deviceId\":\"A1A2\",\"op\":\"clearFaults\","
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"A1A2A3A4A5A6A7A8A9AAABAC\",\"op\":\"clearFaults\","
 				  "\"statusMask\":65534,\"logMask\":0}",
 				  ser, sizeof(ser), &n), 200);
 	CHECK_EQ_INT(n, 5);
@@ -420,7 +461,7 @@ static void test_post_command(void)
 		cfg[i] = (uint8_t)(i * 7 + 3);
 	b64_encode(cfg, 96, b64);
 	snprintf(body, sizeof(body),
-		 "{\"deviceId\":\"A1A2\",\"op\":\"writeConfig\",\"version\":2,\"data\":\"%s\"}", b64);
+		 "{\"deviceId\":\"A1A2A3A4A5A6A7A8A9AAABAC\",\"op\":\"writeConfig\",\"version\":2,\"data\":\"%s\"}", b64);
 	CHECK_EQ_INT(post_command(body, ser, sizeof(ser), &n), 200);
 	CHECK_EQ_INT(n, 2 + 62 + 2 + 34);
 	CHECK(ser[0] == 0x06 && ser[1] == 0);
@@ -430,15 +471,26 @@ static void test_post_command(void)
 
 	/* Key names inside values or nested members no longer derail the
 	 * lookup: each of these used to fail or pick the wrong value. */
-	CHECK_EQ_INT(post_command("{\"deviceId\":\"op\",\"op\":\"screen\",\"cmd\":224}",
+	CHECK_EQ_INT(post_command("{\"note\":\"op\",\"op\":\"screen\",\"cmd\":224}",
 				  ser, sizeof(ser), &n), 200);
 	CHECK_EQ_MEM(ser, "\x0c\xe0", 2);
 	CHECK_EQ_INT(post_command("{\"op\":\"screen\",\"x\":{\"cmd\":5},\"cmd\":225}",
 				  ser, sizeof(ser), &n), 200);
 	CHECK_EQ_MEM(ser, "\x0c\xe1", 2);
-	CHECK_EQ_INT(post_command("{\"deviceId\":\"\\\"op\\\":\\\"nvm\\\"\",\"op\":\"screen\",\"cmd\":226}",
+	CHECK_EQ_INT(post_command("{\"note\":\"\\\"op\\\":\\\"nvm\\\"\",\"op\":\"screen\",\"cmd\":226}",
 				  ser, sizeof(ser), &n), 200);
 	CHECK_EQ_MEM(ser, "\x0c\xe2", 2);
+
+	/* deviceId picks the device by UID, in any case; empty means the
+	 * primary; an unknown one is refused and reaches nothing. */
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"a1a2a3a4a5a6a7a8a9aaabac\",\"op\":\"screen\",\"cmd\":227}",
+				  ser, sizeof(ser), &n), 200);
+	CHECK_EQ_MEM(ser, "\x0c\xe3", 2);
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"\",\"op\":\"screen\",\"cmd\":227}",
+				  ser, sizeof(ser), &n), 200);
+	CHECK_EQ_INT(post_command("{\"deviceId\":\"A1A2\",\"op\":\"screen\",\"cmd\":227}",
+				  ser, sizeof(ser), &n), 404);
+	CHECK_EQ_INT(n, 0);
 
 	/* Bad requests reach nothing. */
 	QUIET(CHECK_EQ_INT(post_command("{\"x\":{\"op\":\"screen\"},\"cmd\":1}",
@@ -462,15 +514,17 @@ static void test_post_command(void)
 
 static void test_client_idle(void)
 {
-	struct client cl[MAX_CLIENTS];
+	/* Eight clients; the table itself holds MAX_CLIENTS. */
+	enum { NCL = 8 };
+	struct client cl[NCL];
 	const struct timespec now = { .tv_sec = 1000, .tv_nsec = 500000000 };
 
-	CHECK_EQ_INT(MAX_CLIENTS, 8);
+	CHECK_EQ_INT(MAX_CLIENTS, 32);
 	CHECK_EQ_INT(CLIENT_IDLE_S, 60);
 
 	/* Client i last active 10 * i s ago. */
 	memset(cl, 0, sizeof(cl));
-	for (int i = 0; i < MAX_CLIENTS; i++) {
+	for (int i = 0; i < NCL; i++) {
 		cl[i].fd = -1;
 		cl[i].id = 100 + (unsigned long)i;
 		cl[i].last_active = now;
@@ -494,14 +548,14 @@ static void test_client_idle(void)
 	cl[7].have = 0;
 
 	/* The longest idle client makes room, never one mid-request. */
-	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 7);
+	CHECK_EQ_INT(client_evict_pick(cl, NCL, &now), 7);
 	cl[7].have = 3;
-	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 6);
+	CHECK_EQ_INT(client_evict_pick(cl, NCL, &now), 6);
 	cl[7].have = 0;
 	/* Sub-second order counts. */
 	cl[3].last_active = cl[7].last_active;
 	cl[3].last_active.tv_nsec -= 1;
-	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 3);
+	CHECK_EQ_INT(client_evict_pick(cl, NCL, &now), 3);
 	cl[3].last_active = now;
 	cl[3].last_active.tv_sec -= 30;
 
@@ -513,7 +567,7 @@ static void test_client_idle(void)
 	CHECK(client_holds_handover(&cl[7], &now));
 	CHECK(!client_holds_handover(&cl[6], &now));
 	CHECK_EQ_INT(client_idle_left(&cl[7], &now), 30000);
-	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 6);
+	CHECK_EQ_INT(client_evict_pick(cl, NCL, &now), 6);
 	/* Other clients' timers are unaffected. */
 	CHECK_EQ_INT(client_idle_left(&cl[6], &now), 0);
 	/* An owner active recently keeps the later of the two deadlines. */
@@ -526,14 +580,14 @@ static void test_client_idle(void)
 	g_suspend_until.tv_sec -= 1;
 	CHECK(!client_holds_handover(&cl[7], &now));
 	CHECK_EQ_INT(client_idle_left(&cl[7], &now), -10000);
-	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), 7);
+	CHECK_EQ_INT(client_evict_pick(cl, NCL, &now), 7);
 	memset(&g_suspend_until, 0, sizeof(g_suspend_until));
 	CHECK(!client_holds_handover(&cl[7], &now));
 
 	/* Nobody to evict: everyone mid-request, or no clients at all. */
-	for (int i = 0; i < MAX_CLIENTS; i++)
+	for (int i = 0; i < NCL; i++)
 		cl[i].have = 1;
-	CHECK_EQ_INT(client_evict_pick(cl, MAX_CLIENTS, &now), -1);
+	CHECK_EQ_INT(client_evict_pick(cl, NCL, &now), -1);
 	CHECK_EQ_INT(client_evict_pick(cl, 0, &now), -1);
 
 	/* client_remove() closes the fd and moves the last client in. */
@@ -573,11 +627,11 @@ static void test_client_activity(void)
 	/* A partial request is not activity; a complete one is. */
 	c.last_active.tv_sec -= 50;
 	CHECK_EQ_INT(write(sp[1], "\x01", 1), 1);
-	CHECK_EQ_INT(client_read(&c, -1), 0);
+	CHECK_EQ_INT(client_read(&c), 0);
 	CHECK_EQ_INT(c.have, 1);
 	CHECK_EQ_INT(client_idle_left(&c, &t0), LONG_MAX);
 	CHECK_EQ_INT(write(sp[1], "\x00\x00", 2), 2);
-	CHECK_EQ_INT(client_read(&c, -1), 0);
+	CHECK_EQ_INT(client_read(&c), 0);
 	CHECK_EQ_INT(c.have, 0);
 	CHECK_EQ_INT(read(sp[1], resp, sizeof(resp)), 3);
 	CHECK_EQ_INT(resp[0], RESP_NOT_CONNECTED);
@@ -590,7 +644,7 @@ static void test_client_activity(void)
 	g_suspend_owner = 0;
 	c.privileged = 1;
 	memcpy(c.req, "\x09\x02\x00\x05\x00", 5);	/* 5 s */
-	handle_client_request(&c, pp[1]);
+	handle_with(&c, pp[1]);
 	CHECK_EQ_INT(read(sp[1], resp, sizeof(resp)), 3);
 	CHECK_EQ_INT(resp[0], RESP_OK);
 	CHECK(g_suspend_owner == c.id);
@@ -604,13 +658,13 @@ static void test_client_activity(void)
 	other.id = c.id + 1000;
 	other.privileged = 0;
 	memcpy(other.req, "\x0a\x00\x00", 3);	/* RESUME, denied */
-	handle_client_request(&other, pp[1]);
+	handle_with(&other, pp[1]);
 	CHECK_EQ_INT(read(sp[1], resp, sizeof(resp)), 3);
 	CHECK_EQ_INT(resp[0], RESP_DENIED);
 	CHECK(g_suspend_owner == c.id);
 
 	memcpy(c.req, "\x0a\x00\x00", 3);	/* RESUME */
-	handle_client_request(&c, pp[1]);
+	handle_with(&c, pp[1]);
 	CHECK_EQ_INT(read(sp[1], resp, sizeof(resp)), 3);
 	CHECK_EQ_INT(resp[0], RESP_OK);
 	CHECK(g_suspend_owner == 0);
@@ -852,12 +906,12 @@ static void test_write_hwmon(void)
 		return;
 	unlink(path);
 
-	CHECK_EQ_INT(write_hwmon(fd, &ss), 0);
+	CHECK_EQ_INT(write_hwmon_fd(fd, &ss), 0);
 	/* Second frame: the extremes of the temperature range. */
 	ss.ts[0] = 2000;
 	ss.ts[1] = INT16_MIN;
 	g_energy_uj = INT64_MAX;
-	CHECK_EQ_INT(write_hwmon(fd, &ss), 0);
+	CHECK_EQ_INT(write_hwmon_fd(fd, &ss), 0);
 
 	/* One write() per frame, the whole 156-byte record; energy_uj is
 	 * little-endian at offset 148. */
@@ -913,13 +967,13 @@ static void test_write_hwmon(void)
 		ss.pins[i].current = UINT32_MAX;
 	}
 	fd = open("/dev/null", O_WRONLY);
-	CHECK_EQ_INT(write_hwmon(fd, &ss), 0);
+	CHECK_EQ_INT(write_hwmon_fd(fd, &ss), 0);
 	close(fd);
 
 	/* A short write is an error, and not a reason to fall back to v2. */
 	fd = open("/dev/full", O_WRONLY);
 	if (fd >= 0) {
-		CHECK_EQ_INT(write_hwmon(fd, &ss), -1);
+		CHECK_EQ_INT(write_hwmon_fd(fd, &ss), -1);
 		CHECK_EQ_INT(g_hwmon_v2, 0);
 		close(fd);
 	}
@@ -937,10 +991,10 @@ static void test_write_hwmon(void)
 	ss.pins[0].current = 8000;
 	g_energy_uj = 42;
 	g_write_einval_len = (long)sizeof(struct hwmon_data);
-	QUIET_OUT(CHECK_EQ_INT(write_hwmon(fd, &ss), 0));
+	QUIET_OUT(CHECK_EQ_INT(write_hwmon_fd(fd, &ss), 0));
 	CHECK_EQ_INT(g_hwmon_v2, 1);
 	g_write_einval_len = -1;
-	CHECK_EQ_INT(write_hwmon(fd, &ss), 0);	/* v3 would fit now; stays v2 */
+	CHECK_EQ_INT(write_hwmon_fd(fd, &ss), 0);	/* v3 would fit now; stays v2 */
 	CHECK_EQ_INT(lseek(fd, 0, SEEK_END), 2 * 148);
 
 	uint8_t v2[2][148];
@@ -958,7 +1012,7 @@ static void test_write_hwmon(void)
 	}
 	/* A v2-only module that rejects the v2 record too: an error. */
 	g_write_einval_len = 148;
-	CHECK_EQ_INT(write_hwmon(fd, &ss), -1);
+	CHECK_EQ_INT(write_hwmon_fd(fd, &ss), -1);
 	g_write_einval_len = -1;
 	close(fd);
 	g_hwmon_v2 = 0;
@@ -978,44 +1032,44 @@ static void test_energy(void)
 {
 	energy_reset();
 	/* 1 W for 1.5 s = 1.5 J. */
-	energy_add(1000000, 1500000000LL);
+	energy_add(TD, 1000000, 1500000000LL);
 	CHECK_EQ_INT(g_energy_uj, 1500000);
 
 	/* Sub-microjoule steps carry over exactly: 3 uW * 0.4 s = 1.2 uJ. */
 	energy_reset();
-	energy_add(3, 400000000LL);
+	energy_add(TD, 3, 400000000LL);
 	CHECK_EQ_INT(g_energy_uj, 1);
-	energy_add(3, 400000000LL);
+	energy_add(TD, 3, 400000000LL);
 	CHECK_EQ_INT(g_energy_uj, 2);
-	energy_add(3, 400000000LL);
+	energy_add(TD, 3, 400000000LL);
 	CHECK_EQ_INT(g_energy_uj, 3);	/* 3.6 */
-	energy_add(3, 400000000LL);
+	energy_add(TD, 3, 400000000LL);
 	CHECK_EQ_INT(g_energy_uj, 4);	/* 4.8 */
-	energy_add(1, 200000000LL);
+	energy_add(TD, 1, 200000000LL);
 	CHECK_EQ_INT(g_energy_uj, 5);	/* 5.0: the remainders add up */
 	CHECK_EQ_INT(g_energy_frac, 0);
 
 	/* Both factors past 1e9: 2.5 kW for 2.5 s = 6250 J. */
 	energy_reset();
-	energy_add(2500000000LL, 2500000000LL);
+	energy_add(TD, 2500000000LL, 2500000000LL);
 	CHECK_EQ_INT(g_energy_uj, 6250000000LL);
 
 	/* Zero, negative power and non-positive time add nothing. */
 	energy_reset();
-	energy_add(0, 1000000000LL);
-	energy_add(-5000000, 1000000000LL);
-	energy_add(1000000, 0);
-	energy_add(1000000, -1);
+	energy_add(TD, 0, 1000000000LL);
+	energy_add(TD, -5000000, 1000000000LL);
+	energy_add(TD, 1000000, 0);
+	energy_add(TD, 1000000, -1);
 	CHECK_EQ_INT(g_energy_uj, 0);
 
 	/* Saturates at INT64_MAX instead of wrapping. */
 	g_energy_uj = INT64_MAX - 10;
-	energy_add(1000000, 1000000000LL);
+	energy_add(TD, 1000000, 1000000000LL);
 	CHECK_EQ_INT(g_energy_uj, INT64_MAX);
-	energy_add(1000000, 1000000000LL);
+	energy_add(TD, 1000000, 1000000000LL);
 	CHECK_EQ_INT(g_energy_uj, INT64_MAX);
 	energy_reset();
-	energy_add(INT64_MAX, 3000000000LL);
+	energy_add(TD, INT64_MAX, 3000000000LL);
 	CHECK_EQ_INT(g_energy_uj, INT64_MAX);
 
 	/* energy_accumulate: the first frame only starts the clock; a frame
@@ -1029,16 +1083,16 @@ static void test_energy(void)
 	}
 	CHECK_EQ_INT(frame_power_uw(&ss), 576000000LL);
 	energy_reset();
-	energy_accumulate(&ss, 5000);
+	energy_accumulate(TD, &ss, 5000);
 	CHECK_EQ_INT(g_energy_uj, 0);
 	CHECK(g_energy_ts_valid);
 	g_energy_ts.tv_sec -= 1;		/* pretend 1 s passed */
-	energy_accumulate(&ss, 5000);
+	energy_accumulate(TD, &ss, 5000);
 	/* 576 J, plus the few microseconds the test itself took. */
 	CHECK(g_energy_uj >= 576000000LL && g_energy_uj < 577000000LL);
 	int64_t before = g_energy_uj;
 	g_energy_ts.tv_sec -= 6;		/* a 6 s gap */
-	energy_accumulate(&ss, 5000);
+	energy_accumulate(TD, &ss, 5000);
 	CHECK_EQ_INT(g_energy_uj, before);
 	energy_reset();
 }
@@ -1080,7 +1134,7 @@ static int query_with(const uint8_t *answers, size_t n)
 		return -100;
 	}
 	shutdown(sp[1], SHUT_WR);	/* a short answer ends in EOF */
-	QUIET_OUT(rc = query_device_info(sp[0]));
+	QUIET_OUT(rc = query_device_info(sp[0], &dev_info));
 	close(sp[0]);
 	close(sp[1]);
 	return rc;
@@ -1179,7 +1233,7 @@ static void test_device_info_reply(void)
 	dev_info.valid = 1;
 
 	/* fw, cfg, uid[12], "B 1.0\0", vendor, product */
-	CHECK_EQ_INT(device_info_reply(out), 2 + 12 + 6 + 2);
+	CHECK_EQ_INT(device_info_reply(&dev_info, out), 2 + 12 + 6 + 2);
 	CHECK_EQ_MEM(out, "\x07\x02\xa1\xa2\xa3\xa4\xa5\xa6\xa7\xa8\xa9\xaa\xab\xac"
 		     "B 1.0\0\xef\x06", 22);
 
@@ -1188,17 +1242,17 @@ static void test_device_info_reply(void)
 
 	/* Empty build string (BUILD_INFO unanswered): NUL, then the ids. */
 	dev_info.build_string[0] = '\0';
-	CHECK_EQ_INT(device_info_reply(out), 17);
+	CHECK_EQ_INT(device_info_reply(&dev_info, out), 17);
 	CHECK_EQ_MEM(out + 14, "\0\xef\x06", 3);
 
 	/* The longest build string the device can send (32 bytes). */
 	memset(dev_info.build_string, 'x', 32);
-	CHECK_EQ_INT(device_info_reply(out), 2 + 12 + 33 + 2);
+	CHECK_EQ_INT(device_info_reply(&dev_info, out), 2 + 12 + 33 + 2);
 	CHECK(out[46] == 0 && out[47] == 0xEF && out[48] == 0x06);
 	/* Even a string filling the whole field (never from the device)
 	 * stays within DEVICE_INFO_MAX. */
 	memset(dev_info.build_string, 'x', sizeof(dev_info.build_string));
-	CHECK_EQ_INT(device_info_reply(out), DEVICE_INFO_MAX);
+	CHECK_EQ_INT(device_info_reply(&dev_info, out), DEVICE_INFO_MAX);
 	CHECK(out[DEVICE_INFO_MAX - 3] == 0 && out[DEVICE_INFO_MAX - 1] == 0x06);
 
 	/* The same bytes over the socket, as a Pro II. */
@@ -1209,7 +1263,7 @@ static void test_device_info_reply(void)
 	memset(&c, 0, sizeof(c));
 	c.fd = sp[0];
 	memcpy(c.req, "\x01\x00\x00", 3);
-	handle_client_request(&c, 1000);	/* serial fd: only checked >= 0 */
+	handle_with(&c, 1000);	/* serial fd: only checked >= 0 */
 	CHECK_EQ_INT(read_reply(sp[1], &status, buf, sizeof(buf)), 22);
 	CHECK_EQ_INT(status, RESP_OK);
 	CHECK_EQ_MEM(buf + 14, "B 1.0\0\xef\x05", 8);
@@ -1233,18 +1287,26 @@ static void test_unsupported_report(void)
 	int saved = dup(2);
 	dup2(fileno(tf), 2);
 
-	unsupported_forget();
+	memset(g_memo, 0, sizeof(g_memo));
 	CHECK(!unsupported_known("/dev/ttyACM0"));
-	unsupported_report("/dev/ttyACM0", 7);
+	unsupported_report("/dev/ttyACM0", "S1", 7);
 	CHECK(unsupported_known("/dev/ttyACM0"));
 	CHECK(!unsupported_known("/dev/ttyACM1"));
-	unsupported_report("/dev/ttyACM0", 7);		/* retry: quiet */
-	unsupported_report("/dev/ttyACM0", 7);
-	unsupported_report("/dev/ttyACM0", 8);		/* another device */
-	unsupported_report("/dev/ttyACM1", 8);		/* another path */
-	unsupported_forget();				/* unplugged */
-	unsupported_report("/dev/ttyACM1", 8);
-	unsupported_forget();
+	unsupported_report("/dev/ttyACM0", "S1", 7);	/* retry: quiet */
+	unsupported_report("/dev/ttyACM0", "S1", 7);
+	unsupported_report("/dev/ttyACM0", "S1", 8);	/* another device */
+	unsupported_report("/dev/ttyACM1", "S2", 8);	/* another path */
+	/* The port left the scan (unplugged): forgotten. */
+	struct wv_candidate still = { .tty = "/dev/ttyACM0", .usb_serial = "S1" };
+	memo_prune(&still, 1);
+	CHECK(unsupported_known("/dev/ttyACM0"));
+	CHECK(!unsupported_known("/dev/ttyACM1"));
+	unsupported_report("/dev/ttyACM1", "S2", 8);
+	/* Another USB serial on the same path is another device. */
+	unsupported_report("/dev/ttyACM1", "S3", 8);
+	unsupported_forget("/dev/ttyACM1");
+	CHECK(!unsupported_known("/dev/ttyACM1"));
+	memset(g_memo, 0, sizeof(g_memo));
 
 	fflush(stderr);
 	dup2(saved, 2);
@@ -1256,6 +1318,7 @@ static void test_unsupported_report(void)
 	CHECK_EQ_STR(errs,
 		     "wireviewd: /dev/ttyACM0: WireView II (product 7) is not supported yet\n"
 		     "wireviewd: /dev/ttyACM0: WireView II (product 8) is not supported yet\n"
+		     "wireviewd: /dev/ttyACM1: WireView II (product 8) is not supported yet\n"
 		     "wireviewd: /dev/ttyACM1: WireView II (product 8) is not supported yet\n"
 		     "wireviewd: /dev/ttyACM1: WireView II (product 8) is not supported yet\n");
 }
@@ -1295,6 +1358,8 @@ static void test_sensors_json(void)
 	dev_info.vendor_id = 0xEF;
 	dev_info.product_id = 0x05;
 	dev_info.valid = 1;
+	snprintf(g_dev_uid, sizeof(g_dev_uid), "A1A2A3A4A5A6A7A8A9AAABAC");
+	g_serial_fd = 1000;	/* connected; only compared with -1 */
 	g_have_last = 1;
 	g_energy_uj = 12345678901LL;
 
@@ -1328,6 +1393,8 @@ static void test_sensors_json(void)
 	g_have_last = 0;
 	dev_info.valid = 0;
 	g_energy_uj = 0;
+	g_serial_fd = -1;
+	g_dev_uid[0] = '\0';
 }
 
 /* ---- GET /metrics ---- */
@@ -1956,8 +2023,382 @@ static void test_setup_http(void)
 
 
 
+/* ---- several devices ---- */
+
+/* Slot i as a connected device: index, UID bytes 0xB0+i.., product. */
+static void fake_device(int slot, int index, uint8_t uid0, uint8_t product,
+			int serial_fd, const char *usb_serial, const char *usb_path)
+{
+	struct wv_device *d = &g_devs[slot];
+
+	dev_init(d);
+	d->used = 1;
+	d->index = index;
+	d->serial_fd = serial_fd;
+	d->info.valid = 1;
+	d->info.vendor_id = 0xEF;
+	d->info.product_id = product;
+	d->info.fw_version = 7;
+	d->info.config_version = 2;
+	for (int i = 0; i < 12; i++)
+		d->info.uid[i] = (uint8_t)(uid0 + i);
+	for (int i = 0; i < 12; i++)
+		snprintf(d->uid_hex + i * 2, 3, "%02X", d->info.uid[i]);
+	snprintf(d->info.build_string, sizeof(d->info.build_string), "build %d", index);
+	snprintf(d->usb_serial, sizeof(d->usb_serial), "%s", usb_serial);
+	snprintf(d->usb_path, sizeof(d->usb_path), "%s", usb_path);
+	snprintf(d->tty, sizeof(d->tty), "/dev/ttyACM%d", index);
+	dev_set_tag(d);
+	for (int i = 0; i < 6; i++) {
+		d->last.pins[i].voltage = (int16_t)(12000 + index);
+		d->last.pins[i].current = 1000;
+	}
+	d->have_last = 1;
+}
+
+/* Send req (n bytes) as client c, with every device as set up; returns the
+ * reply status, payload in buf. */
+static int ask(struct client *c, int peer, const void *req, size_t n,
+	       uint8_t *buf, size_t cap, int *len)
+{
+	uint8_t status = 0xFF;
+
+	memcpy(c->req, req, n);
+	handle_client_request(c);
+	*len = read_reply(peer, &status, buf, cap);
+	return status;
+}
+
+static void test_multi_devices(void)
+{
+	int sp[2], pa[2], pb[2], len;
+	uint8_t buf[2048], ser[64];
+	struct client c;
+
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
+	CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+	CHECK_EQ_INT(pipe(pa), 0);
+	CHECK_EQ_INT(pipe(pb), 0);
+	fcntl(pa[0], F_SETFL, O_NONBLOCK);
+	fcntl(pb[0], F_SETFL, O_NONBLOCK);
+
+	/* Slot order is not index order: slot 0 holds index 1. */
+	fake_device(0, 1, 0xB0, 6, pb[1], "205B38A53245", "3-6");
+	fake_device(1, 0, 0xC0, 5, pa[1], "20A036A64E46", "3-4");
+	struct wv_device *A = &g_devs[1], *B = &g_devs[0];
+	CHECK_EQ_STR(A->tag, "4E46");
+	CHECK_EQ_STR(B->tag, "3245");
+	CHECK(dev_primary() == A);
+	CHECK(dev_by_uid(B->info.uid) == B);
+	CHECK(dev_by_uid_hex("b0b1b2b3b4b5b6b7b8b9babb") == B);
+	CHECK(dev_by_uid_hex("B0B1") == NULL);
+
+	memset(&c, 0, sizeof(c));
+	c.fd = sp[0];
+	c.id = 77;
+	c.privileged = 1;
+
+	/* LIST_DEVICES: format 1, two 160-byte records by index. */
+	CHECK_EQ_INT(ask(&c, sp[1], "\x0c\x00\x00", 3, buf, sizeof(buf), &len), RESP_OK);
+	CHECK_EQ_INT(len, 3 + 2 * 160);
+	CHECK(buf[0] == 1 && buf[1] == 2 && buf[2] == 160);
+	const uint8_t *r0 = buf + 3, *r1 = buf + 3 + 160;
+	CHECK_EQ_MEM(r0, A->info.uid, 12);
+	CHECK(r0[12] == 0 && r0[13] == 0 && r0[14] == 0xEF && r0[15] == 5 &&
+	      r0[16] == 7 && r0[17] == 2);
+	CHECK_EQ_INT(r0[18], 1);		/* primary, no own hwmon instance */
+	CHECK_EQ_STR((const char *)r0 + 20, "20A036A64E46");
+	CHECK_EQ_STR((const char *)r0 + 36, "/dev/ttyACM0");
+	CHECK_EQ_STR((const char *)r0 + 100, "3-4");
+	CHECK_EQ_STR((const char *)r0 + 116, "build 0");
+	CHECK_EQ_MEM(r1, B->info.uid, 12);
+	CHECK(r1[12] == 1 && r1[15] == 6 && r1[18] == 0);
+	CHECK_EQ_STR((const char *)r1 + 20, "205B38A53245");
+	CHECK_EQ_STR((const char *)r1 + 100, "3-6");
+
+	/* Unselected: commands go to the primary (A). */
+	CHECK_EQ_INT(ask(&c, sp[1], "\x05\x01\x00\xe1", 4, buf, sizeof(buf), &len), RESP_OK);
+	CHECK_EQ_INT(read(pa[0], ser, sizeof(ser)), 2);
+	CHECK_EQ_INT(read(pb[0], ser, sizeof(ser)), -1);
+
+	/* SELECT_DEVICE B: GET_DEVICE_INFO and commands go to B. */
+	uint8_t sel[3 + 12] = { 0x0d, 12, 0 };
+	memcpy(sel + 3, B->info.uid, 12);
+	CHECK_EQ_INT(ask(&c, sp[1], sel, sizeof(sel), buf, sizeof(buf), &len), RESP_OK);
+	CHECK_EQ_INT(ask(&c, sp[1], "\x01\x00\x00", 3, buf, sizeof(buf), &len), RESP_OK);
+	CHECK_EQ_MEM(buf + 2, B->info.uid, 12);
+	CHECK_EQ_INT(ask(&c, sp[1], "\x05\x01\x00\xe2", 4, buf, sizeof(buf), &len), RESP_OK);
+	CHECK_EQ_INT(read(pb[0], ser, sizeof(ser)), 2);
+	CHECK_EQ_INT(read(pa[0], ser, sizeof(ser)), -1);
+	CHECK_EQ_INT(ask(&c, sp[1], "\x0c\x00\x00", 3, buf, sizeof(buf), &len), RESP_OK);
+	CHECK(buf[3 + 18] == 1 && buf[3 + 160 + 18] == 2);	/* selected flag */
+
+	/* SUSPEND_SERIAL hands over B only; A keeps polling. */
+	CHECK_EQ_INT(ask(&c, sp[1], "\x09\x02\x00\x05\x00", 5, buf, sizeof(buf), &len), RESP_OK);
+	CHECK(serial_suspended(B) && !serial_suspended(A));
+	CHECK(B->suspend_owner == 77 && A->suspend_owner == 0);
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	CHECK(client_holds_handover(&c, &now));
+	CHECK_EQ_INT(ask(&c, sp[1], "\x0c\x00\x00", 3, buf, sizeof(buf), &len), RESP_OK);
+	CHECK(buf[3 + 13] == 0 && buf[3 + 160 + 13] == 1);	/* B handed over */
+	CHECK_EQ_INT(ask(&c, sp[1], "\x05\x01\x00\xe2", 4, buf, sizeof(buf), &len), RESP_ERROR);
+	CHECK_EQ_INT(ask(&c, sp[1], "\x0a\x00\x00", 3, buf, sizeof(buf), &len), RESP_OK);
+	CHECK(!serial_suspended(B) && B->suspend_owner == 0);
+
+	/* Unknown UID, a malformed one, and back to the primary. */
+	sel[3] ^= 0xFF;
+	CHECK_EQ_INT(ask(&c, sp[1], sel, sizeof(sel), buf, sizeof(buf), &len), RESP_NO_DEVICE);
+	CHECK(c.has_sel);	/* the earlier choice stands */
+	CHECK_EQ_INT(ask(&c, sp[1], "\x0d\x02\x00\xaa\xbb", 5, buf, sizeof(buf), &len), RESP_ERROR);
+	CHECK_EQ_INT(ask(&c, sp[1], "\x0d\x00\x00", 3, buf, sizeof(buf), &len), RESP_OK);
+	CHECK(!c.has_sel);
+
+	/* A selected device that went away answers NOT_CONNECTED, and does
+	 * not fall back to another. */
+	sel[3] ^= 0xFF;
+	CHECK_EQ_INT(ask(&c, sp[1], sel, sizeof(sel), buf, sizeof(buf), &len), RESP_OK);
+	B->serial_fd = -1;
+	CHECK_EQ_INT(ask(&c, sp[1], "\x01\x00\x00", 3, buf, sizeof(buf), &len), RESP_NOT_CONNECTED);
+	CHECK_EQ_INT(ask(&c, sp[1], "\x0c\x00\x00", 3, buf, sizeof(buf), &len), RESP_OK);
+	CHECK(buf[3 + 160 + 13] == 2);				/* gone */
+	/* Primary moves to B when A goes and B is back. */
+	B->serial_fd = pb[1];
+	A->serial_fd = -1;
+	CHECK(dev_primary() == B);
+	A->serial_fd = pa[1];
+	CHECK(dev_primary() == A);
+
+	/* /sensors: both, primary first; /metrics: one family each. */
+	static char out[16384];
+	int n = build_sensors_json(out, sizeof(out));
+	CHECK(n > 0);
+	const char *ia = strstr(out, A->uid_hex), *ib = strstr(out, B->uid_hex);
+	CHECK(ia && ib && ia < ib);
+	CHECK(strstr(out, "}]}") != NULL && strstr(out, "},{\"id\":") != NULL);
+	static char body[65536];
+	struct outbuf ob = { .p = body, .cap = sizeof(body) };
+	CHECK_EQ_INT(build_metrics(&ob), 0);
+	int types = 0;
+	for (const char *q = body; (q = strstr(q, "# TYPE wireview_power_watts ")); q++)
+		types++;
+	CHECK_EQ_INT(types, 1);
+	char want[128];
+	snprintf(want, sizeof(want), "wireview_power_watts{device=\"%s\"} 72.000\n", A->uid_hex);
+	CHECK(strstr(body, want) != NULL);
+	snprintf(want, sizeof(want), "wireview_power_watts{device=\"%s\"} 72.006\n", B->uid_hex);
+	CHECK(strstr(body, want) != NULL);
+	B->serial_fd = -1;
+	ob = (struct outbuf){ .p = body, .cap = sizeof(body) };
+	CHECK_EQ_INT(build_metrics(&ob), 0);
+	snprintf(want, sizeof(want), "wireview_up{device=\"%s\"} 0\n", B->uid_hex);
+	CHECK(strstr(body, want) != NULL);
+	CHECK(strstr(body, B->uid_hex) == strstr(body, want) + 20);	/* only there */
+
+	/* POST /command with deviceId reaches that device only. */
+	B->serial_fd = pb[1];
+	snprintf(g_secret, sizeof(g_secret), "unit-test-secret");
+	{
+		char json[160], ts[24], msg[512], sig[65], req[1024];
+		uint8_t mac[32];
+		int hp[2];
+		CHECK_EQ_INT(socketpair(AF_UNIX, SOCK_STREAM, 0, hp), 0);
+		snprintf(json, sizeof(json), "{\"deviceId\":\"%s\",\"op\":\"screen\",\"cmd\":224}",
+			 B->uid_hex);
+		snprintf(ts, sizeof(ts), "%ld", (long)time(NULL));
+		int ml = snprintf(msg, sizeof(msg), "%s\nmulti-nonce\n%s", ts, json);
+		hmac_sha256((const uint8_t *)g_secret, strlen(g_secret),
+			    (const uint8_t *)msg, (size_t)ml, mac);
+		hex_encode(mac, 32, sig);
+		snprintf(req, sizeof(req), "POST /command HTTP/1.1\r\nX-Auth-Ts: %s\r\n"
+			 "X-Auth-Nonce: multi-nonce\r\nX-Auth-Sig: %s\r\n\r\n%s", ts, sig, json);
+		handle_post_command(hp[0], req, strstr(req, "\r\n\r\n") + 4, "test");
+		char resp[256];
+		ssize_t rn = read(hp[1], resp, sizeof(resp) - 1);
+		CHECK(rn > 12 && strncmp(resp, "HTTP/1.1 200", 12) == 0);
+		CHECK_EQ_INT(read(pb[0], ser, sizeof(ser)), 2);
+		CHECK_EQ_MEM(ser, "\x0c\xe0", 2);
+		CHECK_EQ_INT(read(pa[0], ser, sizeof(ser)), -1);
+		close(hp[0]);
+		close(hp[1]);
+	}
+	g_secret[0] = '\0';
+	memset(g_nonces, 0, sizeof(g_nonces));
+	g_nonce_idx = 0;
+
+	close(sp[0]); close(sp[1]);
+	close(pa[0]); close(pa[1]);
+	close(pb[0]); close(pb[1]);
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
+	TD->used = 1;
+}
+
+/* A fake /sys tree: class/tty/<name> links to devices/.../<usb>/<usb>:1.0/tty/<name>. */
+static void fake_tty(const char *root, const char *name, const char *usb,
+		     const char *vid, const char *pid, const char *serial)
+{
+	char path[PATH_MAX], target[PATH_MAX], cmd[PATH_MAX * 2];
+
+	snprintf(path, sizeof(path), "%s/devices/usb3/%s", root, usb);
+	snprintf(cmd, sizeof(cmd), "mkdir -p %s/%s:1.0/tty/%s %s/class/tty", path, usb, name, root);
+	CHECK_EQ_INT(system(cmd), 0);
+	FILE *f;
+	char attr[PATH_MAX];
+	snprintf(attr, sizeof(attr), "%s/idVendor", path);
+	f = fopen(attr, "w"); fprintf(f, "%s\n", vid); fclose(f);
+	snprintf(attr, sizeof(attr), "%s/idProduct", path);
+	f = fopen(attr, "w"); fprintf(f, "%s\n", pid); fclose(f);
+	if (serial) {
+		snprintf(attr, sizeof(attr), "%s/serial", path);
+		f = fopen(attr, "w"); fprintf(f, "%s\n", serial); fclose(f);
+	}
+	snprintf(target, sizeof(target), "../../devices/usb3/%s/%s:1.0/tty/%s", usb, usb, name);
+	snprintf(path, sizeof(path), "%s/class/tty/%s", root, name);
+	CHECK_EQ_INT(symlink(target, path), 0);
+}
+
+static void test_scan_devices(void)
+{
+	char root[] = "/tmp/wireview-test-sys-XXXXXX", cls[PATH_MAX], cmd[PATH_MAX];
+	struct wv_candidate c[8];
+
+	if (!mkdtemp(root)) {
+		CHECK(0);
+		return;
+	}
+	fake_tty(root, "ttyACM10", "3-1", "0483", "5740", "AAA");
+	fake_tty(root, "ttyACM1", "3-6", "0483", "5740", "205B38A53245");
+	fake_tty(root, "ttyACM0", "3-4", "0483", "5740", "20A036A64E46");
+	fake_tty(root, "ttyACM2", "3-2", "1234", "5740", "OTHER");	/* other VID */
+	fake_tty(root, "ttyUSB0", "3-3", "0483", "5740", "NOTACM");	/* not ACM */
+	snprintf(cls, sizeof(cls), "%s/class/tty", root);
+	CHECK_EQ_INT(symlink("../../nowhere", strcat(strcpy(cmd, cls), "/ttyACM9")), 0);
+
+	int n = scan_devices(cls, c, 8);
+	CHECK_EQ_INT(n, 3);
+	if (n == 3) {
+		/* By ttyACM number, not name order. */
+		CHECK_EQ_STR(c[0].tty, DEV_DIR "/ttyACM0");
+		CHECK_EQ_STR(c[0].usb_serial, "20A036A64E46");
+		CHECK_EQ_STR(c[0].usb_path, "3-4");
+		CHECK_EQ_STR(c[1].tty, DEV_DIR "/ttyACM1");
+		CHECK_EQ_STR(c[1].usb_path, "3-6");
+		CHECK_EQ_STR(c[2].tty, DEV_DIR "/ttyACM10");
+	}
+	CHECK_EQ_INT(scan_devices(cls, c, 2), 2);	/* capped */
+	CHECK_EQ_INT(scan_devices("/nonexistent/class/tty", c, 8), -1);
+
+	/* -d paths: those that exist, in the given order. */
+	char paths[3][256];
+	snprintf(paths[0], 256, "%s/class/tty/ttyACM1", root);
+	snprintf(paths[1], 256, "/nonexistent/ttyACM5");
+	snprintf(paths[2], 256, "%s/devices", root);
+	n = scan_user_paths(cls, paths, 3, c, 8);
+	CHECK_EQ_INT(n, 2);
+	CHECK_EQ_STR(c[0].tty, paths[0]);
+	CHECK_EQ_STR(c[1].tty, paths[2]);
+	CHECK(c[0].order < c[1].order);
+
+	snprintf(cmd, sizeof(cmd), "rm -rf %s", root);
+	CHECK_EQ_INT(system(cmd), 0);
+}
+
+static void test_assign_index(void)
+{
+	char dir[] = "/tmp/wireview-test-state-XXXXXX", path[PATH_MAX], text[1024];
+	const char *A = "A00000000000000000000001", *B = "B00000000000000000000002";
+	const char *C = "C00000000000000000000003";
+	struct wv_candidate cands[2] = {
+		{ .tty = "/dev/ttyACM0", .usb_serial = "SA" },
+		{ .tty = "/dev/ttyACM1", .usb_serial = "SB" },
+	};
+
+	if (!mkdtemp(dir)) {
+		CHECK(0);
+		return;
+	}
+	snprintf(test_state_dir, sizeof(test_state_dir), "%s/state", dir);
+	snprintf(path, sizeof(path), "%s/devices", test_state_dir);
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
+	g_state_loaded = 0;
+
+	/* A fresh install: 0, then 1, written out (the directory is made). */
+	CHECK_EQ_INT(assign_index(A, "SA", cands, 2), 0);
+	g_devs[0].used = 1;
+	g_devs[0].index = 0;
+	CHECK_EQ_INT(assign_index(B, "SB", cands, 2), 1);
+	g_devs[1].used = 1;
+	g_devs[1].index = 1;
+	FILE *f = fopen(path, "r");
+	size_t n = f ? fread(text, 1, sizeof(text) - 1, f) : 0;
+	if (f)
+		fclose(f);
+	text[n] = '\0';
+	CHECK(strstr(text, "\n0 A00000000000000000000001 SA\n") != NULL);
+	CHECK(strstr(text, "\n1 B00000000000000000000002 SB\n") != NULL);
+
+	/* After a restart B comes first and still gets 1, A still 0. */
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
+	g_state_loaded = 0;
+	CHECK_EQ_INT(assign_index(B, "SB", cands, 2), 1);
+	g_devs[0].used = 1;
+	g_devs[0].index = 1;
+	CHECK_EQ_INT(assign_index(A, "SA", cands, 2), 0);
+	g_devs[1].used = 1;
+	g_devs[1].index = 0;
+
+	/* A new device C while A and B are plugged in: 2. */
+	CHECK_EQ_INT(assign_index(C, "SC", cands, 2), 2);
+
+	/* A replacement unit: only C is plugged in, A and B are recorded
+	 * but absent, so C (recorded at 2) keeps 2; a new D takes 0 from A. */
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
+	g_state_loaded = 0;
+	struct wv_candidate only_c[2] = {
+		{ .tty = "/dev/ttyACM0", .usb_serial = "SC" },
+		{ .tty = "/dev/ttyACM1", .usb_serial = "SD" },
+	};
+	CHECK_EQ_INT(assign_index(C, "SC", only_c, 2), 2);
+	g_devs[0].used = 1;
+	g_devs[0].index = 2;
+	CHECK_EQ_INT(assign_index("D00000000000000000000004", "SD", only_c, 2), 0);
+	/* ...and A, back later, gets the lowest index left: 1 is B's, whose
+	 * serial is not plugged in, so A takes 1. */
+	g_devs[1].used = 1;
+	g_devs[1].index = 0;
+	CHECK_EQ_INT(assign_index(A, "SA", cands, 1), 1);
+
+	/* An unreadable state directory: indexes still work, one warning. */
+	snprintf(test_state_dir, sizeof(test_state_dir), "/nonexistent/x/y");
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
+	g_state_loaded = 0;
+	g_state_warned = 0;
+	QUIET(CHECK_EQ_INT(assign_index(A, "SA", cands, 2), 0));
+	CHECK(g_state_warned);
+
+	snprintf(text, sizeof(text), "rm -rf %s", dir);
+	CHECK_EQ_INT(system(text), 0);
+	snprintf(test_state_dir, sizeof(test_state_dir), "/nonexistent/wireview-state");
+	g_state_loaded = 0;
+	g_nstate = 0;
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
+	TD->used = 1;
+}
+
 int main(void)
 {
+	/* Slot 0 is the one device of the single-device cases. */
+	for (int i = 0; i < MAX_DEVICES; i++)
+		dev_init(&g_devs[i]);
+	TD->used = 1;
+
 	test_json_escape();
 	test_b64();
 	test_json_readers();
@@ -1982,5 +2423,8 @@ int main(void)
 	test_listener_plan();
 	test_reload_config();
 	test_setup_http();
+	test_multi_devices();
+	test_scan_devices();
+	test_assign_index();
 	return check_summary("test_wireviewd");
 }
