@@ -4122,7 +4122,7 @@ static void usage(void)
 		"\n"
 		"Monitor:\n"
 		"  top [--host H[:port][,H2...]]... [--interval MS]\n"
-		"                    Live dashboard: the local device plus remote hosts.\n"
+		"                    Live dashboard: the local devices plus remote hosts.\n"
 		"                    --host repeats and/or takes a comma/space list; hosts are\n"
 		"                    also read from /etc/wireview/hosts, and the global\n"
 		"                    --host (before \"top\") adds one more. Press q to quit.\n"

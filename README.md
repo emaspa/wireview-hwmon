@@ -11,12 +11,12 @@ Works standalone or alongside the [wireview-linux](https://github.com/emaspa/wir
 ## How it works
 
 ```
-WireView Pro II (USB) → wireviewd (serial) → kernel module → /sys/class/hwmon/ → monitoring tools
+WireView Pro II (USB, up to 8) → wireviewd (serial) → kernel module → /sys/class/hwmon/ → monitoring tools
                                  └─────────→ HTTP /sensors, /metrics (opt-in) → LAN: other hosts, the GUI app, wireviewctl, Prometheus
 ```
 
 - **wireview_hwmon.ko** - Kernel module that creates a virtual hwmon device per WireView
-- **wireviewd** - Userspace daemon that reads the device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN. It tells the two editions apart by the product id the device reports (`EF05` WireView Pro II, `EF06` Noctua Edition) and passes it on to clients
+- **wireviewd** - Userspace daemon that reads each device over serial, feeds the kernel module, and (opt-in) publishes readings + accepts authenticated commands over the LAN. It tells the two editions apart by the product id the device reports (`EF05` WireView Pro II, `EF06` Noctua Edition) and passes it on to clients
 - **wireviewctl** - CLI tool for querying sensors, sending commands, firmware flashing (`flash`), and a `top` live monitor
 
 ## Installation
@@ -108,7 +108,7 @@ CLI alone. The package is marked unfree because it bundles Thermal Grizzly's
 firmware image. The flake allows it on its own, so no `allowUnfree` setting is
 needed.
 
-> **Immutable / atomic distros** (Bazzite, Silverblue, Kinoite) are not supported for the kernel module - DKMS doesn't fit rpm-ostree. On those, run the [WireView GUI Flatpak](https://github.com/emaspa/wireview-linux) in direct-serial mode, which doesn't need this module.
+> **Immutable / atomic distros** (Bazzite, Silverblue, Kinoite) are not supported for the kernel module - DKMS doesn't fit rpm-ostree. On those, run the [WireView GUI Flatpak](https://github.com/emaspa/wireview-linux) in direct-serial mode, which doesn't need this module. The Flatpak has no WireView Mini; for that, use the wireview-linux tarball.
 
 ### Firmware image
 
@@ -125,7 +125,7 @@ is proprietary and not covered by the GPL, see
 
 #### Requirements
 
-- Linux 6.8 or newer with kernel headers (`linux-headers-$(uname -r)`); older kernels are not supported
+- Linux 6.8 or newer with kernel headers (`linux-headers-$(uname -r)`); older kernels are not tested
 - A Thermal Grizzly WireView Pro II device connected via USB
 - `gcc` and `make`
 
@@ -326,7 +326,7 @@ as an unplug, a serial handover or a system suspend, is not counted. It is
 published as `energy1_input`, as `"energyJ"` in `GET /sensors` and as
 `wireview_energy_joules_total` on [`GET /metrics`](#prometheus-get-metrics).
 
-Module and daemon must both be this release or newer. An older module has no
+Module and daemon must both be 1.6.0 or newer. An older module has no
 `energy1_input` (the daemon notices and keeps feeding it the old record), and
 with an older daemon the new module reports no data (`ENODATA`) for it.
 
@@ -485,7 +485,7 @@ Commands (require wireview_hwmon module):
 
 Monitor:
   top [--host H[:port][,H2...]]... [--interval MS]
-                    Live dashboard: the local device plus remote hosts.
+                    Live dashboard: the local devices plus remote hosts.
                     --host repeats and/or takes a comma/space list; hosts are
                     also read from /etc/wireview/hosts, and the global
                     --host (before "top") adds one more. Press q to quit.
@@ -779,9 +779,9 @@ for it. `psuCapW` is `0` when unknown, and `energyJ` is left out when the module
 Without the module the command prints `{"devices":[]}` (with `host` and
 `appVersion`) and exits 1.
 
-`WIREVIEW_HWMON_PATH=DIR` makes `sensors` and `top` read DIR (a directory with
-a `name` file and the attribute files) instead of searching
-`/sys/class/hwmon`, for testing without the module.
+`WIREVIEW_HWMON_PATH=DIR[:DIR...]` makes `sensors` and `top` read those
+directories (each with a `name` file and the attribute files), one per device,
+instead of searching `/sys/class/hwmon`, for testing without the module.
 
 ### Remote hosts (`--host`)
 
@@ -1103,7 +1103,7 @@ The file advertises port 9876; edit its `<port>` if you changed `port=`.
 A `btop`-style terminal dashboard of every WireView, local and remote:
 
 ```bash
-wireviewctl top                                  # local device only
+wireviewctl top                                  # local devices only
 wireviewctl top --host 192.168.1.50              # add a remote host
 wireviewctl top --host 192.168.1.50:9876,nas     # several (comma/space list, host[:port])
 wireviewctl top --interval 500                   # refresh every 500 ms
@@ -1118,7 +1118,7 @@ state. A two-device view (one local, one remote) looks like:
 ```
  WireView top  2 devices  14:22:07  refresh 1.0s  q to quit
 
-╭─ local ─ WireView Pro II ─ fw3 ─ cap 600W
+╭─ local ─ WireView Pro II ─ fw5 ─ cap 600W
 │ Power   ████████████████░░░░░░░░░░░░    372.4 W     381.245 Wh
 │ Current █████████████████░░░░░░░░░░░     31.2 A
 │ Pin          1       2       3       4       5       6
@@ -1127,7 +1127,7 @@ state. A two-device view (one local, one remote) looks like:
 │ Watts     63.1    65.5    61.4    64.6    67.2    56.1
 │ Temp   In 45.3° Out 42.1° E1 38.7° E2 --   Fan 75%  Faults none
 ╰─
-╭─ 192.168.1.50 ─ WireView Pro II ─ fw3 ─ cap 450W
+╭─ 192.168.1.50 ─ WireView Pro II ─ fw5 ─ cap 450W
 │ Power   ██████░░░░░░░░░░░░░░░░░░░░░░    118.6 W      52.907 Wh
 │ Current ███████░░░░░░░░░░░░░░░░░░░░░      9.8 A
 │ Pin          1       2       3       4       5       6
