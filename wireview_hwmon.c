@@ -10,6 +10,17 @@
  * This module makes that data available via /sys/class/hwmon/ for tools
  * like lm-sensors, Grafana, conky, btop, etc.
  *
+ * Several devices: instance 0 (platform device "wireview_hwmon", hwmon name
+ * "wireview", chip wireview-isa-0000) exists for the module's lifetime.
+ * Every open file of /dev/wireview-hwmon may bind itself to one instance
+ * with WIREVIEW_IOC_BIND; binding index N >= 1 creates platform device
+ * "wireview_hwmon.N" with its own hwmon device, named "wireviewN" (chip
+ * wireviewN-isa-000N), and closing that file removes it again. A file that
+ * never binds feeds instance 0, as every file did before binding existed.
+ * Only instance 0 is called "wireview", so a client that looks for that
+ * one name (every client from before several devices) keeps finding
+ * instance 0, the daemon's primary device, and never another one.
+ *
  * Supported on the kernels the packaged channels ship: Linux 6.8 (Ubuntu
  * 24.04) and newer. Older kernels are not tested.
  */
@@ -24,6 +35,9 @@
 #include <linux/uaccess.h>
 #include <linux/ktime.h>
 #include <linux/version.h>
+#include <linux/bitmap.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 
 #define WIREVIEW_MAGIC   0x57565032  /* "WVP2" */
 #define WIREVIEW_VERSION 3          /* v3 appends energy_uj */
@@ -58,6 +72,23 @@ struct wireview_hwmon_data {
 	__s64 energy_uj;
 } __packed;
 
+/*
+ * WIREVIEW_IOC_BIND argument. Strings are NUL-padded; the module forces the
+ * last byte of each to NUL. They appear as the instance's serial, uid and
+ * label attributes.
+ */
+struct wireview_bind {
+	__u32 index;               /* instance, 0 .. WIREVIEW_MAX_INSTANCES-1 */
+	char  serial[16];          /* USB serial number */
+	char  uid[28];             /* chip UID, 24 uppercase hex digits */
+	char  label[48];           /* human-readable name */
+};
+
+static_assert(sizeof(struct wireview_bind) == 96, "bind struct size mismatch");
+
+#define WIREVIEW_IOC_BIND	_IOW('W', 0xA0, struct wireview_bind)
+#define WIREVIEW_MAX_INSTANCES	32
+
 /* A v2 frame is the v3 struct without the trailing energy_uj. */
 #define WIREVIEW_DATA_V2_SIZE offsetof(struct wireview_hwmon_data, energy_uj)
 
@@ -69,8 +100,26 @@ struct wireview_priv {
 	struct wireview_hwmon_data data;
 	bool data_valid;
 	ktime_t last_update;
-	struct miscdevice misc;
+	bool bound;                /* identity below set by a BIND */
+	char serial[16];
+	char uid[28];
+	char label[48];
 };
+
+/* Per open file of /dev/wireview-hwmon. */
+struct wireview_file {
+	struct wireview_priv *priv;     /* bound instance; NULL = instance 0 */
+	struct platform_device *pdev;   /* instance >= 1 this file created */
+	u32 index;
+	bool bound;
+};
+
+/* Instance 0, registered at module load and never removed before unload. */
+static struct platform_device *wireview_pdev;
+
+/* Serializes BIND and release; bit N set while some file is bound to N. */
+static DEFINE_MUTEX(wireview_inst_lock);
+static DECLARE_BITMAP(wireview_inst_used, WIREVIEW_MAX_INSTANCES);
 
 /*
  * True if a frame has arrived and is recent enough to report, so readers
@@ -89,13 +138,138 @@ static bool wireview_data_fresh(struct wireview_priv *priv)
 
 /* ---- misc device: /dev/wireview-hwmon ---- */
 
+static struct wireview_priv *wireview_priv0(void)
+{
+	return wireview_pdev ? platform_get_drvdata(wireview_pdev) : NULL;
+}
+
+static int wireview_misc_open(struct inode *inode, struct file *filp)
+{
+	struct wireview_file *wf = kzalloc(sizeof(*wf), GFP_KERNEL);
+
+	if (!wf)
+		return -ENOMEM;
+	/* misc_open() stored the miscdevice here; nothing else uses it. */
+	filp->private_data = wf;
+	return 0;
+}
+
+static int wireview_misc_release(struct inode *inode, struct file *filp)
+{
+	struct wireview_file *wf = filp->private_data;
+
+	mutex_lock(&wireview_inst_lock);
+	if (wf->bound) {
+		if (wf->pdev) {
+			/* Removes the hwmon device; sysfs drains its readers. */
+			platform_device_unregister(wf->pdev);
+		} else {
+			struct wireview_priv *priv = wf->priv;
+
+			/* Instance 0 stays; its data goes stale on its own. */
+			mutex_lock(&priv->lock);
+			priv->bound = false;
+			priv->serial[0] = priv->uid[0] = priv->label[0] = '\0';
+			mutex_unlock(&priv->lock);
+		}
+		clear_bit(wf->index, wireview_inst_used);
+	}
+	mutex_unlock(&wireview_inst_lock);
+	kfree(wf);
+	return 0;
+}
+
+static void wireview_set_ident(struct wireview_priv *priv,
+			       const struct wireview_bind *b)
+{
+	strscpy(priv->serial, b->serial, sizeof(priv->serial));
+	strscpy(priv->uid, b->uid, sizeof(priv->uid));
+	strscpy(priv->label, b->label, sizeof(priv->label));
+	priv->bound = true;
+}
+
+static long wireview_bind(struct wireview_file *wf, void __user *arg)
+{
+	struct wireview_bind b;
+	struct wireview_priv *priv;
+	struct platform_device *pdev;
+	long ret = 0;
+
+	if (copy_from_user(&b, arg, sizeof(b)))
+		return -EFAULT;
+	b.serial[sizeof(b.serial) - 1] = '\0';
+	b.uid[sizeof(b.uid) - 1] = '\0';
+	b.label[sizeof(b.label) - 1] = '\0';
+	if (b.index >= WIREVIEW_MAX_INSTANCES)
+		return -EINVAL;
+
+	mutex_lock(&wireview_inst_lock);
+	if (wf->bound || test_bit(b.index, wireview_inst_used)) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	if (b.index == 0) {
+		priv = wireview_priv0();
+		if (!priv) {
+			ret = -ENODEV;
+			goto out;
+		}
+		mutex_lock(&priv->lock);
+		wireview_set_ident(priv, &b);
+		mutex_unlock(&priv->lock);
+		pdev = NULL;
+	} else {
+		/*
+		 * probe() takes the identity from the platform data, so the
+		 * attributes are set before udev hears of the device.
+		 */
+		pdev = platform_device_register_data(NULL, "wireview_hwmon",
+						     b.index, &b, sizeof(b));
+		if (IS_ERR(pdev)) {
+			ret = PTR_ERR(pdev);
+			goto out;
+		}
+		priv = platform_get_drvdata(pdev);
+		if (!priv) {		/* probe failed */
+			platform_device_unregister(pdev);
+			ret = -ENODEV;
+			goto out;
+		}
+	}
+
+	wf->pdev = pdev;
+	wf->index = b.index;
+	WRITE_ONCE(wf->priv, priv);
+	wf->bound = true;
+	set_bit(b.index, wireview_inst_used);
+out:
+	mutex_unlock(&wireview_inst_lock);
+	return ret;
+}
+
+static long wireview_misc_ioctl(struct file *filp, unsigned int cmd,
+				unsigned long arg)
+{
+	switch (cmd) {
+	case WIREVIEW_IOC_BIND:
+		return wireview_bind(filp->private_data, (void __user *)arg);
+	default:
+		return -ENOTTY;
+	}
+}
+
 static ssize_t wireview_misc_write(struct file *filp, const char __user *buf,
 				   size_t count, loff_t *ppos)
 {
-	/* misc_open() stores our struct miscdevice in private_data. */
-	struct wireview_priv *priv = container_of(filp->private_data,
-						  struct wireview_priv, misc);
+	struct wireview_file *wf = filp->private_data;
+	struct wireview_priv *priv = READ_ONCE(wf->priv);
 	struct wireview_hwmon_data tmp;
+
+	if (!priv)
+		priv = wireview_priv0();
+	if (!priv)
+		return -ENODEV;
 
 	if (count != WIREVIEW_DATA_V2_SIZE && count != sizeof(tmp))
 		return -EINVAL;
@@ -124,7 +298,17 @@ static ssize_t wireview_misc_write(struct file *filp, const char __user *buf,
 
 static const struct file_operations wireview_misc_fops = {
 	.owner = THIS_MODULE,
+	.open = wireview_misc_open,
+	.release = wireview_misc_release,
 	.write = wireview_misc_write,
+	.unlocked_ioctl = wireview_misc_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
+};
+
+static struct miscdevice wireview_misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "wireview-hwmon",
+	.fops = &wireview_misc_fops,
 };
 
 /* ---- hwmon labels ---- */
@@ -140,7 +324,8 @@ static const struct file_operations wireview_misc_fops = {
  * Fan:       pwm1 = fan duty 0-255
  * Intrusion: intrusion0_alarm = any active fault,
  *            intrusion1_alarm = any logged fault
- * Extra:     fault_status_raw, fault_log_raw = raw fault bitmasks
+ * Extra:     fault_status_raw, fault_log_raw = raw fault bitmasks;
+ *            serial, uid, label = identity of the bound device
  */
 
 /*
@@ -237,17 +422,56 @@ static ssize_t wireview_raw_show(struct device *dev,
 	return sysfs_emit(buf, "%u\n", val);
 }
 
+enum wireview_ident_attr {
+	WIREVIEW_IDENT_SERIAL,
+	WIREVIEW_IDENT_UID,
+	WIREVIEW_IDENT_LABEL,
+};
+
+/* serial, uid, label: set by the daemon's BIND; ENODATA while unbound. */
+static ssize_t wireview_ident_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct wireview_priv *priv = dev_get_drvdata(dev);
+	ssize_t ret;
+
+	mutex_lock(&priv->lock);
+	if (!priv->bound) {
+		ret = -ENODATA;
+	} else {
+		switch (to_sensor_dev_attr(attr)->index) {
+		case WIREVIEW_IDENT_SERIAL:
+			ret = sysfs_emit(buf, "%s\n", priv->serial);
+			break;
+		case WIREVIEW_IDENT_UID:
+			ret = sysfs_emit(buf, "%s\n", priv->uid);
+			break;
+		default:
+			ret = sysfs_emit(buf, "%s\n", priv->label);
+			break;
+		}
+	}
+	mutex_unlock(&priv->lock);
+	return ret;
+}
+
 static DEVICE_ATTR_RO(intrusion0_label);
 static DEVICE_ATTR_RO(intrusion1_label);
 static SENSOR_DEVICE_ATTR_RO(fault_status_raw, wireview_raw,
 			     WIREVIEW_RAW_FAULT_STATUS);
 static SENSOR_DEVICE_ATTR_RO(fault_log_raw, wireview_raw, WIREVIEW_RAW_FAULT_LOG);
+static SENSOR_DEVICE_ATTR_RO(serial, wireview_ident, WIREVIEW_IDENT_SERIAL);
+static SENSOR_DEVICE_ATTR_RO(uid, wireview_ident, WIREVIEW_IDENT_UID);
+static SENSOR_DEVICE_ATTR_RO(label, wireview_ident, WIREVIEW_IDENT_LABEL);
 
 static struct attribute *wireview_extra_attrs[] = {
 	&dev_attr_intrusion0_label.attr,
 	&dev_attr_intrusion1_label.attr,
 	&sensor_dev_attr_fault_status_raw.dev_attr.attr,
 	&sensor_dev_attr_fault_log_raw.dev_attr.attr,
+	&sensor_dev_attr_serial.dev_attr.attr,
+	&sensor_dev_attr_uid.dev_attr.attr,
+	&sensor_dev_attr_label.dev_attr.attr,
 	NULL
 };
 
@@ -489,60 +713,42 @@ static const struct hwmon_chip_info wireview_chip_info = {
 
 static int wireview_probe(struct platform_device *pdev)
 {
+	const struct wireview_bind *b = dev_get_platdata(&pdev->dev);
 	struct wireview_priv *priv;
 	struct device *hwmon_dev;
-	int ret;
+	const char *name = "wireview";
 
 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+	if (pdev->id > 0) {
+		name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "wireview%d", pdev->id);
+		if (!name)
+			return -ENOMEM;
+	}
 
 	mutex_init(&priv->lock);
-	platform_set_drvdata(pdev, priv);
+	if (b)
+		wireview_set_ident(priv, b);
 
 	/*
-	 * hwmon first: until misc_register() nothing can write a frame, and
-	 * the hwmon callbacks only need the lock and data_valid (false), both
-	 * set up above. The misc device goes last because a write can arrive
-	 * the moment it is registered.
+	 * Writes reach an instance only through the drvdata set below, after
+	 * the hwmon device exists; the hwmon callbacks only need the lock
+	 * and data_valid (false), both set up above. devres unregisters the
+	 * hwmon device before it frees priv.
 	 */
 	hwmon_dev = devm_hwmon_device_register_with_info(&pdev->dev,
-							 "wireview",
+							 name,
 							 priv,
 							 &wireview_chip_info,
 							 wireview_extra_groups);
 	if (IS_ERR(hwmon_dev))
 		return PTR_ERR(hwmon_dev);
 
-	priv->misc.minor = MISC_DYNAMIC_MINOR;
-	priv->misc.name = "wireview-hwmon";
-	priv->misc.fops = &wireview_misc_fops;
-
-	ret = misc_register(&priv->misc);
-	if (ret)
-		return ret;
-
-	dev_info(&pdev->dev, "WireView hwmon driver loaded\n");
+	platform_set_drvdata(pdev, priv);
+	dev_info(&pdev->dev, "WireView hwmon instance %d ready\n",
+		 pdev->id < 0 ? 0 : pdev->id);
 	return 0;
-}
-
-/*
- * platform_driver::remove() returned int before Linux 6.11 and void from
- * 6.11 onwards (commit 0edb555a65d1). Match the running kernel's signature so
- * the module builds on both older (e.g. RHEL 9, 5.14-based) and newer kernels.
- */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
-static int wireview_remove(struct platform_device *pdev)
-#else
-static void wireview_remove(struct platform_device *pdev)
-#endif
-{
-	struct wireview_priv *priv = platform_get_drvdata(pdev);
-
-	misc_deregister(&priv->misc);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
-	return 0;
-#endif
 }
 
 static struct platform_driver wireview_driver = {
@@ -551,39 +757,55 @@ static struct platform_driver wireview_driver = {
 		/*
 		 * An open /dev/wireview-hwmon holds a pointer into priv and pins
 		 * the module, but not the binding: a sysfs unbind would free
-		 * priv under the daemon's open file. Only module unload may
-		 * remove the device.
+		 * priv under the daemon's open file. Only module unload (for
+		 * instance 0) or the owning file's release (for the others)
+		 * may remove a device.
 		 */
 		.suppress_bind_attrs = true,
 	},
 	.probe = wireview_probe,
-	.remove = wireview_remove,
 };
-
-static struct platform_device *wireview_pdev;
 
 static int __init wireview_init(void)
 {
 	int ret;
 
+	ret = platform_driver_register(&wireview_driver);
+	if (ret)
+		return ret;
+
+	/* Instance 0 keeps the name (and sysfs path) it always had. */
 	wireview_pdev = platform_device_register_simple("wireview_hwmon",
 							-1, NULL, 0);
-	if (IS_ERR(wireview_pdev))
-		return PTR_ERR(wireview_pdev);
-
-	ret = platform_driver_register(&wireview_driver);
-	if (ret) {
-		platform_device_unregister(wireview_pdev);
-		return ret;
+	if (IS_ERR(wireview_pdev)) {
+		ret = PTR_ERR(wireview_pdev);
+		goto err_driver;
 	}
 
+	/* Last: a write can arrive the moment it is registered. */
+	ret = misc_register(&wireview_misc);
+	if (ret)
+		goto err_device;
+
 	return 0;
+
+err_device:
+	platform_device_unregister(wireview_pdev);
+err_driver:
+	platform_driver_unregister(&wireview_driver);
+	wireview_pdev = NULL;
+	return ret;
 }
 
 static void __exit wireview_exit(void)
 {
-	platform_driver_unregister(&wireview_driver);
+	/*
+	 * Every file is closed (they pin the module), so only instance 0
+	 * is left.
+	 */
+	misc_deregister(&wireview_misc);
 	platform_device_unregister(wireview_pdev);
+	platform_driver_unregister(&wireview_driver);
 }
 
 module_init(wireview_init);
