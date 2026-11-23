@@ -2,7 +2,7 @@
 
 Name:           wireview-hwmon
 # Must match the top-level VERSION file ("make check-version").
-Version:        1.8.1
+Version:        1.9.0
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
@@ -146,6 +146,34 @@ dkms status -m %{name} -v %{version} -k "$(uname -r)" 2>/dev/null | grep -q ': i
 dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || true
 
 %changelog
+* Mon Nov 23 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.9.0-1
+- Several WireViews on one PC. wireviewd drives every WireView it finds, up
+  to 8, and the kernel module gives each its own hwmon device. The first
+  keeps the name wireview and the chip wireview-isa-0000; the others are
+  wireview1, wireview2 and so on. Each hwmon device has serial, uid and
+  label attributes that name the device behind it.
+- Each device keeps its index across restarts, reboots and replugs.
+  wireviewd records it by UID in /var/lib/wireview/devices. On a first start
+  with several devices they are numbered by serial port.
+- The command socket gains LIST_DEVICES and SELECT_DEVICE. A connection that
+  chooses no device talks to the connected device with the lowest index, so
+  existing clients keep working. A serial handover applies to the chosen
+  device only. Up to 32 clients can be connected.
+- GET /sensors lists every device, GET /metrics has a series per device, GET
+  /config takes ?id= and POST /command honours deviceId.
+- wireviewctl devices lists the devices, and info, build and sensors show
+  every device. --device picks one by index, UID or USB serial, or their last
+  digits. Commands that change a device refuse to guess while several are
+  connected. flash points dfu-util at the target's USB port, so no other
+  STM32 bootloader is taken for it.
+- An unsupported WireView on one port no longer keeps a supported device on
+  another port from being found. It is reported once and left alone until it
+  is unplugged.
+- Only the first hwmon device is called wireview, so the wireview-linux app
+  up to 1.4 and older wireviewctl keep showing the primary device. With an
+  older module still loaded, only the primary device appears in hwmon until
+  the module is reloaded or the machine restarts.
+
 * Wed Oct 14 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.8.1-1
 - wireviewd retries a LAN listener whose port was taken when it started or
   at a reload, every 10 s, and opens it on its own once the port is free.
