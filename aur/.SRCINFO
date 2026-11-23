@@ -11,7 +11,7 @@ pkgbase = wireview-hwmon
 	source = wireview-hwmon-1.9.0.tar.gz::https://github.com/emaspa/wireview-hwmon/archive/refs/tags/v1.9.0.tar.gz
 	source = wireview-hwmon.sysusers
 	source = wireview-hwmon.tmpfiles
-	sha256sums = 7a227dcd91bfabcc14a35dfdccc5ae03fea18a9c0a6119268ab797b6cbd1be27
+	sha256sums = 8d2ed775c351eee47cf073508aa9e7633b12f3005aecba51a220c7550f0f3aea
 	sha256sums = dec7ef8e8cc0bcfb7a692a0484b9df3fbd8909f89ee63658f1c3f77ab20d7660
 	sha256sums = 01ca092a9409307d362c4edbe4421d21837b02f7de443cc34c053284952407cf
 
