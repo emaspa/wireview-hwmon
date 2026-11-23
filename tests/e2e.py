@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 """End-to-end test: wireviewd and wireviewctl against a fake device.
 
 Builds both with every host path (/dev/wireview-hwmon, /run/wireviewd.sock,

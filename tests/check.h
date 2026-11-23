@@ -5,7 +5,7 @@
  * location. CHECK_EQ_INT/CHECK_EQ_STR/CHECK_EQ_MEM also print both values.
  * Finish main() with "return check_summary(name);".
  *
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef WIREVIEW_TESTS_CHECK_H
 #define WIREVIEW_TESTS_CHECK_H

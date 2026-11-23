@@ -7,7 +7,7 @@
 #
 #   tests/kmod/run-vm-test.sh [stress-rounds]
 #
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$here/../.." && pwd)

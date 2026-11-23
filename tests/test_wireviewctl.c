@@ -10,7 +10,7 @@
  * wireviewctl.c is one file of static functions, so it is compiled into
  * this test directly with its main() renamed out of the way.
  *
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 /* The daemon socket is a variable here, so a test can point the CLI at a
  * fake wireviewd; it starts out where no daemon listens. */

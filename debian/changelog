@@ -26,6 +26,8 @@ wireview-hwmon (1.9.0~26.04.1) resolute; urgency=medium
     app up to 1.4 and older wireviewctl keep showing the primary device.
     With an older module still loaded, only the primary device appears in
     hwmon until the module is reloaded or the machine restarts.
+  * wireviewd, wireviewctl and the tests are now GPL-3.0-or-later. The
+    kernel module stays GPL-2.0-only.
 
  -- Emanuele Sparvoli <sparvoli@gmail.com>  Mon, 23 Nov 2026 07:31:34 +0000
 
@@ -57,6 +59,8 @@ wireview-hwmon (1.9.0~24.04.1) noble; urgency=medium
     app up to 1.4 and older wireviewctl keep showing the primary device.
     With an older module still loaded, only the primary device appears in
     hwmon until the module is reloaded or the machine restarts.
+  * wireviewd, wireviewctl and the tests are now GPL-3.0-or-later. The
+    kernel module stays GPL-2.0-only.
 
  -- Emanuele Sparvoli <sparvoli@gmail.com>  Mon, 23 Nov 2026 07:31:34 +0000
 

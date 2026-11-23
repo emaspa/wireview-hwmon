@@ -1222,4 +1222,4 @@ Thanks to [Thermal Grizzly](https://www.thermal-grizzly.com/) for providing a Wi
 
 ## License
 
-GPL-2.0, see [LICENSE](LICENSE). `sha256.c` and `sha256.h` are CC0-1.0. The device firmware image in `firmware/` is Thermal Grizzly's and is not covered by the GPL (see [firmware/README.md](firmware/README.md)).
+wireviewd, wireviewctl and the tests are GPL-3.0-or-later, see [LICENSE](LICENSE). The kernel module (`wireview_hwmon.c` and its DKMS files) is GPL-2.0-only, like the kernel it builds against, see [LICENSES/GPL-2.0.txt](LICENSES/GPL-2.0.txt). Up to 1.8.1 everything was GPL-2.0. `sha256.c` and `sha256.h` are CC0-1.0. The device firmware image in `firmware/` is Thermal Grizzly's and is not covered by the GPL (see [firmware/README.md](firmware/README.md)).

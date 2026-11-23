@@ -25,7 +25,7 @@
  * The settings file (/etc/wireview/config, root:wireview 0660) is read at
  * start and again on SIGHUP or WCMD_RELOAD_CONFIG, see reload_config().
  *
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #define _GNU_SOURCE

@@ -6,7 +6,7 @@ Version:        1.9.0
 Release:        1%{?dist}
 Summary:        WireView Pro II hwmon daemon, CLI and DKMS kernel module
 
-License:        GPL-2.0-only
+License:        GPL-3.0-or-later
 URL:            https://github.com/emaspa/wireview-hwmon
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 
@@ -30,6 +30,7 @@ the wireview_hwmon kernel module. Includes wireviewd (daemon), wireviewctl
 
 %package dkms
 Summary:        WireView Pro II hwmon kernel module (DKMS)
+License:        GPL-2.0-only
 BuildArch:      noarch
 Requires:       dkms
 Requires:       gcc, make
@@ -73,6 +74,7 @@ chmod 0644 %{buildroot}%{_usrsrc}/%{name}-%{version}/dkms.conf \
     %{buildroot}%{_usrsrc}/%{name}-%{version}/Makefile
 
 %files
+%license LICENSE
 %doc README.md
 %{_bindir}/wireviewd
 %{_bindir}/wireviewctl
@@ -112,6 +114,7 @@ fi
 %systemd_postun_with_restart wireviewd.service
 
 %files dkms
+%license LICENSES/GPL-2.0.txt
 %{_usrsrc}/%{name}-%{version}/
 
 %post dkms
@@ -173,6 +176,8 @@ dkms remove -m %{name} -v %{version} --all --rpm_safe_upgrade 2>/dev/null || tru
   up to 1.4 and older wireviewctl keep showing the primary device. With an
   older module still loaded, only the primary device appears in hwmon until
   the module is reloaded or the machine restarts.
+- wireviewd, wireviewctl and the tests are now GPL-3.0-or-later. The kernel
+  module stays GPL-2.0-only.
 
 * Wed Oct 14 2026 Emanuele Sparvoli <sparvoli@gmail.com> - 1.8.1-1
 - wireviewd retries a LAN listener whose port was taken when it started or

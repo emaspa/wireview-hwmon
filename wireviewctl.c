@@ -6,7 +6,7 @@
  *
  * Usage: wireviewctl <command> [args]
  *
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <stdio.h>

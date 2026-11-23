@@ -42,9 +42,9 @@ stdenv.mkDerivation {
   meta = {
     description = "Daemon and CLI for the Thermal Grizzly WireView Pro II";
     homepage = "https://github.com/emaspa/wireview-hwmon";
-    # The tools are GPL-2.0; the bundled firmware image is Thermal Grizzly's,
+    # The tools are GPL-3.0-or-later; the bundled firmware image is Thermal Grizzly's,
     # redistributed unmodified (firmware/README.md).
-    license = [ lib.licenses.gpl2Only lib.licenses.unfreeRedistributableFirmware ];
+    license = [ lib.licenses.gpl3Plus lib.licenses.unfreeRedistributableFirmware ];
     platforms = lib.platforms.linux;
     mainProgram = "wireviewctl";
   };

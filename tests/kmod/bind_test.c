@@ -5,7 +5,7 @@
  * of bind/write/close while other processes read every hwmon attribute.
  * Runs as root inside the VM that tests/kmod/run-vm-test.sh boots.
  *
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #define _GNU_SOURCE
 #include <dirent.h>

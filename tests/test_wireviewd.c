@@ -7,7 +7,7 @@
  * wireviewd.c is one file of static functions, so it is compiled into this
  * test directly with its main() renamed out of the way.
  *
- * SPDX-License-Identifier: GPL-2.0
+ * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #define _GNU_SOURCE
 #include <errno.h>

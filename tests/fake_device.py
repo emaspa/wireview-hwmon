@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Fake Thermal Grizzly WireView Pro II on a pseudo-terminal.
 
 Any edition: product_id 5 is the WireView Pro II (the default), 6 the
